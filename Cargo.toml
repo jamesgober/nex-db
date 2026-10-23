@@ -1,0 +1,72 @@
+# =============================================================================
+#  R E P S   ·   nex-db
+# =============================================================================
+[package]
+name    = "nex-db"
+version = "0.1.0"
+
+# Minimum Supported Rust Version (MSRV)
+# 1.85: the baseline of the db-collection crates nex-db builds on.
+rust-version = "1.85"
+edition = "2024"
+
+# License
+license = "Apache-2.0 OR MIT"
+
+# Readme
+readme = "README.md"
+
+# Description
+description = "Embedded database with typed engines on one commit log."
+
+# Keywords (5 max)
+keywords = ["database", "embedded", "storage"]
+
+# Categories
+categories = ["database-implementations"]
+
+# Links
+repository = "https://github.com/jamesgober/nex-db"
+
+# Authors
+authors = ["James Gober <me@jamesgober.com>"]
+
+# Not published until James decides (dev/PLAN.md, open decision OD-1).
+publish = false
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+name = "nex_db"
+path = "src/lib.rs"
+
+
+# FEATURE FLAGS
+# #################################
+# Engines arrive behind features as they are built (dev/ROADMAP.md).
+[features]
+default = []
+
+
+# DEPENDENCIES
+# #################################
+# First-party crates by published version only, never `path`. Zero
+# third-party runtime dependencies (dev/DIRECTIVES.md section 2).
+[dependencies]
+
+
+# DEV DEPENDENCIES
+# #################################
+[dev-dependencies]
+
+
+# RELEASE PROFILE
+# #################################
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
+strip         = "symbols"

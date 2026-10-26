@@ -10,15 +10,67 @@
 
 <br>
 
-**nex-db** is an embedded database for Rust. Engines run side by side on one core: one commit log, one catalog, and one read snapshot shared by every engine, so a commit that touches several engines is atomic. Every operation is typed; there is no query string to build or inject.
+**nex-db** is an embedded database for Rust. Engines run side by side on one core: one commit log, one catalog, and one sequence of commits shared by every engine, so a commit that touches several engines is atomic. Every operation is typed; there is no query string to build or inject.
 
-The first engines are an auth engine (sessions, credentials, tokens, roles), kept sealed under its own keys and files, and a content engine (pages, translations, routes).
+The engines in this version are an auth engine (accounts, password hashing, sessions), which stores tokens and identifiers only as keyed digests and passwords only as Argon2id hashes, and a content engine (entities and the routes they are served at).
 
 MSRV is 1.85 (Rust 2024 edition). `#![forbid(unsafe_code)]`.
 
+## Example
+
+```rust,no_run
+use nex_db::{Entity, SessionSpec, SignIn, Validation};
+
+fn main() -> nex_db::Result<()> {
+    let db = nex_db::open("data/site")?;
+
+    // Sign up: an account and a profile page in one commit.
+    let password = db.auth().hash_password("correct horse battery staple")?;
+    let account = db.commit(|tx| {
+        let account = tx.auth().create_account("ann@example.com", &password)?;
+        tx.content().create(
+            Entity::new("profile")
+                .field("account", account)
+                .site("example.com")
+                .path("/u/ann"),
+        )?;
+        Ok(account)
+    })?;
+
+    // Sign in, and check the session on each request.
+    if let SignIn::Success { token, .. } =
+        db.auth().sign_in("ann@example.com", "correct horse battery staple", SessionSpec::web())?
+    {
+        assert!(matches!(db.auth().validate(&token)?, Validation::Valid(s) if s.account() == account));
+    }
+
+    // Serve the profile page.
+    if let Some(route) = db.content().resolve("example.com", "/u/ann")? {
+        let _page = db.content().get(route.entity())?;
+    }
+    Ok(())
+}
+```
+
+`examples/site.rs` runs the same flow, reopens the database, and can stop without closing it to show that everything comes back:
+
+```text
+cargo run --example site
+cargo run --example site -- --crash
+cargo run --example site
+```
+
+## Guarantees
+
+- A commit that returned `Ok` survives a crash of the process at any point; a commit that did not return never appears in part. `tests/kill.rs` kills a writing process at random points and checks every reopen.
+- Every state change is applied from the bytes written to the log, by the same code after a commit and during recovery.
+- A failed log write or sync stops all further commits; it is never retried.
+- A missing key file or a damaged log keeps the database closed.
+- A revoked session never validates again.
+
 ## Status
 
-Scaffold. No functional code yet. The plan is in [`dev/PLAN.md`](./dev/PLAN.md) and the schedule in [`dev/ROADMAP.md`](./dev/ROADMAP.md).
+Version 0.1: the first working build. File formats and the API will change before 1.0. The plan is in [`dev/PLAN.md`](./dev/PLAN.md) and the schedule in [`dev/ROADMAP.md`](./dev/ROADMAP.md).
 
 ## License
 

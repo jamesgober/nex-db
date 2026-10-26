@@ -45,21 +45,74 @@ path = "src/lib.rs"
 
 # FEATURE FLAGS
 # #################################
-# Engines arrive behind features as they are built (dev/ROADMAP.md).
+# Engines are modules behind features (dev/PLAN.md D-001). The core (commit
+# log, catalog, recovery) is always built.
 [features]
-default = []
+default = ["auth", "content"]
+# The auth engine: accounts, sessions, password hashing.
+auth = ["dep:lsm-db", "crypt-io/kdf-argon2"]
+# The content engine: entities and routes.
+content = ["dep:lsm-db"]
 
 
 # DEPENDENCIES
 # #################################
-# First-party crates by published version only, never `path`. Zero
-# third-party runtime dependencies (dev/DIRECTIVES.md section 2).
+# First-party crates by published version only, never `path`. No third-party
+# runtime dependency of nex-db's own; the ones these crates bring are recorded
+# as temporary exceptions in dev/PLAN.md (OD-5).
 [dependencies]
+wal-db = "1.0"
+id-forge = { version = "1.0", default-features = false, features = ["ulid"] }
+crypt-io = { version = "1.2.1", default-features = false, features = [
+    "std",
+    "zeroize",
+    "hash-blake3",
+    "mac-blake3",
+    "aead-chacha20",
+] }
+# `durability` stays off: the core commit log is the write-ahead log.
+lsm-db = { version = "1.1", default-features = false, features = ["std"], optional = true }
 
 
 # DEV DEPENDENCIES
 # #################################
 [dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+
+# TARGETS
+# #################################
+[[example]]
+name = "site"
+required-features = ["auth", "content"]
+
+[[test]]
+name = "commit"
+required-features = ["auth", "content"]
+
+[[test]]
+name = "recovery"
+required-features = ["auth", "content"]
+
+[[test]]
+name = "kill"
+required-features = ["auth", "content"]
+
+[[bench]]
+name = "core"
+harness = false
+required-features = ["auth", "content"]
+
+
+# DEV PROFILE
+# #################################
+# Argon2id is unusably slow without optimisation; tests and examples hash
+# passwords at the cost a release build pays.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
 
 
 # RELEASE PROFILE

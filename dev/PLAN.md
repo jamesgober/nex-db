@@ -131,3 +131,41 @@ Tier 1 (above) covers the common uses with no builder; Tier 2 adds a builder, ty
 | D-006 | No SQL; typed operations are the whole surface |
 | D-007 | `publish = false` until OD-1 is decided |
 | D-008 | Architecture and performance design live in the private design document; public files stay plain |
+| D-009 | (0.1) The commit log is one wal-db log of 16 MiB segments; a record is at most 16 MiB. Each record has a header (format, seq, kind, class, engine mask, section count) and one section per engine (engine, flags, format, collection, length, body), all fixed-width little endian and hand-written |
+| D-010 | (0.1) The commit pipeline runs under one commit lock: validate, assign seq, encode, append and sync, record the written keys, apply each section from the encoded bytes, publish the visible seq. Group commit and the bounded queue arrive in 0.3; the class byte (durable, priority) is written now |
+| D-011 | (0.1) A failed log write, sync, or apply stops every later commit; it is never retried. Reads continue; a restart recovers |
+| D-012 | (0.1) Snapshot isolation through a conflict table per engine (latest commit seq per written key), pruned below the oldest running transaction; a conflicting closure runs again, four attempts in all, then `Error::Conflict` |
+| D-013 | (0.1) Reads in 0.1 read the latest applied state of one engine. Consistent reads across engines at one snapshot (`db.read`, FR-6) arrive in 0.3 |
+| D-014 | (0.1) The catalog is engine 0. Each change rewrites `core/catalog.ckpt` atomically with a BLAKE3 checksum. A new database defines the default realm `users` (auth) and the default space `site` (content) in its first record |
+| D-015 | (0.1) Recovery replays every record in order, checks that sequence numbers have no gap, and lets each engine skip what its store holds. It refuses to open when a store holds a commit past the end of the log |
+| D-016 | (0.1) Engine stores are lsm-db with its own write-ahead log off; each commit's changes go in as one batch with an applied-through mark |
+| D-017 | (0.1) Auth sessions live in a standard map behind the hot-table seam, in memory only, rebuilt from the log at open (so auth replays the whole log in 0.1). Replaced in 0.3 |
+| D-018 | (0.1) Session token: version byte, 3-byte routing prefix (zero), 32 random bytes; 48 characters of URL-safe base64 without padding. Stored as keyed BLAKE3 of the random part |
+| D-019 | (0.1) A new database gets a random 32-byte root key in `auth/keys` (checksummed, owner-only on Unix). Token and identifier keys are keyed BLAKE3 of the root with fixed labels. A missing or damaged key file keeps an existing database closed. Replaced by key-vault in 0.3 |
+| D-020 | (0.1) Passwords: Argon2id with crypt-io's defaults (19 MiB, 2 passes, 1 lane); at most one hash per core at a time (`Error::Busy` beyond); an unknown identifier costs one Argon2id check against a dummy hash |
+| D-021 | (0.1) Content: entities in lsm-db; routes in standard maps (site, then path) behind the route-index seam, rebuilt from the store at open. Replaced in 0.4. A path belongs to a site; the default site is `default` |
+| D-022 | (0.1) Directory lock: the standard library file lock when built with Rust 1.89 or later; below that, an exclusive-share open on Windows and a pid file checked through `/proc` on Unix |
+| D-023 | (0.1) The engine contract (`Engine`, `Staged`) is internal until the design lock (0.2) |
+| D-024 | (0.1) Engines sit behind the `auth` and `content` features (both default). A database that uses an engine the build lacks refuses to open |
+| D-025 | (0.1) Limits: identifier 320 bytes, password 1024 bytes, session lifetime 400 days, 1,000,000 sessions, names 64 bytes, site 253 bytes, path 2048 bytes, 256 fields, text 1 MiB, commit 16 MiB. Configurable from 0.3 |
+| D-026 | (0.1) Known gap until 0.3: auth sections and account records are not sealed, so the Argon2id hash is stored in plain form in the log and the account store |
+| D-027 | (0.1) Known gap until wal-db 1.1 (requested): wal-db 1.0 cuts the log at the first damaged record when it opens, also in the middle of the log. D-015's check catches this whenever a store has flushed past the cut |
+| D-028 | (0.1) The dev profile builds `argon2` and `blake2` with optimisation, so tests and examples hash at release speed |
+| D-029 | (0.1) `cargo audit` ignores RUSTSEC-2026-0385 (`ctutils`) in `.cargo/audit.toml`: the crate is reachable only through crypt-io features nex-db does not enable, so it is not built (`cargo deny`, which follows enabled features, passes). Removed when nex-db moves to crypt-io 1.2.2 |
+
+### Third-party runtime dependencies brought in by first-party crates (OD-5, temporary)
+
+nex-db adds none of its own. `cargo tree -e normal` (default features, 0.1.0):
+
+| Through | Crates | Status |
+|---|---|---|
+| wal-db 1.0, lsm-db 1.1 | `crc32c` | exception until OD-5 |
+| wal-db, lsm-db (through error-forge 1.0) | `pastey`, `parking_lot`, `parking_lot_core`, `lock_api`, `scopeguard`, `smallvec`, `cfg-if`; `windows-link` on Windows, `libc` on Unix | exception until OD-5 |
+| crypt-io 1.2 (audited cryptography) | `argon2`, `blake2`, `password-hash`, `base64ct`, `rand_core`, `getrandom` (`libc` on Unix), `blake3`, `arrayvec`, `constant_time_eq`, `cpufeatures`, `chacha20poly1305`, `chacha20`, `poly1305`, `aead`, `cipher`, `universal-hash`, `inout`, `crypto-common`, `digest`, `block-buffer`, `generic-array`, `typenum`, `opaque-debug`, `subtle`, `zeroize` | allowed (cryptography through crypt-io) |
+| crypt-io (first-party) | `mod-rand` | first-party |
+
+### Defence ideas
+
+| Version | Idea | Method | Cost |
+|---|---|---|---|
+| 0.1 | A log cut by damage shows as a store holding commits past the log's end | compare every engine's applied mark with the last log seq at open; refuse to open when a mark is higher | one comparison per engine at open |

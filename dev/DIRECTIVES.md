@@ -28,7 +28,7 @@ An embedded database: engines side by side on one core (one commit log, one cata
 - **Zero CPU when idle.** No polling; timers sleep until due.
 - **Unsafe.** `#![forbid(unsafe_code)]`.
 - **Secrets.** Never in `Debug`, `Display`, errors, logs, or the change feed. Wiped after use.
-- **Cross-platform.** Linux, macOS, and Windows on x86_64 and aarch64, stable and MSRV 1.85, in CI. Crash-safety tests on all three.
+- **Cross-platform.** Linux, macOS, and Windows on x86_64 and aarch64, stable and MSRV 1.85. Crash-safety tests on all three. While the repository is private, CI runs Linux and Windows x86_64 only (to save Actions minutes); the full matrix is restored, and must pass, before it goes public.
 - **Error handling.** Every fallible path returns `Result`; `Error` is `#[non_exhaustive]`, carries a stable code, and says what to do.
 - **Production-ready.** `#![deny(missing_docs)]`; no `unwrap`/`expect`/`panic!`/`todo!`/`unimplemented!`/`unreachable!`/`dbg!`/printing in library code; every public item has rustdoc with a runnable example.
 - **Performance.** No claim without criterion numbers; regressions over 5% block a change. Numbers stay in private notes until James decides what is published.

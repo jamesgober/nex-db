@@ -122,6 +122,11 @@ pub use crate::{
     ids::{AccountId, Rid},
 };
 
+// Every Rust example in docs/API.md runs as a doctest.
+#[cfg(all(doctest, feature = "auth", feature = "content"))]
+#[doc = include_str!("../docs/API.md")]
+struct ApiDoc;
+
 /// Crate version string, populated by Cargo at build time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

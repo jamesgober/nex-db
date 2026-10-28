@@ -63,7 +63,7 @@ content = ["dep:lsm-db"]
 [dependencies]
 wal-db = "1.0"
 id-forge = { version = "1.0", default-features = false, features = ["ulid"] }
-crypt-io = { version = "1.2.1", default-features = false, features = [
+crypt-io = { version = "1.2.2", default-features = false, features = [
     "std",
     "zeroize",
     "hash-blake3",

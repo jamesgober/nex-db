@@ -1,14 +1,10 @@
-//! The database: open and recovery, the commit pipeline, transactions.
+//! The database facade: open, the engines it hosts, transactions.
+//!
+//! The commit pipeline, recovery, and the catalog live in
+//! [`Core`](crate::core::pipeline::Core); this module holds the typed engines
+//! and hands them to the core through the [`Registry`] contract.
 
-use std::{
-    collections::BTreeMap,
-    fmt,
-    path::{Path, PathBuf},
-    sync::{
-        Mutex, PoisonError,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-};
+use std::{fmt, path::Path};
 
 #[cfg(feature = "auth")]
 use crate::auth::{Auth, AuthEngine, AuthStaged, AuthTx};
@@ -16,18 +12,14 @@ use crate::auth::{Auth, AuthEngine, AuthStaged, AuthTx};
 use crate::content::{Content, ContentEngine, ContentStaged, ContentTx};
 use crate::{
     core::{
-        catalog::{Catalog, DEFAULT_REALM, DEFAULT_SPACE},
-        fs::{self, DirLock},
-        keys,
-        log::{CommitLog, MAX_RECORD},
-        record::{self, Class, Kind, RecordView, RecordWriter, Seq},
+        catalog::{DEFAULT_REALM, DEFAULT_SPACE},
+        fs, keys,
+        pipeline::{ATTEMPTS, Attempt, Core},
+        record::Seq,
     },
-    engine::{Engine, EngineId, Staged},
+    engine::{Engine, EngineId, Registry, Staged},
     error::{Error, Result},
 };
-
-/// Times a commit closure runs before [`Error::Conflict`].
-const ATTEMPTS: usize = 4;
 
 /// Open (or create) the database in the directory `path`.
 ///
@@ -59,27 +51,31 @@ pub fn open(path: impl AsRef<Path>) -> Result<Database> {
     Database::open(path)
 }
 
-/// The commit pipeline's state, behind the commit lock.
-#[derive(Debug, Default)]
-struct CommitState {
-    /// The last committed sequence number.
-    last: Seq,
-    /// Reused record buffer.
-    buf: Vec<u8>,
+/// The engines this build hosts, apart from the catalog.
+struct Engines {
+    #[cfg(feature = "auth")]
+    auth: AuthEngine,
+    #[cfg(feature = "content")]
+    content: ContentEngine,
 }
 
-/// Why one commit attempt did not land.
-enum Attempt {
-    /// A concurrent commit wrote a key this one writes; run the closure
-    /// again.
-    Conflict,
-    /// Anything else; returned to the caller.
-    Failed(Error),
-}
+impl Registry for Engines {
+    fn get(&self, id: EngineId) -> Option<&dyn Engine> {
+        match id {
+            #[cfg(feature = "auth")]
+            EngineId::AUTH => Some(&self.auth),
+            #[cfg(feature = "content")]
+            EngineId::CONTENT => Some(&self.content),
+            _ => None,
+        }
+    }
 
-impl From<Error> for Attempt {
-    fn from(err: Error) -> Self {
-        Attempt::Failed(err)
+    fn each(&self, f: &mut dyn FnMut(&dyn Engine)) {
+        #[cfg(feature = "auth")]
+        f(&self.auth);
+        #[cfg(feature = "content")]
+        f(&self.content);
+        let _ = f;
     }
 }
 
@@ -90,29 +86,16 @@ impl From<Error> for Attempt {
 /// own files (best effort; the commit log already holds them) and releases
 /// the directory.
 pub struct Database {
-    dir: PathBuf,
-    log: CommitLog,
-    commit: Mutex<CommitState>,
-    /// The highest sequence number applied in every engine it touched.
-    visible: AtomicU64,
-    /// Set after a failed log write or apply: no further commits.
-    halted: AtomicBool,
-    /// Snapshots of running transactions, with their counts.
-    snapshots: Mutex<BTreeMap<Seq, usize>>,
-    catalog: Catalog,
-    #[cfg(feature = "auth")]
-    pub(crate) auth: AuthEngine,
-    #[cfg(feature = "content")]
-    pub(crate) content: ContentEngine,
-    _lock: DirLock,
+    engines: Engines,
+    core: Core,
 }
 
 impl fmt::Debug for Database {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Database")
-            .field("dir", &self.dir)
-            .field("visible", &self.visible.load(Ordering::Acquire))
-            .field("halted", &self.halted.load(Ordering::Acquire))
+            .field("dir", &self.core.dir())
+            .field("visible", &self.core.visible())
+            .field("halted", &self.core.halted())
             .finish_non_exhaustive()
     }
 }
@@ -124,70 +107,37 @@ impl Database {
     ///
     /// See [`open`](crate::open).
     pub fn open(path: impl AsRef<Path>) -> Result<Database> {
-        let dir = path.as_ref().to_path_buf();
-        fs::create_dir(&dir)?;
-        let lock = DirLock::acquire(&dir)?;
-        let core_dir = dir.join("core");
+        let (core, new_database) = Core::open(path.as_ref())?;
+        let dir = core.dir().to_path_buf();
         let auth_dir = dir.join("auth");
-        fs::create_dir(&core_dir)?;
         fs::create_dir(&auth_dir)?;
-
-        let catalog = Catalog::open(&core_dir)?;
-        let log = CommitLog::open(&core_dir.join("log"))?;
-        let new_database = log.is_empty();
         if new_database {
-            if !catalog.is_empty() {
-                return Err(Error::corrupt("the commit log (records missing)", 0));
-            }
             keys::create_if_missing(&auth_dir)?;
         }
 
-        #[cfg(feature = "auth")]
-        let auth = {
-            let root = keys::load(&auth_dir)?;
-            AuthEngine::open(&auth_dir.join("accounts"), &root, DEFAULT_REALM.id)?
-        };
-        #[cfg(feature = "content")]
-        let content = ContentEngine::open(&dir.join("content").join("store"), DEFAULT_SPACE.id)?;
-
-        let db = Database {
-            dir,
-            log,
-            commit: Mutex::new(CommitState::default()),
-            visible: AtomicU64::new(0),
-            halted: AtomicBool::new(false),
-            snapshots: Mutex::new(BTreeMap::new()),
-            catalog,
+        let engines = Engines {
             #[cfg(feature = "auth")]
-            auth,
+            auth: {
+                let root = keys::load(&auth_dir)?;
+                AuthEngine::open(&auth_dir.join("accounts"), &root, DEFAULT_REALM.id)?
+            },
             #[cfg(feature = "content")]
-            content,
-            _lock: lock,
+            content: ContentEngine::open(&dir.join("content").join("store"), DEFAULT_SPACE.id)?,
         };
 
-        let last = db.replay()?;
-        db.commit
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .last = last;
-        db.visible.store(last, Ordering::Release);
-
-        if new_database {
-            let staged = Catalog::bootstrap();
-            match db.write(Kind::Catalog, Class::Durable, 0, &[&staged]) {
-                Ok(()) => {}
-                Err(Attempt::Failed(err)) => return Err(err),
-                Err(Attempt::Conflict) => return Err(Error::Conflict),
+        core.recover(&engines, new_database, &[DEFAULT_REALM, DEFAULT_SPACE])?;
+        for expected in [DEFAULT_REALM, DEFAULT_SPACE] {
+            if core.catalog().collection(expected.id) != Some(expected) {
+                return Err(Error::corrupt("the catalog (default collections)", 0));
             }
         }
-        db.check_collections()?;
-        Ok(db)
+        Ok(Database { engines, core })
     }
 
     /// The directory the database lives in.
     #[must_use]
     pub fn path(&self) -> &Path {
-        &self.dir
+        self.core.dir()
     }
 
     /// The auth engine: sessions, accounts, passwords.
@@ -204,6 +154,16 @@ impl Database {
     #[must_use]
     pub fn content(&self) -> Content<'_> {
         Content { db: self }
+    }
+
+    #[cfg(feature = "auth")]
+    pub(crate) fn auth_engine(&self) -> &AuthEngine {
+        &self.engines.auth
+    }
+
+    #[cfg(feature = "content")]
+    pub(crate) fn content_engine(&self) -> &ContentEngine {
+        &self.engines.content
     }
 
     /// Run `f` as one atomic commit across every engine it touches.
@@ -252,19 +212,13 @@ impl Database {
         F: FnMut(&mut Transaction<'_>) -> Result<T>,
     {
         for _ in 0..ATTEMPTS {
-            let snapshot = SnapshotGuard::begin(self);
-            let mut tx = Transaction::new(self, snapshot.seq);
+            let snapshot = self.core.snapshot();
+            let mut tx = Transaction::new(self, snapshot.seq());
             let value = f(&mut tx)?;
-            let staged = tx.staged();
-            if staged.is_empty() {
-                return Ok(value);
-            }
-            let class = if tx.is_priority() {
-                Class::Priority
-            } else {
-                Class::Durable
-            };
-            match self.write(Kind::Commit, class, snapshot.seq, &staged) {
+            match self
+                .core
+                .commit(&self.engines, snapshot.seq(), &tx.staged())
+            {
                 Ok(()) => return Ok(value),
                 Err(Attempt::Conflict) => {}
                 Err(Attempt::Failed(err)) => return Err(err),
@@ -272,230 +226,13 @@ impl Database {
         }
         Err(Error::Conflict)
     }
-
-    /// The commit pipeline: validate, sequence, encode, log and sync, apply
-    /// from the encoded bytes, publish.
-    fn write(
-        &self,
-        kind: Kind,
-        class: Class,
-        snapshot: Seq,
-        staged: &[&dyn Staged],
-    ) -> std::result::Result<(), Attempt> {
-        let mut state = self.commit.lock().unwrap_or_else(PoisonError::into_inner);
-        if self.halted.load(Ordering::Acquire) {
-            return Err(Attempt::Failed(Error::storage(
-                "committing",
-                "writes stopped after an earlier failed write",
-            )));
-        }
-        for work in staged {
-            if work.validate(snapshot).is_err() {
-                return Err(Attempt::Conflict);
-            }
-        }
-
-        let seq = state.last + 1;
-        let engines: Vec<EngineId> = staged.iter().map(|w| w.engine()).collect();
-        let buf = std::mem::take(&mut state.buf);
-        let mut record = RecordWriter::new(seq, kind, class, &engines, buf)?;
-        for work in staged {
-            let format = self.engine(work.engine())?.format();
-            let body = record.begin_section(work.engine(), format, work.collection())?;
-            work.encode(seq, body)?;
-            record.end_section()?;
-        }
-        let bytes = record.finish()?;
-        if bytes.len() > MAX_RECORD {
-            return Err(Attempt::Failed(Error::invalid(
-                "commit",
-                "larger than 16 MiB",
-            )));
-        }
-
-        // A failed write or sync is never retried: the bytes may already be
-        // gone from the page cache. Recovery after a restart decides.
-        if let Err(err) = self.log.append_durable(&bytes) {
-            self.halted.store(true, Ordering::Release);
-            return Err(Attempt::Failed(err));
-        }
-        for work in staged {
-            work.reserve(seq);
-        }
-        // Apply from the encoded bytes: the same path recovery takes.
-        let applied = record::decode(&bytes, 0).and_then(|view| self.apply_record(&view));
-        if let Err(err) = applied {
-            self.halted.store(true, Ordering::Release);
-            return Err(Attempt::Failed(err));
-        }
-        state.last = seq;
-        state.buf = bytes;
-        self.visible.store(seq, Ordering::Release);
-        drop(state);
-        self.reclaim();
-        Ok(())
-    }
-
-    /// Replay the log into the engines. Returns the last sequence number.
-    fn replay(&self) -> Result<Seq> {
-        let engines = self.engines();
-        let floor = engines
-            .iter()
-            .map(|e| e.durable_through())
-            .min()
-            .unwrap_or(0);
-        let top = engines
-            .iter()
-            .map(|e| e.durable_through())
-            .max()
-            .unwrap_or(0);
-        let mut last: Seq = 0;
-        self.log.replay(|lsn, bytes| {
-            let view = record::decode(bytes, lsn)?;
-            if view.seq != last + 1 {
-                return Err(Error::corrupt("the commit log sequence", view.seq));
-            }
-            last = view.seq;
-            if view.seq <= floor {
-                return Ok(());
-            }
-            self.apply_record(&view)
-        })?;
-        // An engine holding a commit the log does not have means the log
-        // lost records: refuse to open rather than serve a mix.
-        if top > last {
-            return Err(Error::corrupt("the commit log (ends early)", last));
-        }
-        Ok(last)
-    }
-
-    /// Hand each section of a decoded record to its engine.
-    fn apply_record(&self, view: &RecordView<'_>) -> Result<()> {
-        for section in &view.sections {
-            let catalog_section = section.engine == EngineId::CATALOG;
-            if catalog_section != (view.kind == Kind::Catalog) {
-                return Err(Error::corrupt("a log record (kind)", view.seq));
-            }
-            if section.flags != 0 {
-                return Err(Error::corrupt("a log section (flags)", view.seq));
-            }
-            if !catalog_section {
-                let bound = self
-                    .catalog
-                    .collection(section.collection)
-                    .is_some_and(|c| c.engine == section.engine);
-                if !bound {
-                    return Err(Error::corrupt("a log section (collection)", view.seq));
-                }
-            }
-            let engine = self.engine(section.engine)?;
-            debug_assert_eq!(engine.id(), section.engine);
-            engine.apply(view.seq, section.collection, section.format, section.body)?;
-        }
-        Ok(())
-    }
-
-    /// The default collections must be bound to their engines.
-    fn check_collections(&self) -> Result<()> {
-        for expected in [DEFAULT_REALM, DEFAULT_SPACE] {
-            if self.catalog.collection(expected.id) != Some(expected) {
-                return Err(Error::corrupt("the catalog (default collections)", 0));
-            }
-        }
-        Ok(())
-    }
-
-    fn engine(&self, id: EngineId) -> Result<&dyn Engine> {
-        match id {
-            EngineId::CATALOG => Ok(&self.catalog),
-            #[cfg(feature = "auth")]
-            EngineId::AUTH => Ok(&self.auth),
-            #[cfg(not(feature = "auth"))]
-            EngineId::AUTH => Err(Error::invalid(
-                "database",
-                "uses the auth engine, which this build does not include",
-            )),
-            #[cfg(feature = "content")]
-            EngineId::CONTENT => Ok(&self.content),
-            #[cfg(not(feature = "content"))]
-            EngineId::CONTENT => Err(Error::invalid(
-                "database",
-                "uses the content engine, which this build does not include",
-            )),
-            _ => Err(Error::corrupt("a log section (engine)", u64::from(id.0))),
-        }
-    }
-
-    fn engines(&self) -> Vec<&dyn Engine> {
-        #[allow(unused_mut)]
-        let mut engines: Vec<&dyn Engine> = vec![&self.catalog];
-        #[cfg(feature = "auth")]
-        engines.push(&self.auth);
-        #[cfg(feature = "content")]
-        engines.push(&self.content);
-        engines
-    }
-
-    /// Prune conflict tables below the oldest running snapshot.
-    fn reclaim(&self) {
-        let watermark = {
-            let snapshots = self
-                .snapshots
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            snapshots
-                .keys()
-                .next()
-                .copied()
-                .unwrap_or_else(|| self.visible.load(Ordering::Acquire))
-        };
-        #[cfg(feature = "auth")]
-        self.auth.reclaim(watermark);
-        #[cfg(feature = "content")]
-        self.content.reclaim(watermark);
-        let _ = watermark;
-    }
 }
 
 impl Drop for Database {
     fn drop(&mut self) {
         // Best effort: the log holds every commit, so a failure here only
         // means a longer replay at the next open.
-        for engine in self.engines() {
-            let _ = engine.checkpoint();
-        }
-    }
-}
-
-/// A running transaction's snapshot, registered so conflict tables keep the
-/// entries it may conflict with.
-struct SnapshotGuard<'db> {
-    db: &'db Database,
-    seq: Seq,
-}
-
-impl<'db> SnapshotGuard<'db> {
-    fn begin(db: &'db Database) -> Self {
-        let mut snapshots = db.snapshots.lock().unwrap_or_else(PoisonError::into_inner);
-        let seq = db.visible.load(Ordering::Acquire);
-        *snapshots.entry(seq).or_insert(0) += 1;
-        SnapshotGuard { db, seq }
-    }
-}
-
-impl Drop for SnapshotGuard<'_> {
-    fn drop(&mut self) {
-        let mut snapshots = self
-            .db
-            .snapshots
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(count) = snapshots.get_mut(&self.seq) {
-            *count -= 1;
-            if *count == 0 {
-                let _ = snapshots.remove(&self.seq);
-            }
-        }
+        self.core.checkpoint(&self.engines);
     }
 }
 
@@ -540,7 +277,9 @@ impl<'db> Transaction<'db> {
     pub fn auth(&mut self) -> AuthTx<'_, 'db> {
         let db = self.db;
         AuthTx {
-            staged: self.auth.get_or_insert_with(|| AuthStaged::new(&db.auth)),
+            staged: self
+                .auth
+                .get_or_insert_with(|| AuthStaged::new(db.auth_engine())),
         }
     }
 
@@ -552,11 +291,11 @@ impl<'db> Transaction<'db> {
         ContentTx {
             staged: self
                 .content
-                .get_or_insert_with(|| ContentStaged::new(&db.content)),
+                .get_or_insert_with(|| ContentStaged::new(db.content_engine())),
         }
     }
 
-    /// The engines' staged work that has something in it.
+    /// Every engine's staged work, for the core.
     fn staged(&self) -> Vec<&dyn Staged> {
         #[allow(unused_mut)]
         let mut staged: Vec<&dyn Staged> = Vec::new();
@@ -568,15 +307,6 @@ impl<'db> Transaction<'db> {
         if let Some(work) = &self.content {
             staged.push(work);
         }
-        staged.retain(|work| !work.is_empty());
         staged
-    }
-
-    fn is_priority(&self) -> bool {
-        #[cfg(feature = "auth")]
-        if let Some(work) = &self.auth {
-            return work.has_revocation();
-        }
-        false
     }
 }

@@ -72,6 +72,12 @@ cargo run --example site
 
 Version 0.1: the first working build. File formats and the API will change before 1.0. The plan is in [`dev/PLAN.md`](./dev/PLAN.md) and the schedule in [`dev/ROADMAP.md`](./dev/ROADMAP.md).
 
+## Documentation
+
+- [`docs/API.md`](./docs/API.md): the public API through 1.0, with the version each item arrives in.
+- [`docs/LOG_FORMAT.md`](./docs/LOG_FORMAT.md): the bytes of a commit log record.
+- [`docs/FILE_FORMATS.md`](./docs/FILE_FORMATS.md): the database directory and its files.
+
 ## License
 
 Licensed under either of

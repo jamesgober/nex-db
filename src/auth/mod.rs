@@ -295,11 +295,6 @@ impl AuthEngine {
             .map_err(|_| Error::invalid("password", "could not be hashed"))?;
         Ok(self.dummy.get_or_init(|| hash))
     }
-
-    /// Prune the conflict table below `watermark`.
-    pub(crate) fn reclaim(&self, watermark: Seq) {
-        self.conflicts.prune(watermark);
-    }
 }
 
 /// A held password-hashing slot.
@@ -383,6 +378,19 @@ impl Engine for AuthEngine {
         FORMAT
     }
 
+    fn define(&self, definition: &[u8]) -> Result<()> {
+        // Realm policies (lockout, session limits) arrive with 0.3; until
+        // then a realm has no definition.
+        if definition.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::invalid(
+                "realm definition",
+                "must be empty in this version",
+            ))
+        }
+    }
+
     fn apply(&self, seq: Seq, collection: u32, format: u16, body: &[u8]) -> Result<()> {
         if format != FORMAT || collection != self.collection {
             return Err(Error::corrupt("an auth section header", seq));
@@ -446,6 +454,10 @@ impl Engine for AuthEngine {
         self.accounts.flush()?;
         Ok(self.durable_through())
     }
+
+    fn reclaim(&self, watermark: Seq) {
+        self.conflicts.prune(watermark);
+    }
 }
 
 /// An auth operation staged in a transaction.
@@ -490,13 +502,6 @@ impl<'e> AuthStaged<'e> {
             issued: HashSet::new(),
         }
     }
-
-    /// True when the work holds a revocation, which commits as priority.
-    pub(crate) fn has_revocation(&self) -> bool {
-        self.ops
-            .iter()
-            .any(|op| matches!(op, StagedOp::RevokeSession { .. }))
-    }
 }
 
 impl Staged for AuthStaged<'_> {
@@ -510,6 +515,13 @@ impl Staged for AuthStaged<'_> {
 
     fn is_empty(&self) -> bool {
         self.ops.is_empty()
+    }
+
+    /// A revocation takes effect ahead of ordinary commits.
+    fn priority(&self) -> bool {
+        self.ops
+            .iter()
+            .any(|op| matches!(op, StagedOp::RevokeSession { .. }))
     }
 
     fn validate(&self, snapshot: Seq) -> std::result::Result<(), Conflict> {
@@ -710,7 +722,7 @@ pub struct Auth<'db> {
 
 impl Auth<'_> {
     fn engine(&self) -> &AuthEngine {
-        &self.db.auth
+        self.db.auth_engine()
     }
 
     /// Check a session token. Reads memory only and allocates nothing.

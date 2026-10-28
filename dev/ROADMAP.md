@@ -2,7 +2,7 @@
 
 > One milestone at a time, each ending with something that runs. Work only on the current milestone. Requirements (FR, NFR) are in [`PLAN.md`](./PLAN.md).
 
-**Current milestone: 0.1.0 (walking skeleton built; waiting for CI and for James to run the example).**
+**Current milestone: 0.2.0 (design lock: `docs/API.md` ready for James's review). 0.1.0 is built and waits for CI and for James to run the example.**
 
 ---
 
@@ -18,15 +18,22 @@
 - **Exit:** the example runs on all three platforms; the kill test passes 10,000 iterations.
 - Seams in 0.1, each replaced later behind the same calls: sessions in a standard map (hot table, 0.3), routes in standard maps (route index, 0.4), the root key file (key-vault, 0.3), one commit lock with a sync per commit (group commit, 0.3), full log replay at open (checkpoints and truncation, 0.3).
 - Blocker recorded, not blocking 0.1: wal-db 1.0 truncates the log at the first damaged record when it opens, also in the middle of the log (`PLAN.md` D-027). Requested from wal-db as an additive 1.1 (strict open); needed for fail-closed recovery by 0.3.
-- Move to crypt-io 1.2.2 when it is published and drop the `cargo audit` ignore (`PLAN.md` D-029).
+- [x] Move to crypt-io 1.2.2 and drop the `cargo audit` ignore (`PLAN.md` D-029, D-035; done in 0.2).
 - Run on macOS: not possible while CI is limited to Linux and Windows; the example and kill test run there when the full matrix returns.
 
 ## 0.2.0 Design lock
 
-- `docs/API.md` (whole public API, Tier 1 first), `docs/LOG_FORMAT.md`, `docs/FILE_FORMATS.md`.
-- The engine contract as code with documentation; a toy third engine in the tests.
-- Building-block checks done; upstream requests filed.
+- [x] `docs/API.md` (whole public API, Tier 1 first), `docs/LOG_FORMAT.md`, `docs/FILE_FORMATS.md`.
+- [x] The engine contract as code with documentation; a toy third engine in the tests (`PLAN.md` D-030 to D-033).
+- [x] Building-block checks done (`PLAN.md` D-038, D-039).
+- [ ] Upstream requests filed. Drafted; waiting for James, because the building-block repositories are public (`PLAN.md` D-040).
 - **Exit:** James approves `docs/API.md`.
+- Blockers recorded for 0.3, each requested from its crate:
+  - crypt-io has no AEAD call that takes the caller's nonce, which sealed auth sections need (`PLAN.md` D-039).
+  - wal-db 1.0 open cuts the log at any damaged record, accepts missing middle segments, and can lose every segment when a torn head marker follows a truncation; a strict open is being built upstream.
+  - lsm-db 1.1 has no checksum on its manifest (a damaged manifest can drop runs without an error) and drops the memtable when a flush fails.
+  - txn-db 1.0 needs `drain_through` and its oldest-reader mark for the account-store overlay.
+- macOS: store-io 0.4 has no macOS backend (it arrives in store-io 0.5). Direct I/O on macOS waits for it.
 
 ## 0.3.0 Core and auth
 

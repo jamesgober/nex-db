@@ -125,11 +125,6 @@ impl ContentEngine {
             None => Ok(None),
         }
     }
-
-    /// Prune the conflict table below `watermark`.
-    pub(crate) fn reclaim(&self, watermark: Seq) {
-        self.conflicts.prune(watermark);
-    }
 }
 
 fn route_entry(entry: &Entry) -> RouteEntry {
@@ -151,6 +146,19 @@ impl Engine for ContentEngine {
 
     fn format(&self) -> u16 {
         FORMAT
+    }
+
+    fn define(&self, definition: &[u8]) -> Result<()> {
+        // Space definitions (sites, fallback chains) arrive with 0.4; until
+        // then a space has no definition.
+        if definition.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::invalid(
+                "space definition",
+                "must be empty in this version",
+            ))
+        }
     }
 
     fn apply(&self, seq: Seq, collection: u32, format: u16, body: &[u8]) -> Result<()> {
@@ -191,6 +199,10 @@ impl Engine for ContentEngine {
     fn checkpoint(&self) -> Result<Seq> {
         self.store.flush()?;
         Ok(self.durable_through())
+    }
+
+    fn reclaim(&self, watermark: Seq) {
+        self.conflicts.prune(watermark);
     }
 }
 
@@ -319,7 +331,7 @@ pub struct Content<'db> {
 
 impl Content<'_> {
     fn engine(&self) -> &ContentEngine {
-        &self.db.content
+        self.db.content_engine()
     }
 
     /// The entity with `rid`, or `None`.

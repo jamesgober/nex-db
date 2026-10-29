@@ -162,7 +162,7 @@ Tier 1 (above) covers the common uses with no builder; Tier 2 adds a builder, ty
 | D-037 | (0.2) `Content::get(rid)` keeps reading the space's default locale; `get_in(rid, locale)` follows the fallback chain. Tier 1 keeps one argument |
 | D-038 | (0.2) Building-block checks that shape 0.3: any lsm-db write or flush error halts writes (a failed flush drops the memtable from the live handle); nex-db syncs a store's directory itself before trusting a flush; the log's 16 MiB record limit is a format constant (wal-db reads a longer record as a torn tail); audit-trail takes its time from the caller (the commit's time) and needs a durable sink from nex-db; page-db writes evicted pages without waiting for the log, so auth checkpoint pages are written only after the log covers them |
 | D-039 | (0.2) Sealed auth sections need a nonce derived from the sequence number; crypt-io 1.x draws every nonce itself. Requested upstream (crypt-io 1.3). If it is not there by 0.3, sections use XChaCha20-Poly1305 with random 24-byte nonces, at 24 bytes more per auth section |
-| D-040 | (0.2) The upstream requests are drafted but not posted: the building-block repositories are public, so posting is James's call. The wal-db strict-open request is being built in wal-db's own repository |
+| D-040 | (0.2) The upstream requests were drafted first and posted on James's go (2026-10-29), worded for each crate's general use: the building-block repositories are public. The wal-db strict-open request is built in wal-db's own repository; dependency clean-ups wait on OD-5 |
 
 ### Third-party runtime dependencies brought in by first-party crates (OD-5, temporary)
 

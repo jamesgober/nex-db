@@ -26,7 +26,7 @@
 - [x] `docs/API.md` (whole public API, Tier 1 first), `docs/LOG_FORMAT.md`, `docs/FILE_FORMATS.md`.
 - [x] The engine contract as code with documentation; a toy third engine in the tests (`PLAN.md` D-030 to D-033).
 - [x] Building-block checks done (`PLAN.md` D-038, D-039).
-- [ ] Upstream requests filed. Drafted; waiting for James, because the building-block repositories are public (`PLAN.md` D-040).
+- [x] Upstream requests filed (2026-10-29, on James's go): crypt-io, lsm-db, txn-db, index-db, audit-trail, key-vault; wal-db strict open is in wal-db's own pull request; dependency clean-ups wait on OD-5 (`PLAN.md` D-040).
 - **Exit:** James approves `docs/API.md`.
 - Blockers recorded for 0.3, each requested from its crate:
   - crypt-io has no AEAD call that takes the caller's nonce, which sealed auth sections need (`PLAN.md` D-039).

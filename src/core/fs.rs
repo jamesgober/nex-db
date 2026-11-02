@@ -131,10 +131,10 @@ fn lock_file(path: &Path) -> Result<File> {
 
 /// Unix before Rust 1.89: the standard library has no file lock, so the lock
 /// file holds the owner's process id. A file naming a live process is held;
-/// on Linux a process that has ended is detected through `/proc` and its
-/// lock is taken over. Elsewhere the lock file must be removed by hand after
-/// a crash. Two processes taking over the same stale lock at the same moment
-/// is not excluded; builds with Rust 1.89 or later use a real lock instead.
+/// a process that has ended is detected (through `/proc` on Linux, through
+/// `ps` elsewhere) and its lock is taken over. Two processes taking over the
+/// same stale lock at the same moment is not excluded; builds with Rust 1.89
+/// or later use a real lock instead.
 #[cfg(all(not(nex_file_lock), unix))]
 fn lock_file(path: &Path) -> Result<File> {
     if let Some(bytes) = read_optional(path)? {
@@ -163,8 +163,22 @@ fn process_is_alive(pid: u32) -> bool {
     if cfg!(target_os = "linux") {
         Path::new("/proc").join(pid.to_string()).exists()
     } else {
-        true
+        ps_finds(pid)
     }
+}
+
+/// True when `ps` lists `pid`, or when `ps` cannot be run: not knowing leaves
+/// the directory locked. One process spawn, only at open, and only when a
+/// lock file is already there.
+#[cfg(all(not(nex_file_lock), unix))]
+fn ps_finds(pid: u32) -> bool {
+    std::process::Command::new("/bin/ps")
+        .arg("-p")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_or(true, |status| status.success())
 }
 
 #[cfg(all(not(nex_file_lock), unix))]
@@ -220,6 +234,20 @@ mod tests {
         let dir = temp_dir("missing");
         assert!(read_optional(&dir.join("nope")).unwrap().is_none());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(all(not(nex_file_lock), unix))]
+    #[test]
+    fn test_ps_finds_live_process_and_not_ended_one() {
+        assert!(ps_finds(std::process::id()));
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let _ = child.wait().unwrap();
+        assert!(!ps_finds(pid));
     }
 
     #[test]

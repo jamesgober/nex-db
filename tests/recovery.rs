@@ -154,6 +154,25 @@ fn test_reopen_garbage_after_last_record_is_cut() {
 }
 
 #[test]
+fn test_reopen_damage_before_the_tail_stays_closed_and_leaves_the_log() {
+    let dir = TempDir::new("mid-log");
+    let db = Database::open(&dir.0).unwrap();
+    let _ = populate(&db, 0, 5);
+    drop(db);
+
+    let segment = first_segment(&dir.0);
+    let mut bytes = fs::read(&segment).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0xff;
+    fs::write(&segment, &bytes).unwrap();
+
+    assert!(matches!(Database::open(&dir.0), Err(Error::Corrupt { .. })));
+    // Refused, not repaired: the records after the damage are still there.
+    assert_eq!(fs::read(&segment).unwrap(), bytes);
+    assert!(matches!(Database::open(&dir.0), Err(Error::Corrupt { .. })));
+}
+
+#[test]
 fn test_reopen_log_shorter_than_stores_is_corrupt() {
     let dir = TempDir::new("short");
     {

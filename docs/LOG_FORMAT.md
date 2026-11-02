@@ -32,16 +32,17 @@ All integers are little endian. Lengths are in bytes.
 ## Framing
 
 The log lives in `core/log/` as a series of segment files of at most 16 MiB,
-written by [wal-db](https://github.com/jamesgober/wal-db) 1.0. wal-db frames
+written by [wal-db](https://github.com/jamesgober/wal-db) 1.1. wal-db frames
 each record with its length and a CRC32C checksum. On open it cuts an
 unfinished record at the end of the log (a write the crash interrupted, which
-never returned `Ok`).
+never returned `Ok`). nex-db opens the log under wal-db's strict policy, so
+damage anywhere before that point refuses the open and changes nothing.
 
 nex-db writes each record with one append followed by a sync, and returns
 from `commit` only after the sync. The largest record is 16 MiB; nex-db
 refuses a larger commit before writing it, and the same limit bounds what
 recovery reads. The limit is part of the format: a build with a smaller limit
-would read a longer record as damage.
+refuses a log holding a longer record.
 
 ## Record
 
@@ -177,9 +178,9 @@ A record is accepted only when:
 4. `seq` is one more than the previous record's;
 5. every section's collection is bound to its engine, and its `flags` are 0.
 
-A failure of 2 to 5 keeps the database closed with `Error::Corrupt`. wal-db
-1.0 handles a failed checksum (1) by cutting the log there, which is right
-for an interrupted last write but loses the records after damage in the
-middle of the log. nex-db then refuses to open when an engine's files hold a
-commit the shortened log no longer has; a stricter open in wal-db is
-requested so that every such case is refused.
+A failure of any of these keeps the database closed with `Error::Corrupt`,
+with one exception: a failed checksum (1) on the last record, with no intact
+record after it, is an interrupted write, and wal-db cuts it. A missing
+segment, or a record above the 16 MiB limit, also keeps the database closed.
+As a second check, nex-db refuses to open when an engine's files hold a commit
+the log does not have.

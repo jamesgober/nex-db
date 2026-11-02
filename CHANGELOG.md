@@ -23,5 +23,6 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 - Catalog format 2: a collection keeps its engine's definition. A database written by the unreleased 0.1 build does not open; delete its directory.
 - crypt-io 1.2.2.
+- wal-db 1.1, opened under its strict policy: damage before the end of the log, or a missing segment, now always keeps the database closed and leaves the log unchanged.
 
 [Unreleased]: https://github.com/jamesgober/nex-db/commits/main

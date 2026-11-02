@@ -2,12 +2,16 @@
 //!
 //! wal-db frames each record with a length and a CRC32C, cuts a torn tail
 //! when it opens, and coalesces concurrent syncs. This module adds nothing to
-//! the framing; it bounds record size and turns wal-db errors into nex-db
-//! errors.
+//! the framing; it bounds record size, opens the log under wal-db's strict
+//! policy, and turns wal-db errors into nex-db errors.
+//!
+//! Strict open cuts only an unfinished last record, which never returned
+//! `Ok`. Damage with an intact record after it, a missing segment, or a record
+//! above the size limit fails the open and leaves the log as it is.
 
 use std::path::Path;
 
-use wal_db::{SegmentedStore, Wal, WalConfig};
+use wal_db::{OpenPolicy, SegmentedStore, Wal, WalConfig};
 
 use crate::error::{Error, Result};
 
@@ -26,9 +30,11 @@ pub(crate) struct CommitLog {
 
 impl CommitLog {
     /// Open (or create) the log in `dir`. A torn tail left by a crash is cut
-    /// here, by wal-db.
+    /// here, by wal-db; damage before the tail refuses the open.
     pub(crate) fn open(dir: &Path) -> Result<Self> {
-        let config = WalConfig::new().with_max_record_size(MAX_RECORD as u32);
+        let config = WalConfig::new()
+            .with_max_record_size(MAX_RECORD as u32)
+            .with_open_policy(OpenPolicy::Strict);
         let wal = Wal::open_segmented_with(dir, SEGMENT_SIZE, config)?;
         Ok(CommitLog { wal })
     }

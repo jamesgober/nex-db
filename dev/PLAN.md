@@ -144,7 +144,7 @@ Tier 1 (above) covers the common uses with no builder; Tier 2 adds a builder, ty
 | D-019 | (0.1) A new database gets a random 32-byte root key in `auth/keys` (checksummed, owner-only on Unix). Token and identifier keys are keyed BLAKE3 of the root with fixed labels. A missing or damaged key file keeps an existing database closed. Replaced by key-vault in 0.3 |
 | D-020 | (0.1) Passwords: Argon2id with crypt-io's defaults (19 MiB, 2 passes, 1 lane); at most one hash per core at a time (`Error::Busy` beyond); an unknown identifier costs one Argon2id check against a dummy hash |
 | D-021 | (0.1) Content: entities in lsm-db; routes in standard maps (site, then path) behind the route-index seam, rebuilt from the store at open. Replaced in 0.4. A path belongs to a site; the default site is `default` |
-| D-022 | (0.1) Directory lock: the standard library file lock when built with Rust 1.89 or later; below that, an exclusive-share open on Windows and a pid file checked through `/proc` on Unix |
+| D-022 | (0.1) Directory lock: the standard library file lock when built with Rust 1.89 or later; below that, an exclusive-share open on Windows and a pid file on Unix, checked through `/proc` on Linux and `ps` elsewhere (when `ps` cannot run, the directory stays locked) |
 | D-023 | (0.1) The engine contract (`Engine`, `Staged`) is internal until the design lock (0.2). Settled by D-030 |
 | D-024 | (0.1) Engines sit behind the `auth` and `content` features (both default). A database that uses an engine the build lacks refuses to open |
 | D-025 | (0.1) Limits: identifier 320 bytes, password 1024 bytes, session lifetime 400 days, 1,000,000 sessions, names 64 bytes, site 253 bytes, path 2048 bytes, 256 fields, text 1 MiB, commit 16 MiB. Configurable from 0.3 |

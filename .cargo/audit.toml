@@ -1,0 +1,11 @@
+# cargo-audit configuration for nex-db.
+#
+# RUSTSEC-2026-0385 (ctutils before 0.4.4): ctutils is reachable only through
+# crypt-io's `hash-sha2` and `mac-hmac` features (digest 0.11), which nex-db
+# does not enable. `cargo tree -e normal -i ctutils` prints nothing and
+# `cargo deny check advisories` (which follows enabled features) passes; the
+# entry is in the lockfile only because Cargo records every optional
+# dependency. Remove this entry when nex-db moves to crypt-io 1.2.2
+# (dev/PLAN.md D-029).
+[advisories]
+ignore = ["RUSTSEC-2026-0385"]

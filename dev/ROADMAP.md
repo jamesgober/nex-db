@@ -2,20 +2,24 @@
 
 > One milestone at a time, each ending with something that runs. Work only on the current milestone. Requirements (FR, NFR) are in [`PLAN.md`](./PLAN.md).
 
-**Current milestone: 0.1.0 (scaffold done; walking skeleton next).**
+**Current milestone: 0.1.0 (walking skeleton built; waiting for CI and for James to run the example).**
 
 ---
 
 ## 0.1.0 Scaffold and walking skeleton
 
 - [x] Repository, `Cargo.toml`, `src/lib.rs` with `VERSION`, CI, `cargo deny` configuration, plan files.
-- [ ] Core: commit log on wal-db with the engine-tagged record header; sequencer; visible sequence; catalog; recovery replay (FR-1, FR-2, FR-4, FR-5).
-- [ ] Auth: sessions in a standard map behind the hot-table seam (replaced in 0.3); accounts and identifiers in lsm-db; Argon2id through crypt-io; `validate`, `issue_session`, `revoke`, `create_account`, `hash_password`, `sign_in`.
-- [ ] Content: entities in lsm-db; routes in a standard map behind the route-index seam (replaced in 0.4); `create`, `get`, `resolve`.
-- [ ] `db.commit` across both engines (FR-3).
-- [ ] `examples/site.rs`: sign up (account and profile in one commit), sign in, validate, resolve, reopen.
-- [ ] Kill test: the process is killed at random points in a loop; every reopen matches the last acknowledged commit.
+- [x] Core: commit log on wal-db with the engine-tagged record header; sequencer; visible sequence; catalog; recovery replay (FR-1, FR-2, FR-4, FR-5).
+- [x] Auth: sessions in a standard map behind the hot-table seam (replaced in 0.3); accounts and identifiers in lsm-db; Argon2id through crypt-io; `validate`, `issue_session`, `revoke`, `create_account`, `hash_password`, `sign_in`.
+- [x] Content: entities in lsm-db; routes in a standard map behind the route-index seam (replaced in 0.4); `create`, `get`, `resolve`.
+- [x] `db.commit` across both engines (FR-3).
+- [x] `examples/site.rs`: sign up (account and profile in one commit), sign in, validate, resolve, reopen.
+- [x] Kill test: the process is killed at random points in a loop; every reopen matches the last acknowledged commit.
 - **Exit:** the example runs on all three platforms; the kill test passes 10,000 iterations.
+- Seams in 0.1, each replaced later behind the same calls: sessions in a standard map (hot table, 0.3), routes in standard maps (route index, 0.4), the root key file (key-vault, 0.3), one commit lock with a sync per commit (group commit, 0.3), full log replay at open (checkpoints and truncation, 0.3).
+- Blocker recorded, not blocking 0.1: wal-db 1.0 truncates the log at the first damaged record when it opens, also in the middle of the log (`PLAN.md` D-027). Requested from wal-db as an additive 1.1 (strict open); needed for fail-closed recovery by 0.3.
+- Move to crypt-io 1.2.2 when it is published and drop the `cargo audit` ignore (`PLAN.md` D-029).
+- Run on macOS: not possible while CI is limited to Linux and Windows; the example and kill test run there when the full matrix returns.
 
 ## 0.2.0 Design lock
 

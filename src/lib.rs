@@ -1,32 +1,78 @@
 //! # nex_db
 //!
 //! An embedded database. Engines run side by side on one core: one commit
-//! log, one catalog, and one read snapshot shared by every engine, so a
+//! log, one catalog, and one sequence of commits shared by every engine, so a
 //! commit that touches several engines is atomic. Every operation is typed;
 //! there is no query string to build or inject.
 //!
-//! The first engines are an auth engine (sessions, credentials, tokens,
-//! roles), kept sealed under its own keys and files, and a content engine
-//! (pages, translations, routes).
+//! The engines in this version are an auth engine (accounts, password
+//! hashing, sessions), whose credentials and session tokens are stored only
+//! as hashes and digests, and a content engine (entities and the routes they
+//! are served at).
 //!
 //! ## Tier 1
 //!
-//! ```
-//! println!("nex-db {}", nex_db::VERSION);
-//! ```
+//! ```no_run
+//! # #[cfg(all(feature = "auth", feature = "content"))]
+//! # fn main() -> nex_db::Result<()> {
+//! use nex_db::{Entity, SessionSpec, SignIn, Validation};
 //!
-//! The Tier 1 entry points arrive with the first engines:
-//!
-//! ```text
 //! let db = nex_db::open("data/site")?;
-//! let check = db.auth().validate(&token)?;
-//! let route = db.content().resolve("example.com", "/blog/hello")?;
-//! let account = db.commit(|tx| { /* typed operations on several engines */ })?;
+//!
+//! // Sign up: an account (auth) and a profile page (content) in one commit.
+//! let password = db.auth().hash_password("correct horse battery staple")?;
+//! let account = db.commit(|tx| {
+//!     let account = tx.auth().create_account("ann@example.com", &password)?;
+//!     tx.content().create(
+//!         Entity::new("profile")
+//!             .field("account", account)
+//!             .field("display_name", "Ann")
+//!             .site("example.com")
+//!             .path("/u/ann"),
+//!     )?;
+//!     Ok(account)
+//! })?;
+//!
+//! // Sign in, then check the session on each request.
+//! if let SignIn::Success { token, .. } =
+//!     db.auth().sign_in("ann@example.com", "correct horse battery staple", SessionSpec::web())?
+//! {
+//!     assert!(matches!(db.auth().validate(&token)?, Validation::Valid(s) if s.account() == account));
+//! }
+//!
+//! // Serve the profile page.
+//! if let Some(route) = db.content().resolve("example.com", "/u/ann")? {
+//!     let page = db.content().get(route.entity())?;
+//!     # let _ = page;
+//! }
+//! # Ok(())
+//! # }
+//! # #[cfg(not(all(feature = "auth", feature = "content")))]
+//! # fn main() {}
 //! ```
+//!
+//! ## Guarantees
+//!
+//! - A commit that returned `Ok` survives a crash of the process at any
+//!   point; a commit that did not return never appears in part.
+//! - Every state change is applied from the bytes written to the log, by the
+//!   same code after a commit and during recovery.
+//! - A failed log write or sync stops all further commits; it is never
+//!   retried.
+//! - A missing key or a damaged log keeps the database closed.
+//! - A revoked session never validates again.
+//!
+//! ## Features
+//!
+//! | Feature | Default | Enables |
+//! |---|---|---|
+//! | `auth` | yes | the auth engine |
+//! | `content` | yes | the content engine |
 //!
 //! ## Status
 //!
-//! Scaffold. No functional code yet.
+//! Version 0.1: the first working build. The file formats and the API change
+//! before 1.0.
 
 #![doc(html_root_url = "https://docs.rs/nex-db")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -41,9 +87,40 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::unreachable,
-        clippy::dbg_macro
+        clippy::dbg_macro,
+        clippy::print_stdout,
+        clippy::print_stderr
     )
 )]
+
+#[cfg(feature = "auth")]
+mod auth;
+#[cfg(feature = "content")]
+mod content;
+mod core;
+mod db;
+mod engine;
+mod error;
+mod ids;
+
+#[cfg(feature = "auth")]
+#[cfg_attr(docsrs, doc(cfg(feature = "auth")))]
+pub use crate::auth::{
+    Auth, AuthTx,
+    token::Token,
+    types::{HashedPassword, RevokeReason, Session, SessionSpec, SignIn, Validation},
+};
+#[cfg(feature = "content")]
+#[cfg_attr(docsrs, doc(cfg(feature = "content")))]
+pub use crate::content::{
+    Content, ContentTx,
+    entity::{DEFAULT_SITE, Entity, Entry, RouteEntry, RouteKind, Value},
+};
+pub use crate::{
+    db::{Database, Transaction, open},
+    error::{Error, Result},
+    ids::{AccountId, Rid},
+};
 
 /// Crate version string, populated by Cargo at build time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

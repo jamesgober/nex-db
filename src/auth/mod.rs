@@ -63,7 +63,11 @@ const SEAL_KEY_ID: u32 = 1;
 /// gives a section of the same size.
 const PAD_BUCKET: usize = 256;
 
+/// Create an account with its record and credential in plain form (format
+/// 1 logs only; read, never written).
 const OP_CREATE_ACCOUNT: u8 = 1;
+/// Create an account whose record, credential included, is already sealed.
+const OP_CREATE_SEALED_ACCOUNT: u8 = 4;
 const OP_ISSUE_SESSION: u8 = 2;
 const OP_REVOKE_SESSION: u8 = 3;
 
@@ -92,6 +96,18 @@ const CREDENTIAL_PASSWORD: u8 = 1;
 const TOKEN_KEY_LABEL: &[u8] = b"nex-db 2026 auth token digest";
 const IDENTIFIER_KEY_LABEL: &[u8] = b"nex-db 2026 auth identifier digest";
 const SEAL_KEY_LABEL: &[u8] = b"nex-db 2026 auth log seal";
+const FILE_KEY_LABEL: &[u8] = b"nex-db 2026 auth file";
+
+/// First byte of a sealed account-store value. Plain values from 0.1 and 0.2
+/// start with their format byte, 1.
+const VALUE_SEALED: u8 = 2;
+
+/// Id of the key that seals account-store values: XChaCha20-Poly1305 under
+/// the file key.
+const FILE_KEY_ID: u32 = 1;
+
+/// Format of the plaintext inside a sealed account record.
+const ACCOUNT_FORMAT_SEALED: u8 = 2;
 
 fn store_key(collection: u32, tag: u8, id: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(5 + id.len());
@@ -147,6 +163,8 @@ pub(crate) struct AuthEngine {
     identifier_key: Zeroizing<[u8; 32]>,
     /// Seals and opens this engine's log sections.
     seal_key: Zeroizing<[u8; 32]>,
+    /// Seals and opens account-store values.
+    file_key: Zeroizing<[u8; 32]>,
     accounts: Lsm,
     /// Highest seq whose account changes the account store holds.
     applied: AtomicU64,
@@ -189,6 +207,7 @@ impl AuthEngine {
             token_key: root.derive(TOKEN_KEY_LABEL),
             identifier_key: root.derive(IDENTIFIER_KEY_LABEL),
             seal_key: root.derive(SEAL_KEY_LABEL),
+            file_key: root.derive(FILE_KEY_LABEL),
             accounts,
             applied: AtomicU64::new(applied),
             sessions: SessionTable::new(),
@@ -228,6 +247,14 @@ impl AuthEngine {
     }
 
     fn password_hash(&self, account: AccountId) -> Result<Option<Zeroizing<String>>> {
+        let key = account_key(self.collection, account);
+        if let Some(value) = self.accounts.get(&key)? {
+            if value.first() == Some(&VALUE_SEALED) {
+                let plain = open_value(&self.file_key, &key, &value)?;
+                return sealed_account_phc(&plain).map(Some);
+            }
+        }
+        // A plain account from 0.1 or 0.2 keeps its credential apart.
         let Some(bytes) = self
             .accounts
             .get(credential_key(self.collection, account))?
@@ -335,6 +362,11 @@ enum Op<'a> {
         created_ms: u64,
         phc: &'a str,
     },
+    CreateSealedAccount {
+        account: AccountId,
+        digest: [u8; 32],
+        value: &'a [u8],
+    },
     IssueSession {
         digest: [u8; 32],
         session: Session,
@@ -355,6 +387,11 @@ fn decode_ops(seq: Seq, body: &[u8]) -> Result<Vec<Op<'_>>> {
                 digest: r.fixed()?,
                 created_ms: r.u64()?,
                 phc: r.str16()?,
+            },
+            OP_CREATE_SEALED_ACCOUNT => Op::CreateSealedAccount {
+                account: AccountId::from_bytes(r.fixed()?),
+                digest: r.fixed()?,
+                value: r.bytes32()?,
             },
             OP_ISSUE_SESSION => {
                 let digest = r.fixed()?;
@@ -432,6 +469,15 @@ impl Engine for AuthEngine {
         if seq > self.applied.load(Ordering::Acquire) {
             let mut batch = Batch::new();
             for op in &ops {
+                if let Op::CreateSealedAccount {
+                    account,
+                    digest,
+                    value,
+                } = op
+                {
+                    batch.put(account_key(self.collection, *account), *value);
+                    batch.put(identifier_key(self.collection, digest), account.as_bytes());
+                }
                 if let Op::CreateAccount {
                     account,
                     digest,
@@ -467,7 +513,7 @@ impl Engine for AuthEngine {
             match op {
                 Op::IssueSession { digest, session } => self.sessions.insert(digest, session),
                 Op::RevokeSession { digest, reason } => self.sessions.revoke(digest, reason),
-                Op::CreateAccount { .. } => {}
+                Op::CreateAccount { .. } | Op::CreateSealedAccount { .. } => {}
             }
         }
         Ok(())
@@ -495,8 +541,8 @@ enum StagedOp {
     CreateAccount {
         account: AccountId,
         digest: [u8; 32],
-        created_ms: u64,
-        phc: Zeroizing<String>,
+        /// The account record, sealed while staging (see [`seal_value`]).
+        value: Vec<u8>,
     },
     IssueSession {
         digest: [u8; 32],
@@ -594,14 +640,12 @@ fn write_ops(ops: &[StagedOp], out: &mut Vec<u8>) -> Result<()> {
             StagedOp::CreateAccount {
                 account,
                 digest,
-                created_ms,
-                phc,
+                value,
             } => {
-                w.u8(OP_CREATE_ACCOUNT);
+                w.u8(OP_CREATE_SEALED_ACCOUNT);
                 w.bytes(account.as_bytes());
                 w.bytes(digest);
-                w.u64(*created_ms);
-                w.str16(phc)?;
+                w.bytes32(value)?;
             }
             StagedOp::IssueSession {
                 digest,
@@ -624,6 +668,82 @@ fn write_ops(ops: &[StagedOp], out: &mut Vec<u8>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Seal an account-store value under the file key:
+/// `2 | key id u32 | nonce [24] | ciphertext | tag [16]`, with the store key
+/// as associated data, so a value moved to another key fails to open.
+///
+/// Values are sealed while staging, never in `apply`: sealing draws a random
+/// nonce, and `apply` must reach the same state on every replay. The sealed
+/// bytes travel inside the (sealed) log section and `apply` stores them as
+/// they are.
+fn seal_value(key: &[u8; 32], store_key: &[u8], plain: &[u8]) -> Result<Vec<u8>> {
+    let sealed = Crypt::xchacha20_poly1305()
+        .encrypt_with_aad(&key[..], plain, store_key)
+        .map_err(|e| Error::storage("sealing an account record", e))?;
+    let mut out = Vec::with_capacity(5 + sealed.len());
+    out.push(VALUE_SEALED);
+    out.extend_from_slice(&FILE_KEY_ID.to_le_bytes());
+    out.extend_from_slice(&sealed);
+    Ok(out)
+}
+
+/// Open a value sealed by [`seal_value`].
+fn open_value(key: &[u8; 32], store_key: &[u8], value: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    let corrupt = || Error::corrupt("a sealed account record", 0);
+    let rest = value.strip_prefix(&[VALUE_SEALED]).ok_or_else(corrupt)?;
+    let (id, sealed) = rest.split_at_checked(4).ok_or_else(corrupt)?;
+    if id != FILE_KEY_ID.to_le_bytes() {
+        return Err(corrupt());
+    }
+    Crypt::xchacha20_poly1305()
+        .decrypt_with_aad(&key[..], sealed, store_key)
+        .map(Zeroizing::new)
+        .map_err(|_| corrupt())
+}
+
+/// A new account's record, sealed: format, created time, identifier digest,
+/// standing, epoch, then the credential (kind and Argon2id string).
+fn seal_account(
+    engine: &AuthEngine,
+    account: AccountId,
+    digest: &[u8; 32],
+    created_ms: u64,
+    phc: &str,
+) -> Result<Vec<u8>> {
+    let mut plain = Zeroizing::new(Vec::with_capacity(52 + phc.len()));
+    let mut w = Writer::new(&mut plain);
+    w.u8(ACCOUNT_FORMAT_SEALED);
+    w.u64(created_ms);
+    w.bytes(digest);
+    w.u8(STANDING_ACTIVE);
+    w.u32(0);
+    w.u8(CREDENTIAL_PASSWORD);
+    w.str16(phc)?;
+    seal_value(
+        &engine.file_key,
+        &account_key(engine.collection, account),
+        &plain,
+    )
+}
+
+/// The password hash inside an opened sealed account record.
+fn sealed_account_phc(plain: &[u8]) -> Result<Zeroizing<String>> {
+    let mut r = Reader::new(plain, "a sealed account record", 0);
+    if r.u8()? != ACCOUNT_FORMAT_SEALED {
+        return Err(Error::corrupt("a sealed account record", 0));
+    }
+    let _created_ms = r.u64()?;
+    let _digest = r.fixed::<32>()?;
+    let _standing = r.u8()?;
+    let _epoch = r.u32()?;
+    if r.u8()? != CREDENTIAL_PASSWORD {
+        return Err(Error::corrupt("a sealed account record", 0));
+    }
+    let phc = Zeroizing::new(r.str16()?.to_owned());
+    r.finish()?;
+    Ok(phc)
 }
 
 /// Associated data of a sealed section: what binds the ciphertext to its
@@ -750,11 +870,11 @@ impl AuthTx<'_, '_> {
         self.staged
             .writes
             .push(account_key(engine.collection, account));
+        let value = seal_account(engine, account, &digest, now_ms(), &password.0)?;
         self.staged.ops.push(StagedOp::CreateAccount {
             account,
             digest,
-            created_ms: now_ms(),
-            phc: Zeroizing::new(password.0.clone()),
+            value,
         });
         Ok(account)
     }
@@ -1067,11 +1187,20 @@ mod tests {
         let account = AccountId::from_bytes([1; 16]);
         // A real Argon2id hash string, the longest field of any operation.
         let phc = kdf::argon2_hash(b"a password").unwrap();
+        let mut plain = Zeroizing::new(Vec::new());
+        let mut w = Writer::new(&mut plain);
+        w.u8(ACCOUNT_FORMAT_SEALED);
+        w.u64(u64::MAX);
+        w.bytes(&[2; 32]);
+        w.u8(STANDING_ACTIVE);
+        w.u32(0);
+        w.u8(CREDENTIAL_PASSWORD);
+        w.str16(&phc).unwrap();
+        let value = seal_value(&[5; 32], &account_key(1, account), &plain).unwrap();
         let create = sealed_len(StagedOp::CreateAccount {
             account,
             digest: [2; 32],
-            created_ms: u64::MAX,
-            phc: Zeroizing::new(phc),
+            value,
         });
         let issue = sealed_len(StagedOp::IssueSession {
             digest: [2; 32],
@@ -1131,5 +1260,22 @@ mod tests {
         assert!(engine.apply(3, &flagged).is_err());
         drop(engine);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn test_sealed_value_round_trips_and_is_bound_to_its_key() {
+        let key = [6u8; 32];
+        let value = seal_value(&key, b"store key a", b"record").unwrap();
+        assert_eq!(value[0], VALUE_SEALED);
+        assert_eq!(
+            &open_value(&key, b"store key a", &value).unwrap()[..],
+            b"record"
+        );
+        assert!(open_value(&key, b"store key b", &value).is_err());
+        assert!(open_value(&[7u8; 32], b"store key a", &value).is_err());
+        let mut bad = value.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 1;
+        assert!(open_value(&key, b"store key a", &bad).is_err());
     }
 }

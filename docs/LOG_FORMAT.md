@@ -172,6 +172,12 @@ The operations:
 | 1 | create account | `account [16]`, `identifier digest [32]`, `created ms u64`, `password hash str16` |
 | 2 | issue session | `token digest [32]`, `account [16]`, `created ms u64`, `expires ms u64` |
 | 3 | revoke session | `token digest [32]`, `reason u8` (1 = revoked), `at ms u64` |
+| 4 | create account (sealed record) | `account [16]`, `identifier digest [32]`, `record bytes32` |
+
+Operation 1 appears only in format 1 logs. From 0.3 a new account is
+operation 4: its record, the password hash included, is sealed under the file
+key before it enters the section, so the store holds exactly the bytes the log
+carries; see [FILE_FORMATS.md](./FILE_FORMATS.md#account-store-authaccounts).
 
 Times are milliseconds since the Unix epoch, chosen when the operation was
 staged, so a replay reaches the same state. Digests are keyed BLAKE3 values;

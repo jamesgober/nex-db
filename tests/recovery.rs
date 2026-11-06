@@ -249,13 +249,25 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 #[test]
-fn test_log_holds_no_password_hash_or_identifier() {
+fn test_files_hold_no_password_hash_or_identifier() {
     let dir = TempDir::new("sealed");
     let db = Database::open(&dir.0).unwrap();
     let _ = populate(&db, 0, 3);
+    // Dropping writes the account store to its own files.
     drop(db);
     let log = all_bytes(&dir.0.join("core").join("log"));
-    assert!(!log.is_empty());
-    assert!(!contains(&log, b"$argon2id$"));
-    assert!(!contains(&log, b"u1@example.com"));
+    let accounts = all_bytes(&dir.0.join("auth").join("accounts"));
+    assert!(!log.is_empty() && !accounts.is_empty());
+    for bytes in [&log, &accounts] {
+        assert!(!contains(bytes, b"$argon2id$"));
+        assert!(!contains(bytes, b"u1@example.com"));
+    }
+    // Sign-in still reads the sealed record.
+    let db = Database::open(&dir.0).unwrap();
+    assert!(matches!(
+        db.auth()
+            .sign_in("u1@example.com", PASSWORD, SessionSpec::web())
+            .unwrap(),
+        SignIn::Success { .. }
+    ));
 }

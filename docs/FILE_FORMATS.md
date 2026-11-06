@@ -105,6 +105,7 @@ Derived keys are `keyed BLAKE3(root key, label)`:
 | `nex-db 2026 auth token digest` | session token digests |
 | `nex-db 2026 auth identifier digest` | identifier digests |
 | `nex-db 2026 auth log seal` | sealed auth sections in the log (0.3) |
+| `nex-db 2026 auth file` | sealed account records (0.3) |
 
 ## The engine stores
 
@@ -128,28 +129,45 @@ keys sort together), then a one-byte tag.
 
 | Key | Value |
 |---|---|
-| `collection, 'a', account [16]` | account record |
+| `collection, 'a', account [16]` | account record, sealed (from 0.3) or plain |
 | `collection, 'i', identifier digest [32]` | `account [16]` |
-| `collection, 'c', account [16]` | credential record |
+| `collection, 'c', account [16]` | credential record, plain accounts only |
 
-Account record:
+A sealed account record (written from 0.3) is
 
 ```text
-format u8                 1
+marker u8                 2
+key id u32                1: XChaCha20-Poly1305 under the file key
+nonce [24]
+ciphertext
+tag [16]
+```
+
+with the store key as associated data, so a record copied to another key
+fails to open. The file key is `keyed BLAKE3(root key, "nex-db 2026 auth
+file")`. Inside, the credential travels with the account:
+
+```text
+format u8                 2
 created ms u64
 identifier digest [32]
 standing u8               1 = active
 epoch u32                 0
-```
-
-Credential record:
-
-```text
-kind u8                   1 = password
+credential kind u8        1 = password
 password hash str16       Argon2id, PHC format
 ```
 
-From 0.3 the values are encrypted with the auth engine's file key.
+Records are sealed when the commit is staged, not when it is applied, and the
+sealed bytes travel inside the sealed log section; applying a commit stores
+them as they are, so every replay writes the same bytes.
+
+Accounts created by 0.1 and 0.2 keep their plain records, still read:
+
+```text
+account record            format u8 (1), created ms u64, identifier digest [32],
+                          standing u8, epoch u32
+credential record         kind u8 (1 = password), password hash str16
+```
 
 Sessions are not stored here: in this version they live in memory and are
 rebuilt from the commit log at open.

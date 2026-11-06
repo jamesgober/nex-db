@@ -40,6 +40,7 @@
   - [x] Group commit with a bounded queue; a failed write, sync, or apply halts writes (`PLAN.md` D-045).
 - Key hierarchy through key-vault and crypt-io; sealed auth sections.
   - [x] Sealed and padded auth sections in the log (`PLAN.md` D-047).
+  - [x] Sealed account records in the account store (`PLAN.md` D-048).
 - Hot table, timer wheel, epoch table, tombstones, checkpoints; standing, counters, lockout, audit chain, revocation journal (FR-6, FR-7).
 - **Exit:** James's site signs users in on nex-db.
 

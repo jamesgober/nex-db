@@ -15,7 +15,7 @@ pub(crate) mod token;
 pub(crate) mod types;
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt,
     path::Path,
     sync::{
@@ -28,7 +28,7 @@ use crypt_io::{Crypt, Zeroizing, kdf, mac};
 use lsm_db::{Batch, Lsm};
 
 use self::{
-    sessions::{SessionTable, Slot},
+    sessions::{EpochTable, SessionTable, Slot},
     token::Token,
     types::{HashedPassword, RevokeReason, Session, SessionSpec, SignIn, Validation},
 };
@@ -68,8 +68,17 @@ const PAD_BUCKET: usize = 256;
 const OP_CREATE_ACCOUNT: u8 = 1;
 /// Create an account whose record, credential included, is already sealed.
 const OP_CREATE_SEALED_ACCOUNT: u8 = 4;
+/// Issue a session without an epoch (format 1 logs only; read as epoch 0).
 const OP_ISSUE_SESSION: u8 = 2;
+/// Issue a session at the account's epoch.
+const OP_ISSUE_SESSION_AT_EPOCH: u8 = 5;
+/// Raise an account's epoch: every older session of the account ends.
+const OP_RAISE_EPOCH: u8 = 6;
 const OP_REVOKE_SESSION: u8 = 3;
+
+/// Revoke reasons in the log.
+const REASON_REVOKED: u8 = 1;
+const REASON_ROTATED: u8 = 2;
 
 /// Longest identifier (an email address), in bytes.
 const MAX_IDENTIFIER: usize = 320;
@@ -130,6 +139,15 @@ fn credential_key(collection: u32, account: AccountId) -> Vec<u8> {
 }
 
 /// Conflict-table key for a session digest.
+/// Conflict key of an account's epoch: two sign-outs everywhere of one
+/// account conflict, so each raises the epoch it read.
+fn epoch_key(account: &AccountId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(17);
+    key.push(b'E');
+    key.extend_from_slice(account.as_bytes());
+    key
+}
+
 fn session_key(digest: &[u8; 32]) -> Vec<u8> {
     let mut key = Vec::with_capacity(33);
     key.push(b's');
@@ -169,6 +187,7 @@ pub(crate) struct AuthEngine {
     /// Highest seq whose account changes the account store holds.
     applied: AtomicU64,
     sessions: SessionTable,
+    epochs: EpochTable,
     conflicts: ConflictTable,
     /// Password hashes in progress, bounded by `max_hashing`.
     hashing: AtomicUsize,
@@ -211,6 +230,7 @@ impl AuthEngine {
             accounts,
             applied: AtomicU64::new(applied),
             sessions: SessionTable::new(),
+            epochs: EpochTable::new(),
             conflicts: ConflictTable::new(),
             hashing: AtomicUsize::new(0),
             max_hashing,
@@ -292,6 +312,11 @@ impl AuthEngine {
             None => Validation::Unknown,
             Some(Slot::Revoked(reason)) => Validation::Revoked { reason },
             Some(Slot::Live(session)) if now_ms() >= session.expires_ms => Validation::Expired,
+            Some(Slot::Live(session)) if session.epoch != self.epochs.get(session.account) => {
+                Validation::Revoked {
+                    reason: RevokeReason::SignedOutEverywhere,
+                }
+            }
             Some(Slot::Live(session)) => Validation::Valid(session),
         }
     }
@@ -375,6 +400,10 @@ enum Op<'a> {
         digest: [u8; 32],
         reason: RevokeReason,
     },
+    RaiseEpoch {
+        account: AccountId,
+        epoch: u32,
+    },
 }
 
 fn decode_ops(seq: Seq, body: &[u8]) -> Result<Vec<Op<'_>>> {
@@ -404,13 +433,35 @@ fn decode_ops(seq: Seq, body: &[u8]) -> Result<Vec<Op<'_>>> {
                         account,
                         created_ms,
                         expires_ms,
+                        epoch: 0,
                     },
                 }
             }
+            OP_ISSUE_SESSION_AT_EPOCH => {
+                let digest = r.fixed()?;
+                let account = AccountId::from_bytes(r.fixed()?);
+                let created_ms = r.u64()?;
+                let expires_ms = r.u64()?;
+                let epoch = r.u32()?;
+                Op::IssueSession {
+                    digest,
+                    session: Session {
+                        account,
+                        created_ms,
+                        expires_ms,
+                        epoch,
+                    },
+                }
+            }
+            OP_RAISE_EPOCH => Op::RaiseEpoch {
+                account: AccountId::from_bytes(r.fixed()?),
+                epoch: r.u32()?,
+            },
             OP_REVOKE_SESSION => {
                 let digest = r.fixed()?;
                 let reason = match r.u8()? {
-                    1 => RevokeReason::Revoked,
+                    REASON_REVOKED => RevokeReason::Revoked,
+                    REASON_ROTATED => RevokeReason::Rotated,
                     _ => return Err(Error::corrupt("an auth revoke reason", seq)),
                 };
                 let _at_ms = r.u64()?;
@@ -513,6 +564,7 @@ impl Engine for AuthEngine {
             match op {
                 Op::IssueSession { digest, session } => self.sessions.insert(digest, session),
                 Op::RevokeSession { digest, reason } => self.sessions.revoke(digest, reason),
+                Op::RaiseEpoch { account, epoch } => self.epochs.raise(account, epoch),
                 Op::CreateAccount { .. } | Op::CreateSealedAccount { .. } => {}
             }
         }
@@ -549,10 +601,16 @@ enum StagedOp {
         account: AccountId,
         created_ms: u64,
         expires_ms: u64,
+        epoch: u32,
     },
     RevokeSession {
         digest: [u8; 32],
+        reason: RevokeReason,
         at_ms: u64,
+    },
+    RaiseEpoch {
+        account: AccountId,
+        epoch: u32,
     },
 }
 
@@ -565,6 +623,8 @@ pub(crate) struct AuthStaged<'e> {
     identifiers: HashSet<[u8; 32]>,
     accounts: HashSet<AccountId>,
     issued: HashSet<[u8; 32]>,
+    /// Epochs this work raised, by account.
+    raised: HashMap<AccountId, u32>,
 }
 
 impl<'e> AuthStaged<'e> {
@@ -576,6 +636,7 @@ impl<'e> AuthStaged<'e> {
             identifiers: HashSet::new(),
             accounts: HashSet::new(),
             issued: HashSet::new(),
+            raised: HashMap::new(),
         }
     }
 }
@@ -595,9 +656,12 @@ impl Staged for AuthStaged<'_> {
 
     /// A revocation takes effect ahead of ordinary commits.
     fn priority(&self) -> bool {
-        self.ops
-            .iter()
-            .any(|op| matches!(op, StagedOp::RevokeSession { .. }))
+        self.ops.iter().any(|op| {
+            matches!(
+                op,
+                StagedOp::RevokeSession { .. } | StagedOp::RaiseEpoch { .. }
+            )
+        })
     }
 
     fn validate(&self, snapshot: Seq) -> std::result::Result<(), Conflict> {
@@ -652,18 +716,32 @@ fn write_ops(ops: &[StagedOp], out: &mut Vec<u8>) -> Result<()> {
                 account,
                 created_ms,
                 expires_ms,
+                epoch,
             } => {
-                w.u8(OP_ISSUE_SESSION);
+                w.u8(OP_ISSUE_SESSION_AT_EPOCH);
                 w.bytes(digest);
                 w.bytes(account.as_bytes());
                 w.u64(*created_ms);
                 w.u64(*expires_ms);
+                w.u32(*epoch);
             }
-            StagedOp::RevokeSession { digest, at_ms } => {
+            StagedOp::RevokeSession {
+                digest,
+                reason,
+                at_ms,
+            } => {
                 w.u8(OP_REVOKE_SESSION);
                 w.bytes(digest);
-                w.u8(1);
+                w.u8(match reason {
+                    RevokeReason::Rotated => REASON_ROTATED,
+                    _ => REASON_REVOKED,
+                });
                 w.u64(*at_ms);
+            }
+            StagedOp::RaiseEpoch { account, epoch } => {
+                w.u8(OP_RAISE_EPOCH);
+                w.bytes(account.as_bytes());
+                w.u32(*epoch);
             }
         }
     }
@@ -896,18 +974,111 @@ impl AuthTx<'_, '_> {
                 what: "the session table",
             });
         }
+        let created_ms = now_ms();
+        self.stage_session(
+            account,
+            created_ms,
+            created_ms.saturating_add(spec.ttl_ms()),
+        )
+    }
+
+    /// Stage a session for `account` at its current epoch (counting a raise
+    /// staged in this transaction).
+    fn stage_session(
+        &mut self,
+        account: AccountId,
+        created_ms: u64,
+        expires_ms: u64,
+    ) -> Result<Token> {
+        let engine = self.staged.engine;
         let (token, random) = Token::generate()?;
         let digest = engine.token_digest(&random);
-        let created_ms = now_ms();
+        let epoch = self.epoch(account);
         let _ = self.staged.issued.insert(digest);
         self.staged.writes.push(session_key(&digest));
         self.staged.ops.push(StagedOp::IssueSession {
             digest,
             account,
             created_ms,
-            expires_ms: created_ms.saturating_add(spec.ttl_ms()),
+            expires_ms,
+            epoch,
         });
         Ok(token)
+    }
+
+    /// The account's epoch as this transaction sees it.
+    fn epoch(&self, account: AccountId) -> u32 {
+        self.staged
+            .raised
+            .get(&account)
+            .copied()
+            .unwrap_or_else(|| self.staged.engine.epochs.get(account))
+    }
+
+    /// Sign `account` out everywhere: every session issued before this
+    /// commit ends, at once and on every reader, as
+    /// `Revoked { reason: SignedOutEverywhere }`. Returns how many sessions
+    /// were live. A session issued later in the same transaction stays valid.
+    ///
+    /// Commits ahead of ordinary commits.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the account does not exist.
+    pub fn revoke_all(&mut self, account: AccountId) -> Result<u32> {
+        let engine = self.staged.engine;
+        if !self.staged.accounts.contains(&account) && !engine.account_exists(account)? {
+            return Err(Error::invalid("account", "no such account"));
+        }
+        let epoch = self.epoch(account);
+        let live = engine.sessions.live_for(account, epoch, now_ms());
+        let next = epoch
+            .checked_add(1)
+            .ok_or(Error::invalid("account", "signed out too many times"))?;
+        // Sessions staged earlier in this transaction end too.
+        self.staged
+            .ops
+            .retain(|op| !matches!(op, StagedOp::IssueSession { account: a, .. } if *a == account));
+        let _ = self.staged.raised.insert(account, next);
+        self.staged.writes.push(epoch_key(&account));
+        self.staged.ops.push(StagedOp::RaiseEpoch {
+            account,
+            epoch: next,
+        });
+        Ok(live)
+    }
+
+    /// Replace the session `token` names with a new one for the same
+    /// account and the same expiry; the old token becomes
+    /// `Revoked { reason: Rotated }`. Use it after a sign-in step-up or a
+    /// privilege change, so a token seen before cannot be replayed.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the token names no valid session.
+    pub fn rotate(&mut self, token: impl AsRef<str>) -> Result<Token> {
+        let engine = self.staged.engine;
+        let session = token::parse(token.as_ref())
+            .map(|random| engine.token_digest(&random))
+            .and_then(|digest| match engine.sessions.get(&digest) {
+                Some(Slot::Live(session))
+                    if now_ms() < session.expires_ms
+                        && session.epoch == self.epoch(session.account) =>
+                {
+                    Some((digest, session))
+                }
+                _ => None,
+            });
+        let Some((digest, session)) = session else {
+            return Err(Error::invalid("token", "names no valid session"));
+        };
+        self.staged.writes.push(session_key(&digest));
+        self.staged.ops.push(StagedOp::RevokeSession {
+            digest,
+            reason: RevokeReason::Rotated,
+            at_ms: now_ms(),
+        });
+        self.stage_session(session.account, now_ms(), session.expires_ms)
     }
 
     /// Revoke the session `token` names. Returns `true` when a session was
@@ -931,6 +1102,7 @@ impl AuthTx<'_, '_> {
         self.staged.writes.push(session_key(&digest));
         self.staged.ops.push(StagedOp::RevokeSession {
             digest,
+            reason: RevokeReason::Revoked,
             at_ms: now_ms(),
         });
         Ok(true)
@@ -1018,6 +1190,37 @@ impl Auth<'_> {
     pub fn revoke(&self, token: impl AsRef<str>) -> Result<bool> {
         let token = token.as_ref();
         self.db.commit(|tx| tx.auth().revoke(token))
+    }
+
+    /// Sign an account out everywhere in its own commit. See
+    /// [`AuthTx::revoke_all`].
+    ///
+    /// ```no_run
+    /// # fn main() -> nex_db::Result<()> {
+    /// # let db = nex_db::open("data/site")?;
+    /// # let account = nex_db::AccountId::from_bytes([1; 16]);
+    /// let ended = db.auth().revoke_all(account)?;
+    /// # let _ = ended;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`AuthTx::revoke_all`], plus the errors of [`Database::commit`].
+    pub fn revoke_all(&self, account: AccountId) -> Result<u32> {
+        self.db.commit(|tx| tx.auth().revoke_all(account))
+    }
+
+    /// Replace a session's token in its own commit. See
+    /// [`AuthTx::rotate`].
+    ///
+    /// # Errors
+    ///
+    /// As [`AuthTx::rotate`], plus the errors of [`Database::commit`].
+    pub fn rotate(&self, token: impl AsRef<str>) -> Result<Token> {
+        let token = token.as_ref();
+        self.db.commit(|tx| tx.auth().rotate(token))
     }
 
     /// Check `password` for `identifier` inside the engine and, when it
@@ -1207,11 +1410,18 @@ mod tests {
             account,
             created_ms: u64::MAX,
             expires_ms: u64::MAX,
+            epoch: u32::MAX,
         });
         let revoke = sealed_len(StagedOp::RevokeSession {
             digest: [2; 32],
+            reason: RevokeReason::Rotated,
             at_ms: u64::MAX,
         });
+        let raise = sealed_len(StagedOp::RaiseEpoch {
+            account,
+            epoch: u32::MAX,
+        });
+        assert_eq!(revoke, raise);
         assert_eq!(create, issue);
         assert_eq!(issue, revoke);
     }
@@ -1227,17 +1437,14 @@ mod tests {
         crate::core::keys::create_if_missing(&dir).unwrap();
         let root = crate::core::keys::load(&dir).unwrap();
         let engine = AuthEngine::open(&dir.join("accounts"), &root, 1).unwrap();
+        // A format 1 body as 0.1 and 0.2 wrote it: issue session, no epoch.
         let mut body = Vec::new();
-        write_ops(
-            &[StagedOp::IssueSession {
-                digest: [4; 32],
-                account: AccountId::from_bytes([1; 16]),
-                created_ms: 0,
-                expires_ms: u64::MAX,
-            }],
-            &mut body,
-        )
-        .unwrap();
+        let mut w = Writer::new(&mut body);
+        w.u8(OP_ISSUE_SESSION);
+        w.bytes(&[4; 32]);
+        w.bytes(&[1; 16]);
+        w.u64(0);
+        w.u64(u64::MAX);
         let plain = Section {
             engine: EngineId::AUTH,
             flags: 0,

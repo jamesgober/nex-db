@@ -171,8 +171,15 @@ The operations:
 |---|---|---|
 | 1 | create account | `account [16]`, `identifier digest [32]`, `created ms u64`, `password hash str16` |
 | 2 | issue session | `token digest [32]`, `account [16]`, `created ms u64`, `expires ms u64` |
-| 3 | revoke session | `token digest [32]`, `reason u8` (1 = revoked), `at ms u64` |
+| 3 | revoke session | `token digest [32]`, `reason u8` (1 = revoked, 2 = rotated), `at ms u64` |
 | 4 | create account (sealed record) | `account [16]`, `identifier digest [32]`, `record bytes32` |
+| 5 | issue session at an epoch | `token digest [32]`, `account [16]`, `created ms u64`, `expires ms u64`, `epoch u32` |
+| 6 | raise an account's epoch | `account [16]`, `epoch u32` |
+
+A session is valid only while its epoch equals the account's current epoch
+(0 until the first raise), so operation 6 ends every older session of the
+account at once. An epoch never goes down. Operations 1 and 2 appear only in
+format 1 logs; operation 2 is read as epoch 0.
 
 Operation 1 appears only in format 1 logs. From 0.3 a new account is
 operation 4: its record, the password hash included, is sealed under the file

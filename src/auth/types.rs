@@ -74,6 +74,9 @@ pub struct Session {
     pub(crate) account: AccountId,
     pub(crate) created_ms: u64,
     pub(crate) expires_ms: u64,
+    /// The account's epoch when the session was issued. Signing the account
+    /// out everywhere raises the epoch, which ends every older session.
+    pub(crate) epoch: u32,
 }
 
 impl Session {
@@ -103,6 +106,11 @@ pub enum RevokeReason {
     /// Revoked with [`revoke`](crate::Auth::revoke) (a sign-out, or an
     /// administrator).
     Revoked,
+    /// Replaced by a new token with [`rotate`](crate::Auth::rotate).
+    Rotated,
+    /// Ended by [`revoke_all`](crate::Auth::revoke_all): the account was
+    /// signed out everywhere.
+    SignedOutEverywhere,
 }
 
 /// The outcome of validating a token. Every outcome except `Valid` means the
@@ -191,6 +199,7 @@ mod tests {
             account: AccountId::from_bytes([1; 16]),
             created_ms: 1,
             expires_ms: 2,
+            epoch: 0,
         };
         assert_eq!(Validation::Valid(session).session(), Some(session));
         assert_eq!(Validation::Unknown.session(), None);

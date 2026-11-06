@@ -15,6 +15,7 @@ use std::{
 };
 
 use super::types::{RevokeReason, Session};
+use crate::ids::AccountId;
 
 /// One entry: a live session, or the tombstone a revocation leaves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +54,18 @@ impl SessionTable {
         let _ = slots.insert(digest, Slot::Revoked(reason));
     }
 
+    /// Live sessions of `account` that are still valid at `now_ms` under
+    /// `epoch`. Walks the whole table: the hot table that replaces this map
+    /// keeps a per-account index instead.
+    pub(crate) fn live_for(&self, account: AccountId, epoch: u32, now_ms: u64) -> u32 {
+        let slots = self.slots.read().unwrap_or_else(PoisonError::into_inner);
+        let live = slots.values().filter(|slot| {
+            matches!(slot, Slot::Live(s)
+                if s.account == account && s.epoch == epoch && now_ms < s.expires_ms)
+        });
+        u32::try_from(live.count()).unwrap_or(u32::MAX)
+    }
+
     /// Number of slots, tombstones included.
     pub(crate) fn len(&self) -> usize {
         self.slots
@@ -62,17 +75,80 @@ impl SessionTable {
     }
 }
 
+/// The current epoch of each account that was ever signed out everywhere.
+/// An account not listed is at epoch 0. Read-latest, like the sessions.
+#[derive(Debug, Default)]
+pub(crate) struct EpochTable {
+    epochs: RwLock<HashMap<AccountId, u32>>,
+}
+
+impl EpochTable {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// The account's epoch. Allocates nothing.
+    pub(crate) fn get(&self, account: AccountId) -> u32 {
+        let epochs = self.epochs.read().unwrap_or_else(PoisonError::into_inner);
+        epochs.get(&account).copied().unwrap_or(0)
+    }
+
+    /// Raise the account's epoch to `epoch`. An epoch never goes down, so a
+    /// replayed or reordered raise is harmless.
+    pub(crate) fn raise(&self, account: AccountId, epoch: u32) {
+        let mut epochs = self.epochs.write().unwrap_or_else(PoisonError::into_inner);
+        let current = epochs.entry(account).or_insert(0);
+        *current = (*current).max(epoch);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::AccountId;
 
     fn session() -> Session {
         Session {
             account: AccountId::from_bytes([7; 16]),
             created_ms: 1,
             expires_ms: 10,
+            epoch: 0,
         }
+    }
+
+    #[test]
+    fn test_live_for_counts_only_current_unexpired_sessions() {
+        let table = SessionTable::new();
+        table.insert([1; 32], session());
+        table.insert(
+            [2; 32],
+            Session {
+                epoch: 1,
+                ..session()
+            },
+        );
+        table.insert([3; 32], session());
+        table.revoke([3; 32], RevokeReason::Revoked);
+        table.insert(
+            [4; 32],
+            Session {
+                account: AccountId::from_bytes([8; 16]),
+                ..session()
+            },
+        );
+        let account = AccountId::from_bytes([7; 16]);
+        assert_eq!(table.live_for(account, 0, 5), 1);
+        assert_eq!(table.live_for(account, 1, 5), 1);
+        assert_eq!(table.live_for(account, 0, 10), 0);
+    }
+
+    #[test]
+    fn test_epoch_only_rises() {
+        let epochs = EpochTable::new();
+        let account = AccountId::from_bytes([7; 16]);
+        assert_eq!(epochs.get(account), 0);
+        epochs.raise(account, 2);
+        epochs.raise(account, 1);
+        assert_eq!(epochs.get(account), 2);
     }
 
     #[test]

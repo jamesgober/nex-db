@@ -42,6 +42,7 @@
   - [x] Sealed and padded auth sections in the log (`PLAN.md` D-047).
   - [x] Sealed account records in the account store (`PLAN.md` D-048).
 - Hot table, timer wheel, epoch table, tombstones, checkpoints; standing, counters, lockout, audit chain, revocation journal (FR-6, FR-7).
+  - [x] Epoch table, `revoke_all`, `rotate` (`PLAN.md` D-049).
 - **Exit:** James's site signs users in on nex-db.
 
 ## 0.4.0 Content and adapters

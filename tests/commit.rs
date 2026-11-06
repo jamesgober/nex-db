@@ -292,3 +292,122 @@ fn test_secrets_never_in_debug_output() {
     assert!(!shown.contains(token.as_str()));
     assert!(!shown.contains("argon2"));
 }
+
+#[test]
+fn test_revoke_all_ends_every_session_of_the_account_only() {
+    let dir = TempDir::new("revoke-all");
+    let db = Database::open(&dir.0).unwrap();
+    let password = db.auth().hash_password("pw").unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    let bo = db
+        .auth()
+        .create_account("bo@example.com", &password)
+        .unwrap();
+    let a1 = db.auth().issue_session(ann, SessionSpec::web()).unwrap();
+    let a2 = db.auth().issue_session(ann, SessionSpec::web()).unwrap();
+    let b1 = db.auth().issue_session(bo, SessionSpec::web()).unwrap();
+
+    assert_eq!(db.auth().revoke_all(ann).unwrap(), 2);
+    for token in [&a1, &a2] {
+        assert_eq!(
+            db.auth().validate(token).unwrap(),
+            Validation::Revoked {
+                reason: RevokeReason::SignedOutEverywhere
+            }
+        );
+    }
+    assert!(matches!(
+        db.auth().validate(&b1).unwrap(),
+        Validation::Valid(_)
+    ));
+    // A session issued afterwards is valid; signing out again ends it.
+    let a3 = db.auth().issue_session(ann, SessionSpec::web()).unwrap();
+    assert!(matches!(
+        db.auth().validate(&a3).unwrap(),
+        Validation::Valid(_)
+    ));
+    assert_eq!(db.auth().revoke_all(ann).unwrap(), 1);
+    assert!(!matches!(
+        db.auth().validate(&a3).unwrap(),
+        Validation::Valid(_)
+    ));
+    drop(db);
+
+    // The epochs come back with the log.
+    let db = Database::open(&dir.0).unwrap();
+    assert!(!matches!(
+        db.auth().validate(&a1).unwrap(),
+        Validation::Valid(_)
+    ));
+    assert!(!matches!(
+        db.auth().validate(&a3).unwrap(),
+        Validation::Valid(_)
+    ));
+    assert!(matches!(
+        db.auth().validate(&b1).unwrap(),
+        Validation::Valid(_)
+    ));
+}
+
+#[test]
+fn test_revoke_all_in_one_commit_with_a_new_session_keeps_only_the_new_one() {
+    let dir = TempDir::new("revoke-all-tx");
+    let db = Database::open(&dir.0).unwrap();
+    let password = db.auth().hash_password("pw").unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    let old = db.auth().issue_session(ann, SessionSpec::web()).unwrap();
+    let new = db
+        .commit(|tx| {
+            let _ = tx.auth().revoke_all(ann)?;
+            tx.auth().issue_session(ann, SessionSpec::web())
+        })
+        .unwrap();
+    assert!(!matches!(
+        db.auth().validate(&old).unwrap(),
+        Validation::Valid(_)
+    ));
+    assert!(matches!(
+        db.auth().validate(&new).unwrap(),
+        Validation::Valid(_)
+    ));
+}
+
+#[test]
+fn test_rotate_replaces_the_token_and_keeps_the_expiry() {
+    let dir = TempDir::new("rotate");
+    let db = Database::open(&dir.0).unwrap();
+    let password = db.auth().hash_password("pw").unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    let old = db.auth().issue_session(ann, SessionSpec::web()).unwrap();
+    let Validation::Valid(before) = db.auth().validate(&old).unwrap() else {
+        panic!("valid");
+    };
+    let new = db.auth().rotate(&old).unwrap();
+    assert_eq!(
+        db.auth().validate(&old).unwrap(),
+        Validation::Revoked {
+            reason: RevokeReason::Rotated
+        }
+    );
+    let Validation::Valid(after) = db.auth().validate(&new).unwrap() else {
+        panic!("valid");
+    };
+    assert_eq!(
+        (after.account(), after.expires_at()),
+        (ann, before.expires_at())
+    );
+    assert!(matches!(db.auth().rotate(&old), Err(Error::Invalid { .. })));
+    assert!(matches!(
+        db.auth().rotate("not a token"),
+        Err(Error::Invalid { .. })
+    ));
+}

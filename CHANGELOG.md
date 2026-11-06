@@ -12,6 +12,7 @@ All notable changes to `nex-db` are documented in this file. The format is based
 - `Auth::revoke_all` and `AuthTx::revoke_all` (sign an account out everywhere), and `rotate`.
 - `Auth::verify_password`, `Login`, `Auth::standing`, `set_standing`, and `Standing`; ten failed sign-ins within fifteen minutes lock an account out for fifteen minutes. `SignIn::LockedOut`.
 - `RevokeReason::Rotated` and `RevokeReason::SignedOutEverywhere`.
+- `Database::builder`, `Builder`, and `Keys`: the root key from a file outside the directory (`Keys::file`) or an environment variable (`Keys::env`). `auth/key.check` makes the wrong key fail as `KeyUnavailable`.
 - `Database::read`, `Read`, `AuthRead`, and `ContentRead`: reads across engines at one snapshot. `Error::SnapshotTooOld` (NEX-1009) after 60 seconds.
 
 ### Changed

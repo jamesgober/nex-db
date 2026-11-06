@@ -1812,8 +1812,9 @@ mod tests {
             id_forge::ulid::Ulid::new()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        crate::core::keys::create_if_missing(&dir).unwrap();
-        let root = crate::core::keys::load(&dir).unwrap();
+        let path = dir.join(crate::core::keys::KEY_FILE);
+        crate::core::keys::create_file_if_missing(&path).unwrap();
+        let root = crate::core::keys::load_file(&path).unwrap();
         let engine = AuthEngine::open(&dir.join("accounts"), &root, 1).unwrap();
         // A format 1 body as 0.1 and 0.2 wrote it: issue session, no epoch.
         let mut body = Vec::new();

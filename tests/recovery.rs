@@ -271,3 +271,40 @@ fn test_files_hold_no_password_hash_or_identifier() {
         SignIn::Success { .. }
     ));
 }
+
+#[test]
+fn test_key_outside_the_directory_is_needed_to_open() {
+    let dir = TempDir::new("key-file");
+    let key_dir = TempDir::new("key-file-key");
+    fs::create_dir_all(&key_dir.0).unwrap();
+    let key = key_dir.0.join("site.key");
+    {
+        let db = Database::builder(&dir.0)
+            .keys(nex_db::Keys::file(&key))
+            .open()
+            .unwrap();
+        let _ = populate(&db, 0, 1);
+    }
+    assert!(key.exists());
+    assert!(!dir.0.join("auth").join("keys").exists());
+    // The directory alone does not open, and neither does another key.
+    assert!(matches!(Database::open(&dir.0), Err(Error::KeyUnavailable)));
+    let other = key_dir.0.join("other.key");
+    assert!(matches!(
+        Database::builder(&dir.0)
+            .keys(nex_db::Keys::file(&other))
+            .open(),
+        Err(Error::KeyUnavailable)
+    ));
+    // The right key opens it with everything in place.
+    let db = Database::builder(&dir.0)
+        .keys(nex_db::Keys::file(&key))
+        .open()
+        .unwrap();
+    assert!(matches!(
+        db.auth()
+            .sign_in("u0@example.com", PASSWORD, SessionSpec::web())
+            .unwrap(),
+        SignIn::Success { .. }
+    ));
+}

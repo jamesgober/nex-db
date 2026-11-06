@@ -119,7 +119,8 @@ pub use crate::content::{
     entity::{DEFAULT_SITE, Entity, Entry, RouteEntry, RouteKind, Value},
 };
 pub use crate::{
-    db::{Database, Read, Transaction, open},
+    core::keys::Keys,
+    db::{Builder, Database, Read, Transaction, open},
     error::{Error, Result},
     ids::{AccountId, Rid},
 };

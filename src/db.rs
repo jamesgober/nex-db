@@ -13,7 +13,8 @@ use crate::content::{Content, ContentEngine, ContentRead, ContentStaged, Content
 use crate::{
     core::{
         catalog::{DEFAULT_REALM, DEFAULT_SPACE},
-        fs, keys,
+        fs,
+        keys::{self, Keys},
         pipeline::{ATTEMPTS, Attempt, Core, SnapshotGuard},
         record::Seq,
     },
@@ -79,6 +80,44 @@ impl Registry for Engines {
     }
 }
 
+/// Opens a database with settings other than the defaults. Made by
+/// [`Database::builder`].
+///
+/// ```no_run
+/// # fn main() -> nex_db::Result<()> {
+/// let db = nex_db::Database::builder("data/site")
+///     .keys(nex_db::Keys::env("SITE_DB_KEY"))
+///     .open()?;
+/// # let _ = db;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct Builder {
+    dir: std::path::PathBuf,
+    keys: Keys,
+}
+
+impl Builder {
+    /// Where the root key comes from. The default is a key file inside the
+    /// database directory; see [`Keys`].
+    pub fn keys(mut self, keys: Keys) -> Self {
+        self.keys = keys;
+        self
+    }
+
+    /// Open (or create) the database.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`](crate::open). [`Error::KeyUnavailable`] also when the key
+    /// is not the one the database was created with.
+    pub fn open(self) -> Result<Database> {
+        Database::open_with(self)
+    }
+}
+
 /// An open database.
 ///
 /// `Database` is `Send` and `Sync`: share it between threads by reference or
@@ -107,20 +146,31 @@ impl Database {
     ///
     /// See [`open`](crate::open).
     pub fn open(path: impl AsRef<Path>) -> Result<Database> {
-        let (core, new_database) = Core::open(path.as_ref())?;
+        Database::builder(path).open()
+    }
+
+    /// A builder for opening the database in `path` with settings other than
+    /// the defaults.
+    pub fn builder(path: impl AsRef<Path>) -> Builder {
+        Builder {
+            dir: path.as_ref().to_path_buf(),
+            keys: Keys::default(),
+        }
+    }
+
+    fn open_with(builder: Builder) -> Result<Database> {
+        let (core, new_database) = Core::open(&builder.dir)?;
         let dir = core.dir().to_path_buf();
         let auth_dir = dir.join("auth");
         fs::create_dir(&auth_dir)?;
-        if new_database {
-            keys::create_if_missing(&auth_dir)?;
-        }
+        // A build without the auth engine still checks the key, so the
+        // database never opens under the wrong one.
+        #[cfg_attr(not(feature = "auth"), allow(unused_variables))]
+        let root = keys::root_key(&builder.keys, &auth_dir, new_database)?;
 
         let engines = Engines {
             #[cfg(feature = "auth")]
-            auth: {
-                let root = keys::load(&auth_dir)?;
-                AuthEngine::open(&auth_dir.join("accounts"), &root, DEFAULT_REALM.id)?
-            },
+            auth: AuthEngine::open(&auth_dir.join("accounts"), &root, DEFAULT_REALM.id)?,
             #[cfg(feature = "content")]
             content: ContentEngine::open(&dir.join("content").join("store"), DEFAULT_SPACE.id)?,
         };

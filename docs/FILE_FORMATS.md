@@ -37,7 +37,8 @@ length, then the bytes).
 │   ├─ log/              the commit log (wal-db segments)
 │   └─ catalog.ckpt      the catalog
 ├─ auth/
-│   ├─ keys              the root key
+│   ├─ keys              the root key (default key source only)
+│   ├─ key.check         a check of the root key
 │   └─ accounts/         the account store (lsm-db)
 └─ content/
     └─ store/            the content store (lsm-db)
@@ -84,7 +85,11 @@ also keeps it closed.
 
 ## auth/keys
 
-The root key from which the auth engine derives its keys.
+The root key from which the auth engine derives its keys, when the database
+uses the default key source (`Keys::in_directory()`). With `Keys::file(path)`
+the same file lives at `path`, outside the directory; with `Keys::env(var)`
+the key is 64 hexadecimal characters in an environment variable and no file
+holds it.
 
 ```text
 format u16       1
@@ -94,9 +99,15 @@ checksum [32]    BLAKE3 of format and key
 
 Created once, with the database. A database whose key file is missing or
 damaged stays closed (`Error::KeyUnavailable`): a new key would make every
-stored digest useless. On Unix the file is readable by its owner only. From
-0.3 the root key comes from a key source (a key vault, the OS keychain, a
-file named in configuration) and this file is no longer written.
+stored digest and sealed record useless. On Unix the file is readable by its
+owner only.
+
+## auth/key.check
+
+`keyed BLAKE3(root key, "nex-db 2026 root key check")`, 32 bytes, written
+with the database (or at the first open of a 0.1 or 0.2 database). Opening
+with a root key whose check differs fails with `Error::KeyUnavailable` before
+anything is decrypted. It reveals nothing about the key.
 
 Derived keys are `keyed BLAKE3(root key, label)`:
 

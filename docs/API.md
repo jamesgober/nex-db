@@ -165,7 +165,8 @@ From 0.3 the builder configures what `open` takes by default:
 | Builder call | Since | Default |
 |---|---|---|
 | `Database::builder(dir)` | 0.3 | |
-| `.keys(Keys::vault(name))`, `Keys::file(path)`, `Keys::env(var)` | 0.3 | a key file in the directory |
+| `.keys(Keys::file(path))`, `Keys::env(var)`, `Keys::in_directory()` | 0.3 | `Keys::in_directory()` |
+| `.keys(Keys::vault(name))`: the OS keychain | 0.4 | |
 | `.auth(AuthMode::embedded())`, `AuthMode::separate_process()` | 0.3 / 0.5 | embedded |
 | `.max_snapshot_age(Duration)` | 0.3 | 60 s |
 | `.commit_queue(n)`, `.hashing_slots(n)` | 0.3 | 4,096; one per CPU |

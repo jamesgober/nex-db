@@ -194,8 +194,8 @@ collections are **spaces** (one or more sites). A new database has the realm
 |---|---|---|
 | `db.auth() -> Auth` (default realm) | 0.1 | P0 |
 | `db.content() -> Content` (default space) | 0.1 | P0 |
-| `db.define_realm(name, RealmPolicy) -> Result<()>` | 0.3 | P1 |
-| `db.auth_realm(name) -> Result<Auth>` | 0.3 | P1 |
+| `db.define_realm(name, RealmPolicy) -> Result<()>` | 0.4 | P1 |
+| `db.auth_realm(name) -> Result<Auth>` | 0.4 | P1 |
 | `db.define_space(name, SpaceSpec) -> Result<()>` | 0.4 | P1 |
 | `db.content_space(name) -> Result<Content>` | 0.4 | P1 |
 | `db.collections() -> Vec<CollectionInfo>` (names and engines) | 0.4 | P2 |
@@ -278,7 +278,7 @@ Rules:
 |---|---|---|
 | `db.commit(\|tx\| ..) -> Result<T>` | 0.1 | P0 |
 | `tx.auth() -> AuthTx`, `tx.content() -> ContentTx` | 0.1 | P0 |
-| `db.commit_serializable(\|tx\| ..) -> Result<T>` (also checks what the closure read) | 0.3 | P1 |
+| `db.commit_serializable(\|tx\| ..) -> Result<T>` (also checks what the closure read) | 0.4 | P1 |
 | `db.commit_with(CommitOptions, \|tx\| ..) -> Result<Committed<T>>` (retries, idempotency key) | 0.3 | P2 |
 
 An idempotency key makes a retried request commit at most once. A commit with

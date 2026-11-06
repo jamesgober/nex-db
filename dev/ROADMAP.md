@@ -48,6 +48,7 @@
 - Hot table, timer wheel, epoch table, tombstones, checkpoints; standing, counters, lockout, audit chain, revocation journal (FR-6, FR-7).
   - [x] Epoch table, `revoke_all`, `rotate` (`PLAN.md` D-049).
   - [x] Standing, failure counters, and lock-out (`PLAN.md` D-050).
+- Moved (`PLAN.md` D-058): named realms and `commit_serializable` to 0.4; the revocation journal to 0.5.
 - **Exit:** James's site signs users in on nex-db.
 
 ## 0.4.0 Content and adapters

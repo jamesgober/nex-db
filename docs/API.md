@@ -39,6 +39,7 @@ high value, **P3** nice to have. Every P0 and P1 item exists by 0.5.
 - [The change feed](#the-change-feed)
 - [Health and observers](#health-and-observers)
 - [Backup and restore](#backup-and-restore)
+- [Read replica](#read-replica)
 - [Errors](#errors)
 - [Limits](#limits)
 - [What the API never offers](#what-the-api-never-offers)
@@ -65,9 +66,11 @@ nex-db = { git = "https://github.com/jamesgober/nex-db", tag = "v0.2.0" }
 The core (commit log, catalog, recovery) is always built. A database that uses
 an engine the build leaves out refuses to open with `Error::Invalid`.
 
-The minimum supported Rust version is 1.85. nex-db starts no threads of its
-own and has no async runtime; every call blocks the calling thread for at most
-one log sync (a commit) or one password hash (`hash_password`, `sign_in`).
+The minimum supported Rust version is 1.85. nex-db has no async runtime. A
+commit blocks until the log sync that covers it; `hash_password`,
+`verify_password`, and `sign_in` block for one password hash; a feed read
+blocks until the next change. From 0.3 the database runs its own threads for
+scheduled work, expiry, and checkpoints; they sleep until work is due.
 
 ## Tier 1
 
@@ -95,10 +98,12 @@ let account = db.commit(|tx| {
 })?;
 
 // Sign in: the password is checked inside the auth engine.
-let token = match db.auth().sign_in("ann@example.com", "correct horse battery staple", SessionSpec::web())? {
-    SignIn::Success { token, .. } => token, // set token.as_str() as the cookie value
-    _ => unreachable!("the password is right"),
+let SignIn::Success { token, .. } =
+    db.auth().sign_in("ann@example.com", "correct horse battery staple", SessionSpec::web())?
+else {
+    return Ok(()); // wrong identifier or password: show the sign-in form again
 };
+// token.as_str() is the cookie value.
 
 // Every signed-in request: validate the cookie.
 match db.auth().validate(token.as_str())? {
@@ -106,7 +111,7 @@ match db.auth().validate(token.as_str())? {
     _ => { /* not signed in: treat as a guest */ }
 }
 
-// Every content request: resolve the path, then read the entity.
+// Every content request: resolve the path, then read the published entity.
 let route = db.content().resolve("example.com", "/u/ann")?.expect("published");
 let page = db.content().get(route.entity())?.expect("exists");
 assert_eq!(page.field("account").and_then(|v| v.as_account()), Some(account));
@@ -128,6 +133,9 @@ db.auth().revoke(token.as_str())?; // sign out
 | `db.content().resolve(site, path) -> Result<Option<RouteEntry>>` | 0.1 | P0 |
 | `db.content().get(rid) -> Result<Option<Entry>>` | 0.1 | P0 |
 | `db.commit(\|tx\| ..) -> Result<T>` | 0.1 | P0 |
+
+`sign_in` checks the password and issues a session in one call; applications
+with their own session handling use `verify_password` (0.3) instead.
 
 ## The database
 
@@ -156,18 +164,22 @@ From 0.3 the builder configures what `open` takes by default:
 
 | Builder call | Since | Default |
 |---|---|---|
-| `Database::builder().path(dir)` | 0.3 | required |
+| `Database::builder(dir)` | 0.3 | |
 | `.keys(Keys::vault(name))`, `Keys::file(path)`, `Keys::env(var)` | 0.3 | a key file in the directory |
 | `.auth(AuthMode::embedded())`, `AuthMode::separate_process()` | 0.3 / 0.5 | embedded |
-| `.durability(Durability::GroupCommit { window: Duration })` | 0.3 | 200 µs |
 | `.max_snapshot_age(Duration)` | 0.3 | 60 s |
 | `.commit_queue(n)`, `.hashing_slots(n)` | 0.3 | 4,096; one per CPU |
+| `.idempotency_window(Duration)` | 0.3 | 24 hours |
 | `.cache(bytes)` | 0.4 | 256 MiB |
 | `.observer(impl Observer)` | 0.4 | none |
 | `.open() -> Result<Database>` | 0.3 | |
 
 Keys are named, never given in configuration. A key the database needs and
 cannot get keeps it closed (`Error::KeyUnavailable`).
+
+Commits never wait for a timer: a commit is written and synced as soon as no
+other batch is being written, and commits that arrive meanwhile share the next
+sync.
 
 ### Collections: realms and spaces
 
@@ -186,6 +198,11 @@ collections are **spaces** (one or more sites). A new database has the realm
 | `db.content_space(name) -> Result<Content>` | 0.4 | P1 |
 | `db.collections() -> Vec<CollectionInfo>` (names and engines) | 0.4 | P2 |
 
+A `RealmPolicy` sets a realm's lockout threshold and window, idle and
+absolute session limits, and whether new accounts start as
+`PendingVerification`. A `SpaceSpec` sets a space's sites, default locale, and
+fallback chains.
+
 A collection never changes engine. Dropping one (`db.drop_collection(name)`,
 0.5, P2) marks it and reclaims it in the background.
 
@@ -197,7 +214,7 @@ read several things as of one moment, use `db.read`:
 | Call | Since | Grade |
 |---|---|---|
 | `db.read(\|r\| ..) -> Result<T>` | 0.3 | P0 |
-| `r.auth()`, `r.content()`: the read operations of each engine | 0.3 | P0 |
+| `r.auth() -> AuthRead`, `r.content() -> ContentRead`: the read operations of each engine | 0.3 | P0 |
 
 Every read inside the closure sees the same commit. A snapshot held longer
 than the configured maximum fails with `Error::SnapshotTooOld`, so a forgotten
@@ -245,7 +262,12 @@ Rules:
   again, up to four times in all, then `commit` returns `Error::Conflict`. The
   closure must therefore have no side effects outside `tx`.
 - Do slow work (hashing a password) before `commit`, not inside it.
-- A commit larger than 16 MiB is refused with `Error::Invalid`.
+- Return what the commit made (an `AccountId`, a `Token`, a `Rid`) from the
+  closure. A value kept from an attempt that was retried never becomes valid.
+- The 16 MiB limit is for the whole commit across engines; a larger one is
+  refused with `Error::Invalid { field: "commit", .. }`. Split large bodies
+  and large releases into several commits.
+- From 0.3 `max_snapshot_age` also limits how long a closure may run.
 - If the log write or sync fails, the database stops accepting commits
   (`Error::Storage`); reads continue. Restart the process.
 
@@ -254,12 +276,12 @@ Rules:
 | `db.commit(\|tx\| ..) -> Result<T>` | 0.1 | P0 |
 | `tx.auth() -> AuthTx`, `tx.content() -> ContentTx` | 0.1 | P0 |
 | `db.commit_serializable(\|tx\| ..) -> Result<T>` (also checks what the closure read) | 0.3 | P1 |
-| `db.commit_with(CommitOptions, \|tx\| ..) -> Result<T>` (retries, idempotency key) | 0.3 | P2 |
-| `db.begin() -> Result<Transaction>`, `tx.commit() -> Result<()>`, `tx.abort()` | 0.3 | P2 |
+| `db.commit_with(CommitOptions, \|tx\| ..) -> Result<Committed<T>>` (retries, idempotency key) | 0.3 | P2 |
 
-An idempotency key makes a retried request commit at most once: a second
-commit with a key already used in the last 24 hours returns the first one's
-outcome without writing.
+An idempotency key makes a retried request commit at most once. A commit with
+a key already used within the idempotency window (24 hours by default) writes
+nothing and returns `Committed::Duplicate { position }`; a new one returns
+`Committed::New(value)`.
 
 ## The auth engine
 
@@ -313,8 +335,9 @@ assert_eq!(db.auth().validate("not a token")?, Validation::Malformed);
 Every outcome except `Valid` means the caller is a guest. The reason is there
 so an application can score suspicious traffic.
 
-`Session` gives `account()`, `created_at()`, `expires_at()`, and from 0.3
-`idle_limit()`, `recheck_at()`, `device()`, and `payload() -> &[u8]`: up to
+`Session` gives `account()`, `created_at()`, `expires_at()`, from 0.3
+`idle_limit()`, `recheck_at()`, and `payload() -> &[u8]`, and from 0.4
+`device()`. The payload is up to
 256 bytes the application stored with the session (permissions, attributes),
 opaque to nex-db.
 
@@ -323,17 +346,18 @@ opaque to nex-db.
 | Call | Since |
 |---|---|
 | `SessionSpec::web()` (30 days), `SessionSpec::new(ttl)` (up to 400 days) | 0.1 |
-| `.idle(Duration)`, `.payload(bytes)`, `.device(DeviceId)`, `.recheck_after(Duration)` | 0.3 |
+| `.idle(Duration)`, `.payload(bytes)`, `.recheck_after(Duration)` | 0.3 |
+| `.device(DeviceId)` | 0.4 |
 
 | Operation | Since | Grade | Notes |
 |---|---|---|---|
 | `validate(token) -> Result<Validation>` | 0.1 | P0 | read only |
 | `issue_session(account, spec) -> Result<Token>` | 0.1 | P0 | durable |
-| `revoke(token) -> Result<bool>` | 0.1 | P0 | takes effect ahead of ordinary commits; `false` when the token named no live session |
+| `revoke(token) -> Result<bool>` | 0.1 | P0 | takes effect ahead of ordinary commits; `false` when the token names no session or one already revoked |
 | `rotate(token) -> Result<Token>` | 0.3 | P0 | the old token becomes `Revoked { Rotated }` |
 | `revoke_all(account) -> Result<u32>` | 0.3 | P0 | signs the account out everywhere; returns how many sessions ended |
 | `sessions(account) -> Result<Vec<SessionInfo>>` | 0.4 | P2 | ids, devices, times; never tokens or digests |
-| `revoke_session(account, SessionId) -> Result<bool>` | 0.4 | P2 | for "sign out that device" |
+| `revoke_session(account, SessionId) -> Result<bool>` | 0.4 | P2 | for "sign out that device"; a `SessionId` is random and unrelated to the token or its digest |
 
 ### Accounts and passwords
 
@@ -371,30 +395,36 @@ hashing slots; past that, `Error::Busy`. An unknown identifier costs the same
 work as a wrong password, and both give `SignIn::Failed`, so the outcome does
 not reveal which accounts exist.
 
+Identifiers are stored only as keyed digests and cannot be read back: keep the
+email address in the application's own profile if it needs to show or send to
+it.
+
 | Operation | Since | Grade | Notes |
 |---|---|---|---|
 | `hash_password(password) -> Result<HashedPassword>` | 0.1 | P0 | before `commit` |
 | `create_account(identifier, &HashedPassword) -> Result<AccountId>` | 0.1 | P0 | unique by identifier |
-| `sign_in(identifier, password, spec) -> Result<SignIn>` | 0.1 | P1 | check and issue in one call |
-| `verify_password(identifier, password) -> Result<Login>` | 0.3 | P0 | check only; counts failures |
-| `account(id) -> Result<Option<Account>>` | 0.3 | P0 | standing, created, roles; never the hash |
-| `standing(account) -> Result<Standing>` | 0.3 | P0 | |
-| `set_standing(account, Standing, by: AccountId) -> Result<()>` | 0.3 | P0 | a ban or lock ends every session at once |
+| `sign_in(identifier, password, spec) -> Result<SignIn>` | 0.1 | P0 | check and issue in one call |
+| `verify_password(identifier, password) -> Result<Login>` | 0.3 | P1 | check only; counts failures |
+| `account(id) -> Result<Option<Account>>` | 0.3 | P0 | standing, created, roles; never the hash, never identifiers |
+| `standing(account) -> Result<Option<Standing>>` | 0.3 | P0 | the read a request makes when a session's `recheck_at` has passed |
+| `set_standing(account, Standing, by: Option<AccountId>) -> Result<()>` | 0.3 | P0 | a ban or lock-out ends every session at once; `by` is `None` for an automatic lock-out |
 | `set_password(account, &HashedPassword) -> Result<()>` | 0.4 | P1 | ends the account's other sessions |
-| `add_identifier`, `remove_identifier` | 0.4 | P1 | a second email, a username |
+| `add_identifier`, `remove_identifier` | 0.3 | P1 | a second email, a username |
 | `erase_account(account) -> Result<()>` | 0.5 | P2 | destroys the account's key: its data in every copy and backup becomes unreadable |
 
 `SignIn` (non-exhaustive): `Success { account, token }` and `Failed` (0.1);
-`Locked { until }` and `NeedsSecondFactor { challenge }` (0.3, 0.4). Show the
-same message for `Failed` and `Locked` so the reply reveals nothing.
+`LockedOut { until }` (0.3) and `NeedsSecondFactor { challenge }` (0.4).
+`LockedOut` is returned only after the password matched. A wrong password on a
+locked-out account, or an unknown identifier, gives `Failed` after the same
+work, so only the account's owner can learn it is locked out.
 
 `Login` is `SignIn` without the session: `Verified(AccountId)`, `Failed`,
-`Locked { until }`, `NeedsSecondFactor { challenge }`.
+`LockedOut { until }`, `NeedsSecondFactor { challenge }`.
 
 `Standing` (non-exhaustive): `Active`, `PendingVerification`,
-`Locked { until, reason }`, `Suspended { until, reason, by }`,
-`Banned { reason, by }`. A change of standing that takes access away revokes
-every session of the account in the same commit.
+`LockedOut { until, reason }`, `Suspended { until, reason }`,
+`Banned { reason }`. Who set it is in the audit log. A change of standing that
+takes access away revokes every session of the account in the same commit.
 
 ### Second factors, tokens, keys, roles (0.4)
 
@@ -402,22 +432,28 @@ every session of the account in the same commit.
 |---|---|---|
 | `add_totp(account) -> Result<TotpEnrollment>`, `confirm_totp(account, code)` | P1 | the secret is sealed; codes are single-use |
 | `verify_totp(challenge, code) -> Result<SignIn>` | P1 | completes `NeedsSecondFactor` |
-| `recovery_codes(account) -> Result<Vec<String>>` | P1 | shown once; stored hashed |
+| `new_recovery_codes(account) -> Result<RecoveryCodes>` (tx) | P1 | replaces any earlier codes; shown once; stored hashed |
 | `add_passkey`, `verify_passkey` | P2 | WebAuthn public keys and counters |
-| `single_use_token(purpose, account, ttl) -> Result<Token>` | P1 | email verification, password reset, magic link |
+| `single_use_token(purpose, account, ttl) -> Result<Token>` | P1 | email verification, magic link, preview |
+| `single_use_token_for(identifier, purpose, ttl) -> Result<Option<Token>>` | P1 | password reset by email address; the same work whether the identifier exists or not, so answer the same either way |
 | `redeem(token, purpose) -> Result<Option<AccountId>>` | P1 | works once |
-| `api_key_create(account, scopes, expiry) -> Result<ApiKey>` | P1 | the key text is shown once |
-| `api_key_check(text) -> Result<ApiKeyCheck>`, `api_key_revoke(id)` | P1 | |
+| `create_api_key(account, scopes, expiry) -> Result<ApiKey>` | P1 | the key text is shown once |
+| `validate_api_key(text) -> Result<ApiKeyCheck>`, `revoke_api_key(id)` | P1 | |
 | `define_role(Role)`, `assign_roles(account, &[RoleId])`, `roles(account)` | P1 | |
+| `allowed(account, permission) -> Result<bool>` | P1 | checks the account's roles against the current policy |
 | `link_external(account, provider, subject)`, `find_external(provider, subject)` | P2 | OAuth and OpenID Connect sign-in |
 | `devices(account)`, `bind_device_key(account, device, public_key)` | P2 | |
+
+`TotpEnrollment`, `RecoveryCodes`, `ApiKey`, and `Token` show nothing in
+`Debug` and are wiped from memory when dropped.
 
 ### Audit (0.3)
 
 Every security-relevant write (account created, signed in, failed, locked,
 standing changed, revoked) adds an event to the realm's hash-chained audit
 log in the same commit. `audit_export(range) -> Result<AuditExport>` (0.8,
-P3) returns the events with a proof that none was changed or removed.
+P3) returns the events (ids, kinds, and times only) with a proof that none was
+changed or removed.
 
 ### Transactions
 
@@ -429,7 +465,8 @@ Inside `db.commit`, `tx.auth()` stages:
 | `issue_session(account, spec) -> Result<Token>` | 0.1 |
 | `revoke(token) -> Result<bool>` | 0.1 |
 | `revoke_all`, `set_standing`, `rotate` | 0.3 |
-| `set_password`, `add_identifier`, `remove_identifier`, `assign_roles` | 0.4 |
+| `add_identifier`, `remove_identifier` | 0.3 |
+| `set_password`, `assign_roles`, `new_recovery_codes` | 0.4 |
 
 A token staged with `tx.auth().issue_session` is valid only once the commit
 returns `Ok`.
@@ -492,7 +529,7 @@ A space declares its types. Undeclared fields are stored but not indexed.
 | `.indexed()`, `.unique()` | listed and filtered; unique within the space |
 | `.reference(name, Rule::Restrict \| Rule::Detach \| Rule::Cascade)` | what deleting the target does |
 | `.searchable(weight)` | part of the text index, with a weight |
-| `.copied_from(reference, field)` | a copy of a referenced entity's field, kept current by the engine |
+| `.copied_from(reference, field)` | a copy of a field of the entity an `Entity` reference points at, kept current by the engine |
 | `.revisions(RevisionPolicy::keep(n) \| keep_for(Duration))` | how many revisions to keep |
 
 `db.content().define(Type) -> Result<()>` (P0). Changing a type adds fields
@@ -503,7 +540,8 @@ or flags; removing one keeps the stored values readable.
 Each entity has one working draft, which saves (and autosaves) over itself
 without making revisions. Saving a revision, or publishing, records a fixed
 revision with who, when, and a message. Readers of the public site see only
-the published revision.
+the published revision: `get` and `resolve` read only that, and `draft`
+reads the working draft.
 
 | Operation (in `tx.content()` unless noted) | Grade | Notes |
 |---|---|---|
@@ -520,12 +558,13 @@ the published revision.
 
 `Status`: `Draft`, `Review`, `Published`, `Archived`, `Trashed`. Workflow
 stages beyond these are an application field. `Visibility`: `Public`,
-`Members`, `Password(..)`, `Private`. Publishing is per locale: each locale
-has its own published revision and its own schedule.
+`Members`, `Private`. The application decides who may see `Members` and
+`Private` pages; nex-db stores no page password. Publishing is per locale:
+each locale has its own published revision and its own schedule.
 
 A **release** publishes or unpublishes many entities at one time, in one
-commit: `release(name)`, `release_add(release, rid, locales, action)`,
-`release_schedule(release, at)`, `release_publish(release)` (P2).
+commit: `create_release(name)`, `add_to_release(release, rid, locales,
+action)`, `schedule_release(release, at)`, `publish_release(release)` (P2).
 
 ### Locales (0.4)
 
@@ -534,7 +573,8 @@ default locale and fallback chains (`fr-CA` to `fr` to `en`).
 
 | Operation | Grade | Notes |
 |---|---|---|
-| `get(rid) -> Result<Option<Entry>>` | P0 | 0.1; the space's default locale |
+| `get(rid) -> Result<Option<Entry>>` | P0 | 0.1; the published revision in the space's default locale, or `None` when nothing is published |
+| `draft(rid) -> Result<Option<Entry>>` | P0 | the working draft, for editors |
 | `get_in(rid, locale) -> Result<Option<Entry>>` | P0 | follows the fallback chain; `Entry::fallback()` says when it did |
 | `get_many(&[Rid], locale) -> Result<Vec<Option<Entry>>>` | P1 | one snapshot |
 | `translate(rid, locale, Patch)` (tx) | P0 | records the source revision it was translated from |
@@ -565,7 +605,7 @@ assert!(db.content().resolve("other.example", "/about")?.is_none());
 ```
 
 `RouteEntry` is a small `Copy` value: `entity()`, `revision()`, `kind()`
-(0.1), and `locale()` (0.4). `RouteKind` (non-exhaustive):
+(0.1), and `locale()` and `visibility()` (0.4). `RouteKind` (non-exhaustive):
 
 | Kind | Since | Answer |
 |---|---|---|
@@ -585,10 +625,13 @@ redirects again is shortened, so a chain is never followed.
 | `set_path(rid, locale, path)` (tx) | P0 | the old path redirects |
 | `add_redirect(site, from, to, status)` (tx), `remove_route(site, path)` (tx) | P1 | |
 | `routes(rid) -> Result<Vec<(String, String)>>` | P2 | every path of an entity |
-| `preview(token, site, path) -> Result<Option<RouteEntry>>` | P2 | 0.6; drafts at their real paths |
+| `resolve_draft(site, path) -> Result<Option<RouteEntry>>` | P2 | 0.6; drafts at their real paths, for previews |
 
-Only published, public entities are in the routes `resolve` reads. Drafts are
-reached through `preview` with a single-use token from the auth engine.
+Only published entities are routed. `RouteEntry::visibility()` tells the
+application when it must check the session before serving a page. For a
+preview link, the application redeems a single-use token
+(`db.auth().redeem(token, Purpose::Preview)`) and then calls `resolve_draft`;
+the content engine never checks auth data itself.
 
 ### Taxonomies, references, assets (0.4)
 
@@ -625,19 +668,21 @@ order: `EntityChanged { rid, locales, revision, paths }`, `RouteChanged`,
 `AccountCreated { account }`, `SessionRevoked { account }`,
 `StandingChanged { account }`. Auth events carry ids and kinds only. A feed is
 an iterator that blocks for the next change; a consumer that falls behind its
-bound is cut off and resumes from its last `Position`. Typical use: drop
-cached pages when an entity they were built from changes.
+bound is cut off and resumes from its last `Position`. `db.position()` (0.4)
+returns the position of the last visible commit, to start a feed from now.
+Typical use: drop cached pages when an entity they were built from changes.
 
 ## Health and observers
 
 | Call | Since | Grade |
 |---|---|---|
 | `db.health() -> Health` (`Ready`, `Recovering`, `ReadOnly { reason }`) | 0.4 | P1 |
-| `Observer` trait: `on_commit`, `on_error`, `on_security_event`; no cost when none is set | 0.4 | P1 |
+| `Observer` trait: `on_commit`, `on_error`, `on_security_event`; not called when none is set | 0.4 | P1 |
 | `nex_db::metrics::Recorder` (feature `metrics`) | 0.4 | P2 |
 
-Security events (repeated failures, a lockout, a revoked session presented
-again) always reach the observer; nex-db never keeps one to itself.
+Security events (repeated failures, a lock-out, a revoked session presented
+again) always reach the observer, with ids and kinds only, never an
+identifier; nex-db never keeps one to itself.
 
 ## Backup and restore
 
@@ -648,6 +693,13 @@ again) always reach the observer; nex-db never keeps one to itself.
 
 A backup is taken while the database runs and stays encrypted. Revocations
 survive a restore: a session revoked after the restore point stays revoked.
+
+## Read replica
+
+`nex_db::open_replica(dir, source) -> Result<Replica>` (0.8, P1) opens a copy
+that follows another database's log and serves reads only: the same read
+operations as `db.auth()`, `db.content()`, and `db.read`. Revocations reach it
+ahead of ordinary changes.
 
 ## Errors
 
@@ -660,7 +712,7 @@ ever contains a token, password, hash, or key.
 |---|---|---|---|---|
 | `AlreadyExists { what }` | NEX-1001 | 0.1 | a unique value is taken (`identifier`, `path`, `collection`) | choose another; for a sign-up, answer as if it succeeded |
 | `Conflict` | NEX-1002 | 0.1 | retries ran out under contention | retry later |
-| `Busy { what }` | NEX-1003 | 0.1 | a bounded resource is full (hashing slots; from 0.3 the commit queue) | back off |
+| `Busy { what }` | NEX-1003 | 0.1 | a bounded resource is full: hashing slots, the session table; from 0.3 the commit queue | back off |
 | `Invalid { field, reason }` | NEX-1004 | 0.1 | a value breaks its rule | fix the input |
 | `KeyUnavailable` | NEX-1005 | 0.1 | a key cannot be read | restore the key or its source |
 | `Locked` | NEX-1006 | 0.1 | another owner holds the directory | stop it, or use another directory |
@@ -668,7 +720,7 @@ ever contains a token, password, hash, or key.
 | `Storage { what, source }` | NEX-1008 | 0.1 | the operating system refused, or a write could not be made durable | check the disk; restart |
 | `SnapshotTooOld` | NEX-1009 | 0.3 | a `db.read` outlived its limit | read again |
 | `Restricted { what }` | NEX-1010 | 0.4 | a reference rule refuses a delete | remove the references first |
-| `Sealed` | NEX-1011 | 0.7 | the auth engine was sealed after a security event | an operator unseals it |
+| `AuthHalted` | NEX-1011 | 0.7 | the auth engine refuses every call after a security event | an operator resumes it |
 
 `error.code()` returns the code. `Display` gives the message; `source()` gives
 the operating-system error for `Storage`.

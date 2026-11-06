@@ -71,8 +71,8 @@
 //!
 //! ## Status
 //!
-//! Version 0.1: the first working build. The file formats and the API change
-//! before 1.0.
+//! Version 0.2: the design lock. The API through 1.0 is in `docs/API.md`; the
+//! file formats and the API may still change before 1.0.
 
 #![doc(html_root_url = "https://docs.rs/nex-db")]
 #![cfg_attr(docsrs, feature(doc_cfg))]

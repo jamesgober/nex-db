@@ -37,6 +37,7 @@ use std::{
         Arc, Condvar, Mutex, PoisonError,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use super::{
@@ -52,6 +53,16 @@ use crate::{
 
 /// Times a commit closure runs before [`Error::Conflict`].
 pub(crate) const ATTEMPTS: usize = 4;
+
+/// How long a snapshot may run: a read past it fails with
+/// `Error::SnapshotTooOld`, and a commit whose closure ran longer runs again
+/// on a new snapshot. Older snapshots are left out of the watermark, so they
+/// hold no memory.
+pub(crate) const MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(60);
+
+/// During recovery, engines drop their snapshot versions every this many
+/// records (no snapshot runs before recovery ends).
+const REPLAY_RECLAIM_EVERY: u64 = 1024;
 
 /// Commits between taking a sequence number and becoming visible, before a
 /// new commit is refused with `Error::Busy`. Bounds the memory held by
@@ -112,8 +123,9 @@ pub(crate) struct Core {
     visible: AtomicU64,
     /// Set after a failed log write or apply: no further commits.
     halted: AtomicBool,
-    /// Snapshots of running transactions, with their counts.
-    snapshots: Mutex<BTreeMap<Seq, usize>>,
+    /// Running snapshots: how many at each sequence number, and when the
+    /// oldest of them started.
+    snapshots: Mutex<BTreeMap<Seq, (usize, Instant)>>,
     /// Serializes collection definitions (id choice and name check).
     defining: Mutex<()>,
     catalog: Catalog,
@@ -207,8 +219,13 @@ impl Core {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let seq = self.visible.load(Ordering::Acquire);
-        *snapshots.entry(seq).or_insert(0) += 1;
-        SnapshotGuard { core: self, seq }
+        let started = Instant::now();
+        snapshots.entry(seq).or_insert((0, started)).0 += 1;
+        SnapshotGuard {
+            core: self,
+            seq,
+            started,
+        }
     }
 
     /// Commit the staged work of one transaction, taken at `snapshot`.
@@ -217,14 +234,19 @@ impl Core {
     pub(crate) fn commit(
         &self,
         engines: &dyn Registry,
-        snapshot: Seq,
+        snapshot: &SnapshotGuard<'_>,
         staged: &[&dyn Staged],
     ) -> std::result::Result<(), Attempt> {
         let parts: Vec<&dyn Staged> = staged.iter().copied().filter(|w| !w.is_empty()).collect();
         if parts.is_empty() {
             return Ok(());
         }
-        self.write(engines, Kind::Commit, snapshot, &parts)
+        // Conflict entries older than the watermark are gone, and an expired
+        // snapshot is not in the watermark: run the closure again.
+        if snapshot.expired() {
+            return Err(Attempt::Conflict);
+        }
+        self.write(engines, Kind::Commit, snapshot.seq(), &parts)
     }
 
     /// Create a collection of `engine` named `name`, after the engine has
@@ -480,6 +502,9 @@ impl Core {
                 return Err(Error::corrupt("the commit log sequence", view.seq));
             }
             last = view.seq;
+            if view.seq % REPLAY_RECLAIM_EVERY == 0 {
+                engines.each(&mut |engine| engine.reclaim(view.seq - 1));
+            }
             if view.seq <= floor {
                 return Ok(());
             }
@@ -529,9 +554,9 @@ impl Core {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             snapshots
-                .keys()
-                .next()
-                .copied()
+                .iter()
+                .find(|(_, (_, started))| started.elapsed() < MAX_SNAPSHOT_AGE)
+                .map(|(seq, _)| *seq)
                 .unwrap_or_else(|| self.visible.load(Ordering::Acquire))
         };
         engines.each(&mut |engine| engine.reclaim(watermark));
@@ -548,12 +573,19 @@ fn halted_error() -> Error {
 pub(crate) struct SnapshotGuard<'c> {
     core: &'c Core,
     seq: Seq,
+    started: Instant,
 }
 
 impl SnapshotGuard<'_> {
     /// The snapshot's sequence number.
     pub(crate) fn seq(&self) -> Seq {
         self.seq
+    }
+
+    /// True once the snapshot has run past [`MAX_SNAPSHOT_AGE`]: its
+    /// versions may be gone.
+    pub(crate) fn expired(&self) -> bool {
+        self.started.elapsed() >= MAX_SNAPSHOT_AGE
     }
 }
 
@@ -564,7 +596,7 @@ impl Drop for SnapshotGuard<'_> {
             .snapshots
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(count) = snapshots.get_mut(&self.seq) {
+        if let Some((count, _)) = snapshots.get_mut(&self.seq) {
             *count -= 1;
             if *count == 0 {
                 let _ = snapshots.remove(&self.seq);

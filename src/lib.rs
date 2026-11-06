@@ -106,7 +106,7 @@ mod ids;
 #[cfg(feature = "auth")]
 #[cfg_attr(docsrs, doc(cfg(feature = "auth")))]
 pub use crate::auth::{
-    Auth, AuthTx,
+    Auth, AuthRead, AuthTx,
     token::Token,
     types::{
         HashedPassword, Login, RevokeReason, Session, SessionSpec, SignIn, Standing, Validation,
@@ -115,11 +115,11 @@ pub use crate::auth::{
 #[cfg(feature = "content")]
 #[cfg_attr(docsrs, doc(cfg(feature = "content")))]
 pub use crate::content::{
-    Content, ContentTx,
+    Content, ContentRead, ContentTx,
     entity::{DEFAULT_SITE, Entity, Entry, RouteEntry, RouteKind, Value},
 };
 pub use crate::{
-    db::{Database, Transaction, open},
+    db::{Database, Read, Transaction, open},
     error::{Error, Result},
     ids::{AccountId, Rid},
 };

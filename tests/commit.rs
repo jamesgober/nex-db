@@ -546,3 +546,61 @@ fn test_suspension_that_ran_out_reads_as_active() {
         SignIn::Success { .. }
     ));
 }
+
+#[test]
+fn test_read_sees_one_snapshot_while_others_commit() {
+    let dir = TempDir::new("read-snapshot");
+    let db = Database::open(&dir.0).unwrap();
+    let password = db.auth().hash_password("pw").unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    let first = db
+        .content()
+        .create(Entity::new("page").path("/first"))
+        .unwrap();
+
+    let (late, seen) = db
+        .read(|r| {
+            assert_eq!(r.auth().standing(ann)?, Some(Standing::Active));
+            // Another thread commits while the snapshot runs.
+            let late = std::thread::scope(|s| {
+                s.spawn(|| {
+                    db.auth()
+                        .set_standing(ann, Standing::Banned { reason: 1 }, None)
+                        .unwrap();
+                    db.content()
+                        .create(Entity::new("page").path("/late"))
+                        .unwrap()
+                })
+                .join()
+                .unwrap()
+            });
+            let seen = (
+                r.auth().standing(ann)?,
+                r.content().get(first)?.is_some(),
+                r.content().get(late)?.is_some(),
+                r.content()
+                    .resolve(nex_db::DEFAULT_SITE, "/late")?
+                    .is_some(),
+            );
+            Ok((late, seen))
+        })
+        .unwrap();
+    assert_eq!(seen, (Some(Standing::Active), true, false, false));
+
+    // A new snapshot sees the commits.
+    let now = db
+        .read(|r| {
+            Ok((
+                r.auth().standing(ann)?,
+                r.content().get(late)?.is_some(),
+                r.content()
+                    .resolve(nex_db::DEFAULT_SITE, "/late")?
+                    .is_some(),
+            ))
+        })
+        .unwrap();
+    assert_eq!(now, (Some(Standing::Banned { reason: 1 }), true, true));
+}

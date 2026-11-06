@@ -7,14 +7,14 @@
 use std::{fmt, path::Path};
 
 #[cfg(feature = "auth")]
-use crate::auth::{Auth, AuthEngine, AuthStaged, AuthTx};
+use crate::auth::{Auth, AuthEngine, AuthRead, AuthStaged, AuthTx};
 #[cfg(feature = "content")]
-use crate::content::{Content, ContentEngine, ContentStaged, ContentTx};
+use crate::content::{Content, ContentEngine, ContentRead, ContentStaged, ContentTx};
 use crate::{
     core::{
         catalog::{DEFAULT_REALM, DEFAULT_SPACE},
         fs, keys,
-        pipeline::{ATTEMPTS, Attempt, Core},
+        pipeline::{ATTEMPTS, Attempt, Core, SnapshotGuard},
         record::Seq,
     },
     engine::{Engine, EngineId, Registry, Staged},
@@ -215,16 +215,95 @@ impl Database {
             let snapshot = self.core.snapshot();
             let mut tx = Transaction::new(self, snapshot.seq());
             let value = f(&mut tx)?;
-            match self
-                .core
-                .commit(&self.engines, snapshot.seq(), &tx.staged())
-            {
+            match self.core.commit(&self.engines, &snapshot, &tx.staged()) {
                 Ok(()) => return Ok(value),
                 Err(Attempt::Conflict) => {}
                 Err(Attempt::Failed(err)) => return Err(err),
             }
         }
         Err(Error::Conflict)
+    }
+}
+
+impl Database {
+    /// Run `f` with reads that all see one snapshot: every engine as of the
+    /// same commit, whatever commits while `f` runs.
+    ///
+    /// ```
+    /// # #[cfg(all(feature = "auth", feature = "content"))]
+    /// # fn main() -> nex_db::Result<()> {
+    /// # let dir = std::env::temp_dir().join(format!("nex-db-read-doc-{}", std::process::id()));
+    /// # let _ = std::fs::remove_dir_all(&dir);
+    /// let db = nex_db::open(&dir)?;
+    /// let rid = db.content().create(nex_db::Entity::new("page").path("/a"))?;
+    /// let (route, page) = db.read(|r| {
+    ///     let route = r.content().resolve(nex_db::DEFAULT_SITE, "/a")?;
+    ///     Ok((route, r.content().get(rid)?))
+    /// })?;
+    /// assert_eq!(route.map(|r| r.entity()), page.map(|p| p.rid()));
+    /// # drop(db);
+    /// # std::fs::remove_dir_all(&dir).unwrap();
+    /// # Ok(())
+    /// # }
+    /// # #[cfg(not(all(feature = "auth", feature = "content")))]
+    /// # fn main() {}
+    /// ```
+    ///
+    /// A snapshot may run for 60 seconds; reads after that fail with
+    /// [`Error::SnapshotTooOld`]. Sessions are the exception to the
+    /// snapshot: a revoked session is revoked for every reader at once.
+    ///
+    /// # Errors
+    ///
+    /// Any error `f` returns, unchanged.
+    pub fn read<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Read<'_>) -> Result<T>,
+    {
+        let read = Read {
+            db: self,
+            snapshot: self.core.snapshot(),
+        };
+        f(&read)
+    }
+}
+
+/// Reads at one snapshot, handed to the closure of [`Database::read`].
+pub struct Read<'db> {
+    #[cfg_attr(not(any(feature = "auth", feature = "content")), allow(dead_code))]
+    db: &'db Database,
+    snapshot: SnapshotGuard<'db>,
+}
+
+impl fmt::Debug for Read<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Read")
+            .field("snapshot", &self.snapshot.seq())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Read<'_> {
+    /// Auth reads at this snapshot.
+    #[cfg(feature = "auth")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "auth")))]
+    #[must_use]
+    pub fn auth(&self) -> AuthRead<'_> {
+        AuthRead {
+            engine: self.db.auth_engine(),
+            snapshot: &self.snapshot,
+        }
+    }
+
+    /// Content reads at this snapshot.
+    #[cfg(feature = "content")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "content")))]
+    #[must_use]
+    pub fn content(&self) -> ContentRead<'_> {
+        ContentRead {
+            engine: self.db.content_engine(),
+            snapshot: &self.snapshot,
+        }
     }
 }
 

@@ -267,7 +267,7 @@ impl Db {
 
     fn commit(&self, staged: &[&dyn Staged]) -> std::result::Result<(), Attempt> {
         let snapshot = self.core.snapshot();
-        self.core.commit(&self.toys, snapshot.seq(), staged)
+        self.core.commit(&self.toys, &snapshot, staged)
     }
 }
 
@@ -370,13 +370,11 @@ fn test_toy_concurrent_write_of_same_key_conflicts() {
         .unwrap();
     let late = ToyStaged::new(&db.toys.a, a).put(7, 2);
     assert!(matches!(
-        db.core.commit(&db.toys, early.seq(), &[&late]),
+        db.core.commit(&db.toys, &early, &[&late]),
         Err(Attempt::Conflict)
     ));
     let other_key = ToyStaged::new(&db.toys.a, a).put(8, 2);
-    db.core
-        .commit(&db.toys, early.seq(), &[&other_key])
-        .unwrap();
+    db.core.commit(&db.toys, &early, &[&other_key]).unwrap();
     drop(early);
     drop(db);
     std::fs::remove_dir_all(dir).unwrap();

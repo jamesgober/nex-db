@@ -214,7 +214,8 @@ read several things as of one moment, use `db.read`:
 | Call | Since | Grade |
 |---|---|---|
 | `db.read(\|r\| ..) -> Result<T>` | 0.3 | P0 |
-| `r.auth() -> AuthRead`, `r.content() -> ContentRead`: the read operations of each engine | 0.3 | P0 |
+| `r.auth() -> AuthRead`: `validate(token)` (latest), `standing(account)` | 0.3 | P0 |
+| `r.content() -> ContentRead`: `get(rid)`, `resolve(site, path)` | 0.3 | P0 |
 
 Every read inside the closure sees the same commit. A snapshot held longer
 than the configured maximum fails with `Error::SnapshotTooOld`, so a forgotten

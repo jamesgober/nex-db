@@ -27,7 +27,9 @@ use crate::{
         codec::{Reader, Writer},
         conflict::ConflictTable,
         now_ms,
+        pipeline::SnapshotGuard,
         record::{Section, Seq},
+        versions::Versions,
     },
     engine::{Conflict, Engine, EngineId, Staged},
     error::{Error, Result},
@@ -72,6 +74,8 @@ pub(crate) struct ContentEngine {
     /// Highest seq the store holds.
     applied: AtomicU64,
     routes: RouteTable,
+    /// Entity versions kept for running snapshots.
+    versions: Versions,
     conflicts: ConflictTable,
 }
 
@@ -107,7 +111,7 @@ impl ContentEngine {
         for (_, value) in store.scan(start..end)? {
             let entry = Entry::decode(&value, applied)?;
             if let Some((site, path)) = entry.route() {
-                routes.insert(site, path, route_entry(&entry));
+                routes.insert(site, path, 0, route_entry(&entry));
             }
         }
         Ok(ContentEngine {
@@ -115,6 +119,7 @@ impl ContentEngine {
             store,
             applied: AtomicU64::new(applied),
             routes,
+            versions: Versions::new(),
             conflicts: ConflictTable::new(),
         })
     }
@@ -123,6 +128,15 @@ impl ContentEngine {
         match self.store.get(entity_key(self.collection, rid))? {
             Some(bytes) => Ok(Some(Entry::decode(&bytes, 0)?)),
             None => Ok(None),
+        }
+    }
+
+    /// The entity as a snapshot at `at` sees it.
+    fn get_at(&self, rid: Rid, at: Seq) -> Result<Option<Entry>> {
+        match self.versions.at(&entity_key(self.collection, rid), at) {
+            Some(Some(bytes)) => Ok(Some(Entry::decode(&bytes, at)?)),
+            Some(None) => Ok(None),
+            None => self.get(rid),
         }
     }
 }
@@ -179,14 +193,17 @@ impl Engine for ContentEngine {
         }
         let mut batch = Batch::new();
         for (entry, record) in &entries {
-            batch.put(entity_key(self.collection, entry.rid()), record);
+            let key = entity_key(self.collection, entry.rid());
+            self.versions
+                .record(&key, seq, Some(record), || Ok(self.store.get(&key)?))?;
+            batch.put(key, record);
         }
         batch.put(META_APPLIED, seq.to_le_bytes());
         self.store.write(batch)?;
         self.applied.store(seq, Ordering::Release);
         for (entry, _) in &entries {
             if let Some((site, path)) = entry.route() {
-                self.routes.insert(site, path, route_entry(entry));
+                self.routes.insert(site, path, seq, route_entry(entry));
             }
         }
         Ok(())
@@ -203,6 +220,7 @@ impl Engine for ContentEngine {
 
     fn reclaim(&self, watermark: Seq) {
         self.conflicts.prune(watermark);
+        self.versions.prune(watermark);
     }
 }
 
@@ -373,6 +391,45 @@ impl Content<'_> {
     /// As [`ContentTx::create`], plus the errors of [`Database::commit`].
     pub fn create(&self, entity: Entity) -> Result<Rid> {
         self.db.commit(|tx| tx.content().create(entity.clone()))
+    }
+}
+
+/// Content reads at one snapshot, inside [`Database::read`](crate::Database::read).
+///
+/// Returned by [`Read::content`](crate::Read::content).
+#[derive(Debug)]
+pub struct ContentRead<'r> {
+    pub(crate) engine: &'r ContentEngine,
+    pub(crate) snapshot: &'r SnapshotGuard<'r>,
+}
+
+impl ContentRead<'_> {
+    fn at(&self) -> Result<Seq> {
+        if self.snapshot.expired() {
+            return Err(Error::SnapshotTooOld);
+        }
+        Ok(self.snapshot.seq())
+    }
+
+    /// The entity with `rid` as of the snapshot, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SnapshotTooOld`] past the snapshot age limit, and the errors
+    /// of [`Content::get`].
+    pub fn get(&self, rid: Rid) -> Result<Option<Entry>> {
+        let at = self.at()?;
+        self.engine.get_at(rid, at)
+    }
+
+    /// The route at `path` on `site` as of the snapshot, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SnapshotTooOld`] past the snapshot age limit.
+    pub fn resolve(&self, site: &str, path: &str) -> Result<Option<RouteEntry>> {
+        let at = self.at()?;
+        Ok(self.engine.routes.get_at(site, path, at))
     }
 }
 

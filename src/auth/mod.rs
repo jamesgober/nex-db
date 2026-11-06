@@ -43,7 +43,9 @@ use crate::{
         conflict::ConflictTable,
         keys::RootKey,
         now_ms,
+        pipeline::SnapshotGuard,
         record::{SEALED, Section, Seq},
+        versions::Versions,
     },
     engine::{Conflict, Engine, EngineId, Staged},
     error::{Error, Result},
@@ -208,6 +210,8 @@ pub(crate) struct AuthEngine {
     applied: AtomicU64,
     sessions: SessionTable,
     epochs: EpochTable,
+    /// Account record versions kept for running snapshots.
+    versions: Versions,
     /// Failed sign-ins per account: count and window start.
     failures: Mutex<HashMap<AccountId, (u32, u64)>>,
     conflicts: ConflictTable,
@@ -253,6 +257,7 @@ impl AuthEngine {
             applied: AtomicU64::new(applied),
             sessions: SessionTable::new(),
             epochs: EpochTable::new(),
+            versions: Versions::new(),
             failures: Mutex::new(HashMap::new()),
             conflicts: ConflictTable::new(),
             hashing: AtomicUsize::new(0),
@@ -289,18 +294,37 @@ impl AuthEngine {
         }
     }
 
+    /// The account's record as a snapshot at `at` sees it.
+    fn load_account_at(&self, account: AccountId, at: Seq) -> Result<Option<AccountRecord>> {
+        let key = account_key(self.collection, account);
+        match self.versions.at(&key, at) {
+            Some(Some(value)) => self.decode_account(account, &key, &value).map(Some),
+            Some(None) => Ok(None),
+            None => self.load_account(account),
+        }
+    }
+
     /// The account's record, sealed or (from 0.1 and 0.2) plain.
     fn load_account(&self, account: AccountId) -> Result<Option<AccountRecord>> {
         let key = account_key(self.collection, account);
         let Some(value) = self.accounts.get(&key)? else {
             return Ok(None);
         };
+        self.decode_account(account, &key, &value).map(Some)
+    }
+
+    fn decode_account(
+        &self,
+        account: AccountId,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<AccountRecord> {
         if value.first() == Some(&VALUE_SEALED) {
-            let plain = open_value(&self.file_key, &key, &value)?;
-            return AccountRecord::decode(&plain).map(Some);
+            let plain = open_value(&self.file_key, key, value)?;
+            return AccountRecord::decode(&plain);
         }
         // A plain account keeps its credential apart.
-        let mut r = Reader::new(&value, "an account record", 0);
+        let mut r = Reader::new(value, "an account record", 0);
         if r.u8()? != ACCOUNT_FORMAT {
             return Err(Error::corrupt("an account record", 0));
         }
@@ -322,12 +346,12 @@ impl AuthEngine {
         }
         let phc = Zeroizing::new(r.str16()?.to_owned());
         r.finish()?;
-        Ok(Some(AccountRecord {
+        Ok(AccountRecord {
             created_ms,
             digest,
             standing,
             phc,
-        }))
+        })
     }
 
     /// Count a failed sign-in of `account` at `now`. Returns the failures in
@@ -597,7 +621,10 @@ impl Engine for AuthEngine {
             let mut batch = Batch::new();
             for op in &ops {
                 if let Op::UpdateAccount { account, value } = op {
-                    batch.put(account_key(self.collection, *account), *value);
+                    let key = account_key(self.collection, *account);
+                    self.versions
+                        .record(&key, seq, Some(value), || Ok(self.accounts.get(&key)?))?;
+                    batch.put(key, *value);
                 }
                 if let Op::CreateSealedAccount {
                     account,
@@ -605,7 +632,10 @@ impl Engine for AuthEngine {
                     value,
                 } = op
                 {
-                    batch.put(account_key(self.collection, *account), *value);
+                    let key = account_key(self.collection, *account);
+                    self.versions
+                        .record(&key, seq, Some(value), || Ok(self.accounts.get(&key)?))?;
+                    batch.put(key, *value);
                     batch.put(identifier_key(self.collection, digest), account.as_bytes());
                 }
                 if let Op::CreateAccount {
@@ -666,6 +696,7 @@ impl Engine for AuthEngine {
 
     fn reclaim(&self, watermark: Seq) {
         self.conflicts.prune(watermark);
+        self.versions.prune(watermark);
     }
 }
 
@@ -1546,6 +1577,47 @@ impl Auth<'_> {
     ) -> Result<()> {
         self.db
             .commit(|tx| tx.auth().set_standing(account, standing, by))
+    }
+}
+
+/// Auth reads at one snapshot, inside [`Database::read`](crate::Database::read).
+///
+/// Returned by [`Read::auth`](crate::Read::auth). Sessions are read-latest
+/// by design: a session revoked after the snapshot is revoked here too.
+#[derive(Debug)]
+pub struct AuthRead<'r> {
+    pub(crate) engine: &'r AuthEngine,
+    pub(crate) snapshot: &'r SnapshotGuard<'r>,
+}
+
+impl AuthRead<'_> {
+    /// As [`Auth::validate`], at the latest state.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SnapshotTooOld`] past the snapshot age limit.
+    pub fn validate(&self, token: impl AsRef<str>) -> Result<Validation> {
+        if self.snapshot.expired() {
+            return Err(Error::SnapshotTooOld);
+        }
+        Ok(self.engine.validate(token.as_ref()))
+    }
+
+    /// The account's standing as of the snapshot, or `None` when the account
+    /// did not exist then.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SnapshotTooOld`] past the snapshot age limit, and the errors
+    /// of [`Auth::standing`].
+    pub fn standing(&self, account: AccountId) -> Result<Option<Standing>> {
+        if self.snapshot.expired() {
+            return Err(Error::SnapshotTooOld);
+        }
+        Ok(self
+            .engine
+            .load_account_at(account, self.snapshot.seq())?
+            .map(|record| record.standing.at(now_ms())))
     }
 }
 

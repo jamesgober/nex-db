@@ -11,11 +11,16 @@ use std::{
 };
 
 use super::entity::RouteEntry;
+use crate::core::record::Seq;
+
+/// A site's routes by path, each with the sequence number that created it
+/// (0 for routes loaded from the store, which every snapshot sees).
+type Paths = HashMap<String, (Seq, RouteEntry)>;
 
 /// Routes by site, then by path.
 #[derive(Debug, Default)]
 pub(crate) struct RouteTable {
-    sites: RwLock<HashMap<String, HashMap<String, RouteEntry>>>,
+    sites: RwLock<HashMap<String, Paths>>,
 }
 
 impl RouteTable {
@@ -25,17 +30,28 @@ impl RouteTable {
 
     /// The route at `path` on `site`. Allocates nothing.
     pub(crate) fn get(&self, site: &str, path: &str) -> Option<RouteEntry> {
-        let sites = self.sites.read().unwrap_or_else(PoisonError::into_inner);
-        sites.get(site).and_then(|paths| paths.get(path)).copied()
+        self.get_at(site, path, Seq::MAX)
     }
 
-    /// Set the route at `path` on `site`.
-    pub(crate) fn insert(&self, site: &str, path: &str, entry: RouteEntry) {
+    /// The route at `path` on `site` as a snapshot at `at` sees it. Routes
+    /// are only ever added in this version, so a route is visible from the
+    /// commit that created it on.
+    pub(crate) fn get_at(&self, site: &str, path: &str, at: Seq) -> Option<RouteEntry> {
+        let sites = self.sites.read().unwrap_or_else(PoisonError::into_inner);
+        sites
+            .get(site)
+            .and_then(|paths| paths.get(path))
+            .filter(|(since, _)| *since <= at)
+            .map(|(_, entry)| *entry)
+    }
+
+    /// Set the route at `path` on `site`, created at `since`.
+    pub(crate) fn insert(&self, site: &str, path: &str, since: Seq, entry: RouteEntry) {
         let mut sites = self.sites.write().unwrap_or_else(PoisonError::into_inner);
         let _ = sites
             .entry(site.to_owned())
             .or_default()
-            .insert(path.to_owned(), entry);
+            .insert(path.to_owned(), (since, entry));
     }
 }
 
@@ -52,8 +68,10 @@ mod tests {
             revision: 1,
             kind: RouteKind::Page,
         };
-        table.insert("example.com", "/a", entry);
+        table.insert("example.com", "/a", 4, entry);
         assert_eq!(table.get("example.com", "/a"), Some(entry));
+        assert_eq!(table.get_at("example.com", "/a", 3), None);
+        assert_eq!(table.get_at("example.com", "/a", 4), Some(entry));
         assert_eq!(table.get("example.com", "/b"), None);
         assert_eq!(table.get("other.com", "/a"), None);
     }

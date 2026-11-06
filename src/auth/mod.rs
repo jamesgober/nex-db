@@ -289,6 +289,10 @@ impl AuthEngine {
             Err(_) => None,
         };
         let _slot = self.hashing_slot()?;
+        // Built before the lookup result is used, so the first sign-in of a
+        // process costs the same extra hash whether the identifier exists or
+        // not.
+        let dummy = self.dummy_hash()?;
         match found {
             Some((account, phc)) => match kdf::argon2_check(&phc, password.as_bytes()) {
                 Ok(()) => Ok(Some(account)),
@@ -296,7 +300,6 @@ impl AuthEngine {
                 Err(_) => Err(Error::corrupt("a stored password hash", 0)),
             },
             None => {
-                let dummy = self.dummy_hash()?;
                 let _ = kdf::argon2_check(dummy, password.as_bytes());
                 Ok(None)
             }
@@ -794,9 +797,9 @@ impl AuthTx<'_, '_> {
     /// # Errors
     ///
     /// Only storage errors; a malformed token returns `Ok(false)`.
-    pub fn revoke(&mut self, token: &str) -> Result<bool> {
+    pub fn revoke(&mut self, token: impl AsRef<str>) -> Result<bool> {
         let engine = self.staged.engine;
-        let Some(random) = token::parse(token) else {
+        let Some(random) = token::parse(token.as_ref()) else {
             return Ok(false);
         };
         let digest = engine.token_digest(&random);

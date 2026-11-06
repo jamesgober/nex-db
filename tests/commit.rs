@@ -636,13 +636,15 @@ fn test_session_carries_payload_recheck_and_idle_limit() {
     // An idle limit ends a session left unused.
     let idle = db
         .auth()
-        .issue_session(ann, SessionSpec::web().idle(Duration::from_millis(50)))
+        .issue_session(ann, SessionSpec::web().idle(Duration::from_secs(1)))
         .unwrap();
     assert!(matches!(
         db.auth().validate(&idle).unwrap(),
         Validation::Valid(_)
     ));
-    thread::sleep(Duration::from_millis(120));
+    // A slow disk can take tens of milliseconds to sync the issuing commit,
+    // so the limit is long enough for that and the wait longer still.
+    thread::sleep(Duration::from_millis(1300));
     assert_eq!(db.auth().validate(&idle).unwrap(), Validation::Expired);
     assert!(SessionSpec::web().payload(&[0; 257]).is_err());
 }

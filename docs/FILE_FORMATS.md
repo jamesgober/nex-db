@@ -217,10 +217,13 @@ slot count times:         token digest [32], kind u8, then by kind:
     1 live session        account [16], created ms u64, expires ms u64, epoch u32,
                           idle ms u64, recheck ms u64, payload bytes16,
                           last used ms u64
-    2 revoked             reason u8 (1 revoked, 2 rotated, 3 signed out everywhere)
+    2 revoked             kept until ms u64, reason u8 (1 revoked, 2 rotated,
+                          3 signed out everywhere)
 ```
 
-Sessions already expired are left out.
+Each checkpoint first drops sessions that have expired and tombstones whose
+session would have expired (a tombstone of a session whose expiry is unknown
+is kept a day), so the table stays bounded.
 
 ## auth/audit.chain
 

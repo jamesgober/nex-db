@@ -328,7 +328,10 @@ impl AuthEngine {
     /// tombstones, sealed under the file key.
     fn save_sessions(&self, through: Seq) -> Result<()> {
         let epochs = self.epochs.snapshot();
-        let slots = self.sessions.snapshot(now_ms());
+        // Expired sessions and old tombstones go first: they are invalid
+        // either way, and the table is bounded.
+        let _ = self.sessions.prune(now_ms());
+        let slots = self.sessions.snapshot();
         let mut plain =
             Zeroizing::new(Vec::with_capacity(8 + epochs.len() * 20 + slots.len() * 70));
         let tail = self.audit.sync()?;
@@ -356,6 +359,7 @@ impl AuthEngine {
                 }
                 Slot::Revoked(reason) => {
                     w.u8(SLOT_REVOKED);
+                    w.u64(*seen);
                     w.u8(match reason {
                         RevokeReason::Rotated => REASON_ROTATED,
                         RevokeReason::SignedOutEverywhere => REASON_SIGNED_OUT_EVERYWHERE,
@@ -868,7 +872,11 @@ impl Engine for AuthEngine {
             self.audit_op(seq, n, &op)?;
             match op {
                 Op::IssueSession { digest, session } => self.sessions.insert(digest, session),
-                Op::RevokeSession { digest, reason, .. } => self.sessions.revoke(digest, reason),
+                Op::RevokeSession {
+                    digest,
+                    reason,
+                    at_ms,
+                } => self.sessions.revoke(digest, reason, at_ms),
                 Op::RaiseEpoch { account, epoch, .. } => self.epochs.raise(account, epoch),
                 Op::CreateAccount { .. }
                 | Op::CreateSealedAccount { .. }
@@ -1261,7 +1269,7 @@ fn read_checkpoint(path: &Path, file_key: &[u8; 32]) -> Result<Option<Checkpoint
     let mut slots = Vec::new();
     for _ in 0..r.u32()? {
         let digest = r.fixed::<32>()?;
-        let mut seen = 0;
+        let seen;
         let slot = match r.u8()? {
             SLOT_LIVE => {
                 let session = Session {
@@ -1276,12 +1284,15 @@ fn read_checkpoint(path: &Path, file_key: &[u8; 32]) -> Result<Option<Checkpoint
                 seen = r.u64()?;
                 Slot::Live(session)
             }
-            SLOT_REVOKED => Slot::Revoked(match r.u8()? {
-                REASON_REVOKED => RevokeReason::Revoked,
-                REASON_ROTATED => RevokeReason::Rotated,
-                REASON_SIGNED_OUT_EVERYWHERE => RevokeReason::SignedOutEverywhere,
-                _ => return Err(corrupt()),
-            }),
+            SLOT_REVOKED => {
+                seen = r.u64()?;
+                Slot::Revoked(match r.u8()? {
+                    REASON_REVOKED => RevokeReason::Revoked,
+                    REASON_ROTATED => RevokeReason::Rotated,
+                    REASON_SIGNED_OUT_EVERYWHERE => RevokeReason::SignedOutEverywhere,
+                    _ => return Err(corrupt()),
+                })
+            }
             _ => return Err(corrupt()),
         };
         slots.push((digest, slot, seen));

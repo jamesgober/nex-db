@@ -82,10 +82,17 @@ impl Stored {
     }
 }
 
+/// How long a tombstone of a session whose expiry is unknown is kept.
+const TOMBSTONE_MS: u64 = 24 * 60 * 60 * 1000;
+
 #[derive(Debug)]
 enum Entry {
     Live(Stored),
-    Revoked(RevokeReason),
+    /// A revocation, kept until the session would have expired anyway.
+    Revoked {
+        reason: RevokeReason,
+        until_ms: u64,
+    },
 }
 
 /// Sessions by token digest.
@@ -108,7 +115,7 @@ impl SessionTable {
                 Slot::Live(stored.session()),
                 stored.seen.load(Ordering::Relaxed),
             ),
-            Entry::Revoked(reason) => (Slot::Revoked(*reason), 0),
+            Entry::Revoked { reason, .. } => (Slot::Revoked(*reason), 0),
         })
     }
 
@@ -134,10 +141,30 @@ impl SessionTable {
             .or_insert_with(|| Entry::Live(Stored::new(&session, session.created_ms)));
     }
 
-    /// Replace the session with a tombstone.
-    pub(crate) fn revoke(&self, digest: [u8; 32], reason: RevokeReason) {
+    /// Replace the session with a tombstone, kept until the session would
+    /// have expired (or a day, when it is not known). `now_ms` is the
+    /// revocation's own time, so a replay keeps the same tombstone.
+    pub(crate) fn revoke(&self, digest: [u8; 32], reason: RevokeReason, now_ms: u64) {
         let mut slots = self.slots.write().unwrap_or_else(PoisonError::into_inner);
-        let _ = slots.insert(digest, Entry::Revoked(reason));
+        let until_ms = match slots.get(&digest) {
+            Some(Entry::Live(stored)) => stored.expires_ms,
+            Some(Entry::Revoked { until_ms, .. }) => *until_ms,
+            None => now_ms.saturating_add(TOMBSTONE_MS),
+        };
+        let _ = slots.insert(digest, Entry::Revoked { reason, until_ms });
+    }
+
+    /// Drop sessions and tombstones whose time has passed at `now_ms`: an
+    /// expired session is invalid either way, and a tombstone outlives its
+    /// session only to say why it ended. Returns how many were dropped.
+    pub(crate) fn prune(&self, now_ms: u64) -> usize {
+        let mut slots = self.slots.write().unwrap_or_else(PoisonError::into_inner);
+        let before = slots.len();
+        slots.retain(|_, entry| match entry {
+            Entry::Live(stored) => stored.expires_ms > now_ms,
+            Entry::Revoked { until_ms, .. } => *until_ms > now_ms,
+        });
+        before - slots.len()
     }
 
     /// Live sessions of `account` that are still valid at `now_ms` under
@@ -160,29 +187,32 @@ impl SessionTable {
             .len()
     }
 
-    /// Every slot except sessions that expired before `now_ms`, with when
-    /// each live one was last used, for a checkpoint.
-    pub(crate) fn snapshot(&self, now_ms: u64) -> Vec<([u8; 32], Slot, u64)> {
+    /// Every slot, for a checkpoint: the digest, the slot, and a time (when
+    /// a live session was last used; until when a tombstone is kept).
+    pub(crate) fn snapshot(&self) -> Vec<([u8; 32], Slot, u64)> {
         let slots = self.slots.read().unwrap_or_else(PoisonError::into_inner);
         slots
             .iter()
-            .filter(|(_, entry)| !matches!(entry, Entry::Live(s) if s.expires_ms <= now_ms))
             .map(|(digest, entry)| match entry {
                 Entry::Live(stored) => (
                     *digest,
                     Slot::Live(stored.session()),
                     stored.seen.load(Ordering::Relaxed),
                 ),
-                Entry::Revoked(reason) => (*digest, Slot::Revoked(*reason), 0),
+                Entry::Revoked { reason, until_ms } => (*digest, Slot::Revoked(*reason), *until_ms),
             })
             .collect()
     }
 
-    /// Put a slot back as a checkpoint held it.
-    pub(crate) fn restore(&self, digest: [u8; 32], slot: Slot, seen: u64) {
+    /// Put a slot back as a checkpoint held it, with its time (see
+    /// [`snapshot`](Self::snapshot)).
+    pub(crate) fn restore(&self, digest: [u8; 32], slot: Slot, time: u64) {
         let entry = match slot {
-            Slot::Live(session) => Entry::Live(Stored::new(&session, seen)),
-            Slot::Revoked(reason) => Entry::Revoked(reason),
+            Slot::Live(session) => Entry::Live(Stored::new(&session, time)),
+            Slot::Revoked(reason) => Entry::Revoked {
+                reason,
+                until_ms: time,
+            },
         };
         let mut slots = self.slots.write().unwrap_or_else(PoisonError::into_inner);
         let _ = slots.insert(digest, entry);
@@ -239,6 +269,29 @@ mod tests {
     }
 
     #[test]
+    fn test_prune_drops_expired_sessions_and_old_tombstones() {
+        let table = SessionTable::new();
+        table.insert([1; 32], session()); // expires at 10
+        table.insert(
+            [2; 32],
+            Session {
+                expires_ms: 100,
+                ..session()
+            },
+        );
+        table.revoke([2; 32], RevokeReason::Revoked, 5); // kept until 100
+        table.revoke([3; 32], RevokeReason::Revoked, 5); // unknown: a day
+        assert_eq!(table.prune(50), 1);
+        assert_eq!(table.get(&[1; 32]), None);
+        assert_eq!(
+            table.get(&[2; 32]),
+            Some(Slot::Revoked(RevokeReason::Revoked))
+        );
+        assert_eq!(table.prune(100), 1);
+        assert_eq!(table.len(), 1);
+    }
+
+    #[test]
     fn test_payload_and_last_use_round_trip() {
         let table = SessionTable::new();
         let with = Session {
@@ -250,7 +303,7 @@ mod tests {
         table.touch(&[5; 32], 7);
         table.touch(&[5; 32], 4);
         assert_eq!(table.get_seen(&[5; 32]).map(|(_, seen)| seen), Some(7));
-        let snapshot = table.snapshot(0);
+        let snapshot = table.snapshot();
         let other = SessionTable::new();
         for (digest, slot, seen) in snapshot {
             other.restore(digest, slot, seen);
@@ -270,7 +323,7 @@ mod tests {
             },
         );
         table.insert([3; 32], session());
-        table.revoke([3; 32], RevokeReason::Revoked);
+        table.revoke([3; 32], RevokeReason::Revoked, 0);
         table.insert(
             [4; 32],
             Session {
@@ -307,7 +360,7 @@ mod tests {
     fn test_revoke_then_insert_stays_revoked() {
         let table = SessionTable::new();
         table.insert([1; 32], session());
-        table.revoke([1; 32], RevokeReason::Revoked);
+        table.revoke([1; 32], RevokeReason::Revoked, 0);
         table.insert([1; 32], session());
         assert_eq!(
             table.get(&[1; 32]),

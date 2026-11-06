@@ -174,8 +174,8 @@ The operations:
 | 3 | revoke session | `token digest [32]`, `reason u8` (1 = revoked, 2 = rotated), `at ms u64` |
 | 4 | create account (sealed record) | `account [16]`, `identifier digest [32]`, `record bytes32` |
 | 5 | issue session at an epoch | `token digest [32]`, `account [16]`, `created ms u64`, `expires ms u64`, `epoch u32` |
-| 6 | raise an account's epoch | `account [16]`, `epoch u32` |
-| 7 | replace an account's record | `account [16]`, `record bytes32` (sealed, as in operation 4) |
+| 6 | raise an account's epoch | `account [16]`, `epoch u32`, `at ms u64` |
+| 7 | replace an account's record | `account [16]`, `record bytes32` (sealed, as in operation 4), `at ms u64` |
 
 A session is valid only while its epoch equals the account's current epoch
 (0 until the first raise), so operation 6 ends every older session of the

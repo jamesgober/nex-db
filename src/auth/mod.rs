@@ -10,6 +10,7 @@
 //! There is no query, scan, list, or export of credentials, session digests,
 //! or identifiers. The operations below are the whole surface.
 
+mod audit;
 mod sessions;
 pub(crate) mod token;
 pub(crate) mod types;
@@ -29,6 +30,7 @@ use crypt_io::{Crypt, Zeroizing, kdf, mac};
 use lsm_db::{Batch, Lsm};
 
 use self::{
+    audit::{AuditChain, Tail},
     sessions::{EpochTable, SessionTable, Slot},
     token::Token,
     types::{
@@ -143,6 +145,7 @@ const TOKEN_KEY_LABEL: &[u8] = b"nex-db 2026 auth token digest";
 const IDENTIFIER_KEY_LABEL: &[u8] = b"nex-db 2026 auth identifier digest";
 const SEAL_KEY_LABEL: &[u8] = b"nex-db 2026 auth log seal";
 const FILE_KEY_LABEL: &[u8] = b"nex-db 2026 auth file";
+const AUDIT_KEY_LABEL: &[u8] = b"nex-db 2026 auth audit";
 
 /// First byte of a sealed account-store value. Plain values from 0.1 and 0.2
 /// start with their format byte, 1.
@@ -235,6 +238,8 @@ pub(crate) struct AuthEngine {
     writing: Mutex<()>,
     sessions: SessionTable,
     epochs: EpochTable,
+    /// The realm's audit chain.
+    audit: AuditChain,
     /// Account record versions kept for running snapshots.
     versions: Versions,
     /// Failed sign-ins per account: count and window start.
@@ -261,9 +266,15 @@ impl AuthEngine {
     /// Open the engine's store in `dir`.
     pub(crate) fn open(dir: &Path, root: &RootKey, collection: u32) -> Result<Self> {
         let accounts = Lsm::open(dir)?;
-        let sessions_file = dir
-            .parent()
-            .map_or_else(|| PathBuf::from(SESSIONS_FILE), |p| p.join(SESSIONS_FILE));
+        let auth_dir = dir.parent().unwrap_or(dir).to_path_buf();
+        let sessions_file = auth_dir.join(SESSIONS_FILE);
+        let file_key = root.derive(FILE_KEY_LABEL);
+        let checkpoint = read_checkpoint(&sessions_file, &file_key)?;
+        let audit = AuditChain::open(
+            &auth_dir,
+            root.derive(AUDIT_KEY_LABEL),
+            checkpoint.as_ref().map(|c| c.tail),
+        )?;
         let applied = match accounts.get(META_APPLIED)? {
             Some(bytes) => {
                 let bytes: [u8; 8] = bytes
@@ -282,7 +293,7 @@ impl AuthEngine {
             token_key: root.derive(TOKEN_KEY_LABEL),
             identifier_key: root.derive(IDENTIFIER_KEY_LABEL),
             seal_key: root.derive(SEAL_KEY_LABEL),
-            file_key: root.derive(FILE_KEY_LABEL),
+            file_key,
             accounts,
             applied: AtomicU64::new(applied),
             accounts_durable: AtomicU64::new(applied),
@@ -290,6 +301,7 @@ impl AuthEngine {
             writing: Mutex::new(()),
             sessions: SessionTable::new(),
             epochs: EpochTable::new(),
+            audit,
             versions: Versions::new(),
             failures: Mutex::new(HashMap::new()),
             conflicts: ConflictTable::new(),
@@ -297,62 +309,31 @@ impl AuthEngine {
             max_hashing,
             dummy: OnceLock::new(),
         };
-        engine.load_sessions()?;
+        if let Some(checkpoint) = checkpoint {
+            for (account, epoch) in checkpoint.epochs {
+                engine.epochs.raise(account, epoch);
+            }
+            for (digest, slot) in checkpoint.slots {
+                engine.sessions.restore(digest, slot);
+            }
+            engine
+                .sessions_through
+                .store(checkpoint.through, Ordering::Release);
+        }
         Ok(engine)
     }
 
-    /// Load the session checkpoint, when there is one. A damaged one keeps
-    /// the database closed: the log below its mark may be gone.
-    fn load_sessions(&self) -> Result<()> {
-        let corrupt = || Error::corrupt("the session checkpoint", 0);
-        let Some(bytes) = fs::read_optional(&self.sessions_file)? else {
-            return Ok(());
-        };
-        let mut r = Reader::new(&bytes, "the session checkpoint", 0);
-        if r.u16()? != SESSIONS_FORMAT {
-            return Err(corrupt());
-        }
-        let through = r.u64()?;
-        let sealed = r.bytes32()?;
-        r.finish()?;
-        let plain = open_value(&self.file_key, &sessions_aad(through), sealed)?;
-        let mut r = Reader::new(&plain, "the session checkpoint", 0);
-        for _ in 0..r.u32()? {
-            let account = AccountId::from_bytes(r.fixed()?);
-            self.epochs.raise(account, r.u32()?);
-        }
-        for _ in 0..r.u32()? {
-            let digest = r.fixed::<32>()?;
-            let slot = match r.u8()? {
-                SLOT_LIVE => Slot::Live(Session {
-                    account: AccountId::from_bytes(r.fixed()?),
-                    created_ms: r.u64()?,
-                    expires_ms: r.u64()?,
-                    epoch: r.u32()?,
-                }),
-                SLOT_REVOKED => Slot::Revoked(match r.u8()? {
-                    REASON_REVOKED => RevokeReason::Revoked,
-                    REASON_ROTATED => RevokeReason::Rotated,
-                    REASON_SIGNED_OUT_EVERYWHERE => RevokeReason::SignedOutEverywhere,
-                    _ => return Err(corrupt()),
-                }),
-                _ => return Err(corrupt()),
-            };
-            self.sessions.restore(digest, slot);
-        }
-        r.finish()?;
-        self.sessions_through.store(through, Ordering::Release);
-        Ok(())
-    }
-
-    /// Write the session checkpoint through `through`: sessions not yet
-    /// expired, tombstones, and epochs, sealed under the file key.
+    /// Write the session checkpoint through `through`: the audit chain's
+    /// tail (after syncing the chain), epochs, sessions not yet expired, and
+    /// tombstones, sealed under the file key.
     fn save_sessions(&self, through: Seq) -> Result<()> {
         let epochs = self.epochs.snapshot();
         let slots = self.sessions.snapshot(now_ms());
         let mut plain =
             Zeroizing::new(Vec::with_capacity(8 + epochs.len() * 20 + slots.len() * 70));
+        let tail = self.audit.sync()?;
         let mut w = Writer::new(&mut plain);
+        tail.encode(&mut w);
         w.u32(u32::try_from(epochs.len()).map_err(|_| Error::invalid("epochs", "too many"))?);
         for (account, epoch) in &epochs {
             w.bytes(account.as_bytes());
@@ -476,6 +457,55 @@ impl AuthEngine {
             standing,
             phc,
         })
+    }
+
+    /// Add the audit record of the `n`-th operation of commit `seq`. Called
+    /// before the operation changes the session table, so a revocation can
+    /// still name the session's account.
+    fn audit_op(&self, seq: Seq, n: u32, op: &Op<'_>) -> Result<()> {
+        let account = |a: AccountId| format!("account {a}");
+        let (at_ms, action, target) = match op {
+            Op::CreateAccount {
+                account: a,
+                created_ms,
+                ..
+            } => (*created_ms, "account.created", account(*a)),
+            Op::CreateSealedAccount {
+                account: a, value, ..
+            } => {
+                let key = account_key(self.collection, *a);
+                let created =
+                    AccountRecord::decode(&open_value(&self.file_key, &key, value)?)?.created_ms;
+                (created, "account.created", account(*a))
+            }
+            Op::IssueSession { session, .. } => (
+                session.created_ms,
+                "session.issued",
+                account(session.account),
+            ),
+            Op::RevokeSession {
+                digest,
+                reason,
+                at_ms,
+            } => {
+                let action = match reason {
+                    RevokeReason::Rotated => "session.rotated",
+                    _ => "session.revoked",
+                };
+                let target = match self.sessions.get(digest) {
+                    Some(Slot::Live(session)) => account(session.account),
+                    _ => "session".to_owned(),
+                };
+                (*at_ms, action, target)
+            }
+            Op::RaiseEpoch {
+                account: a, at_ms, ..
+            } => (*at_ms, "account.signed_out_everywhere", account(*a)),
+            Op::UpdateAccount {
+                account: a, at_ms, ..
+            } => (*at_ms, "account.standing_changed", account(*a)),
+        };
+        self.audit.append(seq, n, at_ms, action, &target)
     }
 
     /// Count a failed sign-in of `account` at `now`. Returns the failures in
@@ -615,14 +645,17 @@ enum Op<'a> {
     RevokeSession {
         digest: [u8; 32],
         reason: RevokeReason,
+        at_ms: u64,
     },
     RaiseEpoch {
         account: AccountId,
         epoch: u32,
+        at_ms: u64,
     },
     UpdateAccount {
         account: AccountId,
         value: &'a [u8],
+        at_ms: u64,
     },
 }
 
@@ -676,10 +709,12 @@ fn decode_ops(seq: Seq, body: &[u8]) -> Result<Vec<Op<'_>>> {
             OP_RAISE_EPOCH => Op::RaiseEpoch {
                 account: AccountId::from_bytes(r.fixed()?),
                 epoch: r.u32()?,
+                at_ms: r.u64()?,
             },
             OP_UPDATE_ACCOUNT => Op::UpdateAccount {
                 account: AccountId::from_bytes(r.fixed()?),
                 value: r.bytes32()?,
+                at_ms: r.u64()?,
             },
             OP_REVOKE_SESSION => {
                 let digest = r.fixed()?;
@@ -688,8 +723,12 @@ fn decode_ops(seq: Seq, body: &[u8]) -> Result<Vec<Op<'_>>> {
                     REASON_ROTATED => RevokeReason::Rotated,
                     _ => return Err(Error::corrupt("an auth revoke reason", seq)),
                 };
-                let _at_ms = r.u64()?;
-                Op::RevokeSession { digest, reason }
+                let at_ms = r.u64()?;
+                Op::RevokeSession {
+                    digest,
+                    reason,
+                    at_ms,
+                }
             }
             _ => return Err(Error::corrupt("an auth operation", seq)),
         };
@@ -744,7 +783,7 @@ impl Engine for AuthEngine {
         if seq > self.applied.load(Ordering::Acquire) {
             let mut batch = Batch::new();
             for op in &ops {
-                if let Op::UpdateAccount { account, value } = op {
+                if let Op::UpdateAccount { account, value, .. } = op {
                     let key = account_key(self.collection, *account);
                     self.versions
                         .record(&key, seq, Some(value), || Ok(self.accounts.get(&key)?))?;
@@ -798,11 +837,13 @@ impl Engine for AuthEngine {
         if seq <= self.sessions_through.load(Ordering::Acquire) {
             return Ok(());
         }
-        for op in ops {
+        for (n, op) in ops.into_iter().enumerate() {
+            let n = u32::try_from(n).map_err(|_| Error::corrupt("an auth section", seq))?;
+            self.audit_op(seq, n, &op)?;
             match op {
                 Op::IssueSession { digest, session } => self.sessions.insert(digest, session),
-                Op::RevokeSession { digest, reason } => self.sessions.revoke(digest, reason),
-                Op::RaiseEpoch { account, epoch } => self.epochs.raise(account, epoch),
+                Op::RevokeSession { digest, reason, .. } => self.sessions.revoke(digest, reason),
+                Op::RaiseEpoch { account, epoch, .. } => self.epochs.raise(account, epoch),
                 Op::CreateAccount { .. }
                 | Op::CreateSealedAccount { .. }
                 | Op::UpdateAccount { .. } => {}
@@ -863,11 +904,13 @@ enum StagedOp {
     RaiseEpoch {
         account: AccountId,
         epoch: u32,
+        at_ms: u64,
     },
     UpdateAccount {
         account: AccountId,
         /// The new record, sealed while staging.
         value: Vec<u8>,
+        at_ms: u64,
     },
 }
 
@@ -1000,15 +1043,25 @@ fn write_ops(ops: &[StagedOp], out: &mut Vec<u8>) -> Result<()> {
                 });
                 w.u64(*at_ms);
             }
-            StagedOp::RaiseEpoch { account, epoch } => {
+            StagedOp::RaiseEpoch {
+                account,
+                epoch,
+                at_ms,
+            } => {
                 w.u8(OP_RAISE_EPOCH);
                 w.bytes(account.as_bytes());
                 w.u32(*epoch);
+                w.u64(*at_ms);
             }
-            StagedOp::UpdateAccount { account, value } => {
+            StagedOp::UpdateAccount {
+                account,
+                value,
+                at_ms,
+            } => {
                 w.u8(OP_UPDATE_ACCOUNT);
                 w.bytes(account.as_bytes());
                 w.bytes32(value)?;
+                w.u64(*at_ms);
             }
         }
     }
@@ -1151,6 +1204,64 @@ enum Checked {
     Wrong(Option<AccountId>),
     /// The password matched; the account may not sign in until then.
     Blocked(Option<SystemTime>),
+}
+
+/// What a session checkpoint holds.
+struct Checkpoint {
+    through: Seq,
+    tail: Tail,
+    epochs: Vec<(AccountId, u32)>,
+    slots: Vec<([u8; 32], Slot)>,
+}
+
+/// Read the session checkpoint at `path`, when there is one. A damaged one
+/// keeps the database closed: the log below its mark may be gone.
+fn read_checkpoint(path: &Path, file_key: &[u8; 32]) -> Result<Option<Checkpoint>> {
+    let corrupt = || Error::corrupt("the session checkpoint", 0);
+    let Some(bytes) = fs::read_optional(path)? else {
+        return Ok(None);
+    };
+    let mut r = Reader::new(&bytes, "the session checkpoint", 0);
+    if r.u16()? != SESSIONS_FORMAT {
+        return Err(corrupt());
+    }
+    let through = r.u64()?;
+    let sealed = r.bytes32()?;
+    r.finish()?;
+    let plain = open_value(file_key, &sessions_aad(through), sealed)?;
+    let mut r = Reader::new(&plain, "the session checkpoint", 0);
+    let tail = Tail::decode(&mut r)?;
+    let mut epochs = Vec::new();
+    for _ in 0..r.u32()? {
+        epochs.push((AccountId::from_bytes(r.fixed()?), r.u32()?));
+    }
+    let mut slots = Vec::new();
+    for _ in 0..r.u32()? {
+        let digest = r.fixed::<32>()?;
+        let slot = match r.u8()? {
+            SLOT_LIVE => Slot::Live(Session {
+                account: AccountId::from_bytes(r.fixed()?),
+                created_ms: r.u64()?,
+                expires_ms: r.u64()?,
+                epoch: r.u32()?,
+            }),
+            SLOT_REVOKED => Slot::Revoked(match r.u8()? {
+                REASON_REVOKED => RevokeReason::Revoked,
+                REASON_ROTATED => RevokeReason::Rotated,
+                REASON_SIGNED_OUT_EVERYWHERE => RevokeReason::SignedOutEverywhere,
+                _ => return Err(corrupt()),
+            }),
+            _ => return Err(corrupt()),
+        };
+        slots.push((digest, slot));
+    }
+    r.finish()?;
+    Ok(Some(Checkpoint {
+        through,
+        tail,
+        epochs,
+        slots,
+    }))
 }
 
 /// Associated data of the session checkpoint: binds it to its mark.
@@ -1387,6 +1498,7 @@ impl AuthTx<'_, '_> {
         self.staged.ops.push(StagedOp::RaiseEpoch {
             account,
             epoch: next,
+            at_ms: now_ms(),
         });
         Ok(live)
     }
@@ -1457,9 +1569,11 @@ impl AuthTx<'_, '_> {
         self.staged
             .writes
             .push(account_key(engine.collection, account));
-        self.staged
-            .ops
-            .push(StagedOp::UpdateAccount { account, value });
+        self.staged.ops.push(StagedOp::UpdateAccount {
+            account,
+            value,
+            at_ms: now_ms(),
+        });
         if standing.blocked_until(now_ms()).is_some() {
             let _ = self.revoke_all(account)?;
         }
@@ -1924,6 +2038,7 @@ mod tests {
         let update = sealed_len(StagedOp::UpdateAccount {
             account,
             value: value.clone(),
+            at_ms: u64::MAX,
         });
         let create = sealed_len(StagedOp::CreateAccount {
             account,
@@ -1945,6 +2060,7 @@ mod tests {
         let raise = sealed_len(StagedOp::RaiseEpoch {
             account,
             epoch: u32::MAX,
+            at_ms: u64::MAX,
         });
         assert_eq!(revoke, raise);
         assert_eq!(create, update);
@@ -2060,5 +2176,59 @@ mod tests {
         let last = bad.len() - 1;
         bad[last] ^= 1;
         assert!(open_value(&key, b"store key a", &bad).is_err());
+    }
+
+    #[test]
+    fn test_audit_chain_records_every_security_write_and_verifies() {
+        let dir = std::env::temp_dir().join(format!(
+            "nex-db-audit-{}-{}",
+            std::process::id(),
+            id_forge::ulid::Ulid::new()
+        ));
+        let auth_dir = dir.join("auth");
+        let chain = auth_dir.join(audit::AUDIT_FILE);
+        let key = || {
+            crate::core::keys::load_file(&auth_dir.join(crate::core::keys::KEY_FILE))
+                .unwrap()
+                .derive(AUDIT_KEY_LABEL)
+        };
+        {
+            let db = crate::open(&dir).unwrap();
+            let pw = db.auth().hash_password("pw").unwrap();
+            let ann = db.auth().create_account("ann@example.com", &pw).unwrap();
+            let bo = db.auth().create_account("bo@example.com", &pw).unwrap();
+            let t = db.auth().issue_session(ann, SessionSpec::web()).unwrap();
+            let _ = db.auth().issue_session(bo, SessionSpec::web()).unwrap();
+            assert!(db.auth().revoke(&t).unwrap());
+            let _ = db.auth().revoke_all(bo).unwrap();
+            db.auth()
+                .set_standing(ann, Standing::Banned { reason: 1 }, None)
+                .unwrap();
+        }
+        // Two accounts, two sessions, a revocation, a sign-out everywhere,
+        // and a ban (the record and the sign-out it implies).
+        assert_eq!(audit::verify_file(&chain, &key()).unwrap(), 8);
+
+        {
+            let db = crate::open(&dir).unwrap();
+            let bo = match db.auth().verify_password("bo@example.com", "pw").unwrap() {
+                Login::Verified(bo) => bo,
+                other => panic!("{other:?}"),
+            };
+            let _ = db.auth().issue_session(bo, SessionSpec::web()).unwrap();
+        }
+        assert_eq!(audit::verify_file(&chain, &key()).unwrap(), 9);
+
+        let bytes = std::fs::read(&chain).unwrap();
+        for i in [audit_trail::codec::FILE_HEADER_LEN + 9, bytes.len() - 3] {
+            let mut bad = bytes.clone();
+            bad[i] ^= 1;
+            std::fs::write(&chain, &bad).unwrap();
+            assert!(audit::verify_file(&chain, &key()).is_err(), "byte {i}");
+        }
+        std::fs::write(&chain, &bytes).unwrap();
+        // Another key does not verify it either.
+        assert!(audit::verify_file(&chain, &[9; 32]).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

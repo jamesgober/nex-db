@@ -13,6 +13,7 @@ All notable changes to `nex-db` are documented in this file. The format is based
 - `Auth::verify_password`, `Login`, `Auth::standing`, `set_standing`, and `Standing`; ten failed sign-ins within fifteen minutes lock an account out for fifteen minutes. `SignIn::LockedOut`.
 - `RevokeReason::Rotated` and `RevokeReason::SignedOutEverywhere`.
 - `Database::builder`, `Builder`, and `Keys`: the root key from a file outside the directory (`Keys::file`) or an environment variable (`Keys::env`). `auth/key.check` makes the wrong key fail as `KeyUnavailable`.
+- An audit chain per realm (`auth/audit.chain`, audit-trail format, keyed BLAKE3): every security write, kept after the log is truncated.
 - Checkpoints and log truncation: the log stays bounded and an open replays only what came after the last checkpoint. `Builder::checkpoint_every` (64 MiB by default). Sessions and epochs are kept in a sealed `auth/sessions.ckpt`.
 - `Database::read`, `Read`, `AuthRead`, and `ContentRead`: reads across engines at one snapshot. `Error::SnapshotTooOld` (NEX-1009) after 60 seconds.
 

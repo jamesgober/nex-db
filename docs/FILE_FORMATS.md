@@ -40,6 +40,7 @@ length, then the bytes).
 │   ├─ keys              the root key (default key source only)
 │   ├─ key.check         a check of the root key
 │   ├─ sessions.ckpt     sessions and epochs, as of the last checkpoint
+│   ├─ audit.chain       the audit chain
 │   └─ accounts/         the account store (lsm-db)
 └─ content/
     └─ store/            the content store (lsm-db)
@@ -207,6 +208,8 @@ sealed bytes32            as a sealed account record (marker, key id, nonce,
 The plaintext:
 
 ```text
+audit chain tail          file length u64, next record id u64, last hash [32],
+                          last time ns u64 (see auth/audit.chain)
 epoch count u32
 epoch count times:        account [16], epoch u32
 slot count u32
@@ -215,7 +218,22 @@ slot count times:         token digest [32], kind u8, then by kind:
     2 revoked             reason u8 (1 revoked, 2 rotated, 3 signed out everywhere)
 ```
 
-Sessions already expired are left out. A damaged file keeps the database
+Sessions already expired are left out.
+
+## auth/audit.chain
+
+The realm's audit chain, in the [audit-trail](https://github.com/jamesgober/audit-trail)
+file format: a 16-byte header, then one length-prefixed record per security
+write (account created, session issued, revoked, or rotated, signed out
+everywhere, standing changed). Each record's hash covers the previous one's,
+with keyed BLAKE3 under `keyed BLAKE3(root key, "nex-db 2026 auth audit")`.
+The actor of a record is `commit <seq>.<n>`, the n-th operation of commit
+`seq`; its time is the one the operation carries.
+
+Records are appended as commits apply and synced by each checkpoint, which
+stores the chain's tail. At open the file is cut back to that length and
+replay appends the rest again, the same bytes. A file shorter than its
+checkpoint keeps the database closed. A damaged file keeps the database
 closed: the log below its mark may be gone, so nothing else holds those
 sessions.
 

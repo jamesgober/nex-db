@@ -50,7 +50,7 @@ path = "src/lib.rs"
 [features]
 default = ["auth", "content"]
 # The auth engine: accounts, sessions, password hashing.
-auth = ["dep:lsm-db", "crypt-io/kdf-argon2"]
+auth = ["dep:lsm-db", "dep:audit-trail", "crypt-io/kdf-argon2"]
 # The content engine: entities and routes.
 content = ["dep:lsm-db"]
 
@@ -72,6 +72,9 @@ crypt-io = { version = "1.2.2", default-features = false, features = [
 ] }
 # `durability` stays off: the core commit log is the write-ahead log.
 lsm-db = { version = "1.1", default-features = false, features = ["std"], optional = true }
+# The auth audit chain. No third-party dependency with default features off;
+# hashed with keyed BLAKE3 through crypt-io.
+audit-trail = { version = "1.1", default-features = false, features = ["std"], optional = true }
 
 
 # DEV DEPENDENCIES

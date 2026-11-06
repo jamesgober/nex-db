@@ -6,6 +6,22 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 ## [Unreleased]
 
+### Added
+
+- Group commit: one writer appends and syncs each batch of commits; at most 4,096 commits wait at once (`Error::Busy` beyond).
+- `Auth::revoke_all` and `AuthTx::revoke_all` (sign an account out everywhere), and `rotate`.
+- `Auth::verify_password`, `Login`, `Auth::standing`, `set_standing`, and `Standing`; ten failed sign-ins within fifteen minutes lock an account out for fifteen minutes. `SignIn::LockedOut`.
+- `RevokeReason::Rotated` and `RevokeReason::SignedOutEverywhere`.
+
+### Changed
+
+- Auth sections in the log are sealed and padded (format 2); account records in the account store are sealed. Logs and stores written by 0.1 and 0.2 still read.
+- `Engine::apply` (internal) takes the decoded section.
+
+### Fixed
+
+- A damaged time value in stored data could panic when read; times are now clamped to the year 9999.
+
 ## [0.2.0] - 2026-11-06
 
 The design lock: the public API through 1.0 is written down and approved.

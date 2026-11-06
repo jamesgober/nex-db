@@ -108,7 +108,9 @@ mod ids;
 pub use crate::auth::{
     Auth, AuthTx,
     token::Token,
-    types::{HashedPassword, RevokeReason, Session, SessionSpec, SignIn, Validation},
+    types::{
+        HashedPassword, Login, RevokeReason, Session, SessionSpec, SignIn, Standing, Validation,
+    },
 };
 #[cfg(feature = "content")]
 #[cfg_attr(docsrs, doc(cfg(feature = "content")))]

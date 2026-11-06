@@ -151,11 +151,16 @@ file")`. Inside, the credential travels with the account:
 format u8                 2
 created ms u64
 identifier digest [32]
-standing u8               1 = active
-epoch u32                 0
+standing u8               1 active, 2 pending verification, 3 locked out,
+                          4 suspended, 5 banned
+until ms u64              when a lock-out or suspension ends; 0 for none
+reason u32                application-defined; 0 for none
 credential kind u8        1 = password
 password hash str16       Argon2id, PHC format
 ```
+
+A standing change writes the whole record again, sealed with a new nonce.
+Account epochs are not in the record: they live in the log.
 
 Records are sealed when the commit is staged, not when it is applied, and the
 sealed bytes travel inside the sealed log section; applying a commit stores

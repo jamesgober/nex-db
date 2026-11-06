@@ -175,13 +175,14 @@ The operations:
 | 4 | create account (sealed record) | `account [16]`, `identifier digest [32]`, `record bytes32` |
 | 5 | issue session at an epoch | `token digest [32]`, `account [16]`, `created ms u64`, `expires ms u64`, `epoch u32` |
 | 6 | raise an account's epoch | `account [16]`, `epoch u32` |
+| 7 | replace an account's record | `account [16]`, `record bytes32` (sealed, as in operation 4) |
 
 A session is valid only while its epoch equals the account's current epoch
 (0 until the first raise), so operation 6 ends every older session of the
 account at once. An epoch never goes down. Operations 1 and 2 appear only in
 format 1 logs; operation 2 is read as epoch 0.
 
-Operation 1 appears only in format 1 logs. From 0.3 a new account is
+From 0.3 a new account is
 operation 4: its record, the password hash included, is sealed under the file
 key before it enters the section, so the store holds exactly the bytes the log
 carries; see [FILE_FORMATS.md](./FILE_FORMATS.md#account-store-authaccounts).

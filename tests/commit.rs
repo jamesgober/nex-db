@@ -2,7 +2,9 @@
 
 use std::{path::PathBuf, sync::Arc, thread, time::Duration};
 
-use nex_db::{Database, Entity, Error, RevokeReason, SessionSpec, SignIn, Validation, Value};
+use nex_db::{
+    Database, Entity, Error, Login, RevokeReason, SessionSpec, SignIn, Standing, Validation, Value,
+};
 
 struct TempDir(PathBuf);
 
@@ -409,5 +411,138 @@ fn test_rotate_replaces_the_token_and_keeps_the_expiry() {
     assert!(matches!(
         db.auth().rotate("not a token"),
         Err(Error::Invalid { .. })
+    ));
+}
+
+#[test]
+fn test_ban_ends_sessions_and_blocks_sign_in_only_with_the_right_password() {
+    let dir = TempDir::new("ban");
+    let db = Database::open(&dir.0).unwrap();
+    let password = db.auth().hash_password("right pw").unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    let token = db.auth().issue_session(ann, SessionSpec::web()).unwrap();
+
+    db.auth()
+        .set_standing(ann, Standing::Banned { reason: 3 }, None)
+        .unwrap();
+    assert!(!matches!(
+        db.auth().validate(&token).unwrap(),
+        Validation::Valid(_)
+    ));
+    assert_eq!(
+        db.auth().standing(ann).unwrap(),
+        Some(Standing::Banned { reason: 3 })
+    );
+    assert!(matches!(
+        db.auth()
+            .sign_in("ann@example.com", "right pw", SessionSpec::web())
+            .unwrap(),
+        SignIn::LockedOut { until: None }
+    ));
+    // A wrong password says nothing about the ban.
+    assert_eq!(
+        db.auth()
+            .verify_password("ann@example.com", "wrong")
+            .unwrap(),
+        Login::Failed
+    );
+    drop(db);
+
+    // The standing survives a reopen; lifting it lets the account in.
+    let db = Database::open(&dir.0).unwrap();
+    assert_eq!(
+        db.auth().standing(ann).unwrap(),
+        Some(Standing::Banned { reason: 3 })
+    );
+    db.auth().set_standing(ann, Standing::Active, None).unwrap();
+    assert_eq!(
+        db.auth()
+            .verify_password("ann@example.com", "right pw")
+            .unwrap(),
+        Login::Verified(ann)
+    );
+    assert_eq!(
+        db.auth()
+            .standing(nex_db::AccountId::from_bytes([9; 16]))
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn test_ten_failures_lock_the_account_out() {
+    let dir = TempDir::new("lockout");
+    let db = Database::open(&dir.0).unwrap();
+    let password = db.auth().hash_password("right pw").unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    let token = db.auth().issue_session(ann, SessionSpec::web()).unwrap();
+    for _ in 0..9 {
+        assert_eq!(
+            db.auth()
+                .verify_password("ann@example.com", "wrong")
+                .unwrap(),
+            Login::Failed
+        );
+    }
+    // Nine failures: still open.
+    assert!(matches!(
+        db.auth().validate(&token).unwrap(),
+        Validation::Valid(_)
+    ));
+    assert_eq!(db.auth().standing(ann).unwrap(), Some(Standing::Active));
+    assert_eq!(
+        db.auth()
+            .verify_password("ann@example.com", "wrong")
+            .unwrap(),
+        Login::Failed
+    );
+    assert!(matches!(
+        db.auth().standing(ann).unwrap(),
+        Some(Standing::LockedOut { .. })
+    ));
+    assert!(!matches!(
+        db.auth().validate(&token).unwrap(),
+        Validation::Valid(_)
+    ));
+    assert!(matches!(
+        db.auth()
+            .verify_password("ann@example.com", "right pw")
+            .unwrap(),
+        Login::LockedOut { until: Some(_) }
+    ));
+}
+
+#[test]
+fn test_suspension_that_ran_out_reads_as_active() {
+    let dir = TempDir::new("suspension");
+    let db = Database::open(&dir.0).unwrap();
+    let password = db.auth().hash_password("right pw").unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    let past = std::time::SystemTime::now() - Duration::from_secs(60);
+    db.auth()
+        .set_standing(
+            ann,
+            Standing::Suspended {
+                until: Some(past),
+                reason: 1,
+            },
+            None,
+        )
+        .unwrap();
+    assert_eq!(db.auth().standing(ann).unwrap(), Some(Standing::Active));
+    assert!(matches!(
+        db.auth()
+            .sign_in("ann@example.com", "right pw", SessionSpec::web())
+            .unwrap(),
+        SignIn::Success { .. }
     ));
 }

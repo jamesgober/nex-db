@@ -89,13 +89,13 @@ impl Session {
     /// When the session was issued.
     #[must_use]
     pub fn created_at(&self) -> SystemTime {
-        UNIX_EPOCH + Duration::from_millis(self.created_ms)
+        time_of(self.created_ms)
     }
 
     /// When the session stops being valid.
     #[must_use]
     pub fn expires_at(&self) -> SystemTime {
-        UNIX_EPOCH + Duration::from_millis(self.expires_ms)
+        time_of(self.expires_ms)
     }
 }
 
@@ -160,7 +160,104 @@ pub enum SignIn {
     },
     /// The identifier or the password is wrong.
     Failed,
+    /// The password matched, but the account may not sign in: it is locked
+    /// out after repeated failures, suspended, or banned. `until` is when it
+    /// may sign in again; `None` means not without an administrator.
+    ///
+    /// Only returned after the password matched: a wrong password on such
+    /// an account gives [`Failed`](SignIn::Failed), so only someone who knows
+    /// the password learns the account is locked.
+    LockedOut {
+        /// When the account may sign in again, if ever.
+        until: Option<SystemTime>,
+    },
 }
+
+/// The outcome of [`verify_password`](crate::Auth::verify_password): a
+/// sign-in without a new session.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Login {
+    /// The password matched and the account may sign in.
+    Verified(AccountId),
+    /// The identifier or the password is wrong.
+    Failed,
+    /// As [`SignIn::LockedOut`].
+    LockedOut {
+        /// When the account may sign in again, if ever.
+        until: Option<SystemTime>,
+    },
+}
+
+/// Whether an account may sign in.
+///
+/// A lock-out or suspension whose `until` has passed reads as `Active`.
+/// Setting a standing that takes access away (`LockedOut`, `Suspended`,
+/// `Banned`) ends every session of the account in the same commit.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    /// May sign in.
+    Active,
+    /// May sign in; the application has not verified the account yet.
+    PendingVerification,
+    /// Locked after repeated failed sign-ins, until a time.
+    LockedOut {
+        /// When the lock ends.
+        until: SystemTime,
+    },
+    /// Suspended by an administrator, until a time or until lifted.
+    Suspended {
+        /// When the suspension ends; `None` until lifted.
+        until: Option<SystemTime>,
+        /// An application-defined reason code.
+        reason: u32,
+    },
+    /// Banned: may not sign in until an administrator sets another standing.
+    Banned {
+        /// An application-defined reason code.
+        reason: u32,
+    },
+}
+
+impl Standing {
+    /// When the account may sign in again, or `None` when it may now
+    /// (`Some(None)`: not without an administrator).
+    pub(crate) fn blocked_until(&self, now_ms: u64) -> Option<Option<SystemTime>> {
+        let passed = |t: SystemTime| ms_of(t) <= now_ms;
+        match *self {
+            Standing::Active | Standing::PendingVerification => None,
+            Standing::LockedOut { until } if passed(until) => None,
+            Standing::LockedOut { until } => Some(Some(until)),
+            Standing::Suspended {
+                until: Some(until), ..
+            } if passed(until) => None,
+            Standing::Suspended { until, .. } => Some(until),
+            Standing::Banned { .. } => Some(None),
+        }
+    }
+
+    /// The standing as a reader sees it at `now_ms`: a lock or suspension
+    /// that has run out reads as `Active`.
+    pub(crate) fn at(self, now_ms: u64) -> Standing {
+        match self {
+            Standing::LockedOut { .. } | Standing::Suspended { .. }
+                if self.blocked_until(now_ms).is_none() =>
+            {
+                Standing::Active
+            }
+            other => other,
+        }
+    }
+}
+
+/// Milliseconds since the Unix epoch, 0 before it.
+pub(crate) fn ms_of(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+pub(crate) use crate::core::time_of;
 
 /// A password hashed with Argon2id by [`hash_password`](crate::Auth::hash_password).
 ///

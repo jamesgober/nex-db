@@ -19,9 +19,10 @@ use std::{
     fmt,
     path::Path,
     sync::{
-        OnceLock,
+        Mutex, OnceLock, PoisonError,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
+    time::SystemTime,
 };
 
 use crypt_io::{Crypt, Zeroizing, kdf, mac};
@@ -30,7 +31,10 @@ use lsm_db::{Batch, Lsm};
 use self::{
     sessions::{EpochTable, SessionTable, Slot},
     token::Token,
-    types::{HashedPassword, RevokeReason, Session, SessionSpec, SignIn, Validation},
+    types::{
+        HashedPassword, Login, RevokeReason, Session, SessionSpec, SignIn, Standing, Validation,
+        ms_of, time_of,
+    },
 };
 use crate::{
     Database,
@@ -74,6 +78,18 @@ const OP_ISSUE_SESSION: u8 = 2;
 const OP_ISSUE_SESSION_AT_EPOCH: u8 = 5;
 /// Raise an account's epoch: every older session of the account ends.
 const OP_RAISE_EPOCH: u8 = 6;
+/// Replace an account's sealed record (a standing change).
+const OP_UPDATE_ACCOUNT: u8 = 7;
+
+/// Failed sign-ins within [`LOCKOUT_WINDOW_MS`] that lock an account out.
+const LOCKOUT_FAILURES: u32 = 10;
+/// The window failures are counted in: 15 minutes.
+const LOCKOUT_WINDOW_MS: u64 = 15 * 60 * 1000;
+/// How long an automatic lock-out lasts: 15 minutes.
+const LOCKOUT_MS: u64 = 15 * 60 * 1000;
+/// Accounts whose failures are counted at once; older windows are dropped
+/// first when it fills.
+const MAX_COUNTED: usize = 100_000;
 const OP_REVOKE_SESSION: u8 = 3;
 
 /// Revoke reasons in the log.
@@ -95,8 +111,12 @@ const META_APPLIED: &[u8] = b"\0meta/applied";
 /// Account record format.
 const ACCOUNT_FORMAT: u8 = 1;
 
-/// Standing of a new account. Standing changes arrive in 0.3.
+/// Standing codes in account records.
 const STANDING_ACTIVE: u8 = 1;
+const STANDING_PENDING: u8 = 2;
+const STANDING_LOCKED_OUT: u8 = 3;
+const STANDING_SUSPENDED: u8 = 4;
+const STANDING_BANNED: u8 = 5;
 
 /// Credential kind: an Argon2id password hash.
 const CREDENTIAL_PASSWORD: u8 = 1;
@@ -188,6 +208,8 @@ pub(crate) struct AuthEngine {
     applied: AtomicU64,
     sessions: SessionTable,
     epochs: EpochTable,
+    /// Failed sign-ins per account: count and window start.
+    failures: Mutex<HashMap<AccountId, (u32, u64)>>,
     conflicts: ConflictTable,
     /// Password hashes in progress, bounded by `max_hashing`.
     hashing: AtomicUsize,
@@ -231,6 +253,7 @@ impl AuthEngine {
             applied: AtomicU64::new(applied),
             sessions: SessionTable::new(),
             epochs: EpochTable::new(),
+            failures: Mutex::new(HashMap::new()),
             conflicts: ConflictTable::new(),
             hashing: AtomicUsize::new(0),
             max_hashing,
@@ -266,20 +289,31 @@ impl AuthEngine {
         }
     }
 
-    fn password_hash(&self, account: AccountId) -> Result<Option<Zeroizing<String>>> {
+    /// The account's record, sealed or (from 0.1 and 0.2) plain.
+    fn load_account(&self, account: AccountId) -> Result<Option<AccountRecord>> {
         let key = account_key(self.collection, account);
-        if let Some(value) = self.accounts.get(&key)? {
-            if value.first() == Some(&VALUE_SEALED) {
-                let plain = open_value(&self.file_key, &key, &value)?;
-                return sealed_account_phc(&plain).map(Some);
-            }
+        let Some(value) = self.accounts.get(&key)? else {
+            return Ok(None);
+        };
+        if value.first() == Some(&VALUE_SEALED) {
+            let plain = open_value(&self.file_key, &key, &value)?;
+            return AccountRecord::decode(&plain).map(Some);
         }
-        // A plain account from 0.1 or 0.2 keeps its credential apart.
+        // A plain account keeps its credential apart.
+        let mut r = Reader::new(&value, "an account record", 0);
+        if r.u8()? != ACCOUNT_FORMAT {
+            return Err(Error::corrupt("an account record", 0));
+        }
+        let created_ms = r.u64()?;
+        let digest = r.fixed::<32>()?;
+        let standing = decode_standing(r.u8()?, 0, 0)?;
+        let _epoch = r.u32()?;
+        r.finish()?;
         let Some(bytes) = self
             .accounts
             .get(credential_key(self.collection, account))?
         else {
-            return Ok(None);
+            return Err(Error::corrupt("an account without a credential", 0));
         };
         let bytes = Zeroizing::new(bytes);
         let mut r = Reader::new(&bytes, "a credential record", 0);
@@ -288,7 +322,38 @@ impl AuthEngine {
         }
         let phc = Zeroizing::new(r.str16()?.to_owned());
         r.finish()?;
-        Ok(Some(phc))
+        Ok(Some(AccountRecord {
+            created_ms,
+            digest,
+            standing,
+            phc,
+        }))
+    }
+
+    /// Count a failed sign-in of `account` at `now`. Returns the failures in
+    /// the current window.
+    fn count_failure(&self, account: AccountId, now: u64) -> u32 {
+        let mut failures = self.failures.lock().unwrap_or_else(PoisonError::into_inner);
+        if failures.len() >= MAX_COUNTED && !failures.contains_key(&account) {
+            failures.retain(|_, (_, start)| now.saturating_sub(*start) < LOCKOUT_WINDOW_MS);
+            if failures.len() >= MAX_COUNTED {
+                return 0;
+            }
+        }
+        let entry = failures.entry(account).or_insert((0, now));
+        if now.saturating_sub(entry.1) >= LOCKOUT_WINDOW_MS {
+            *entry = (0, now);
+        }
+        entry.0 += 1;
+        entry.0
+    }
+
+    fn clear_failures(&self, account: AccountId) {
+        let _ = self
+            .failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&account);
     }
 
     /// Take a password-hashing slot, or fail with [`Error::Busy`].
@@ -331,11 +396,11 @@ impl AuthEngine {
 
     /// Check `password` for `identifier`. Unknown identifiers cost one
     /// Argon2id check, like a wrong password.
-    fn verify_password(&self, identifier: &str, password: &str) -> Result<Option<AccountId>> {
+    fn check(&self, identifier: &str, password: &str) -> Result<Checked> {
         check_password(password)?;
         let found = match normalize_identifier(identifier) {
             Ok(normalized) => match self.account_for(&self.identifier_digest(&normalized))? {
-                Some(account) => self.password_hash(account)?.map(|phc| (account, phc)),
+                Some(account) => self.load_account(account)?.map(|record| (account, record)),
                 None => None,
             },
             Err(_) => None,
@@ -346,14 +411,17 @@ impl AuthEngine {
         // not.
         let dummy = self.dummy_hash()?;
         match found {
-            Some((account, phc)) => match kdf::argon2_check(&phc, password.as_bytes()) {
-                Ok(()) => Ok(Some(account)),
-                Err(crypt_io::Error::AuthenticationFailed) => Ok(None),
+            Some((account, record)) => match kdf::argon2_check(&record.phc, password.as_bytes()) {
+                Ok(()) => Ok(match record.standing.blocked_until(now_ms()) {
+                    Some(until) => Checked::Blocked(until),
+                    None => Checked::Verified(account),
+                }),
+                Err(crypt_io::Error::AuthenticationFailed) => Ok(Checked::Wrong(Some(account))),
                 Err(_) => Err(Error::corrupt("a stored password hash", 0)),
             },
             None => {
                 let _ = kdf::argon2_check(dummy, password.as_bytes());
-                Ok(None)
+                Ok(Checked::Wrong(None))
             }
         }
     }
@@ -403,6 +471,10 @@ enum Op<'a> {
     RaiseEpoch {
         account: AccountId,
         epoch: u32,
+    },
+    UpdateAccount {
+        account: AccountId,
+        value: &'a [u8],
     },
 }
 
@@ -456,6 +528,10 @@ fn decode_ops(seq: Seq, body: &[u8]) -> Result<Vec<Op<'_>>> {
             OP_RAISE_EPOCH => Op::RaiseEpoch {
                 account: AccountId::from_bytes(r.fixed()?),
                 epoch: r.u32()?,
+            },
+            OP_UPDATE_ACCOUNT => Op::UpdateAccount {
+                account: AccountId::from_bytes(r.fixed()?),
+                value: r.bytes32()?,
             },
             OP_REVOKE_SESSION => {
                 let digest = r.fixed()?;
@@ -520,6 +596,9 @@ impl Engine for AuthEngine {
         if seq > self.applied.load(Ordering::Acquire) {
             let mut batch = Batch::new();
             for op in &ops {
+                if let Op::UpdateAccount { account, value } = op {
+                    batch.put(account_key(self.collection, *account), *value);
+                }
                 if let Op::CreateSealedAccount {
                     account,
                     digest,
@@ -565,7 +644,9 @@ impl Engine for AuthEngine {
                 Op::IssueSession { digest, session } => self.sessions.insert(digest, session),
                 Op::RevokeSession { digest, reason } => self.sessions.revoke(digest, reason),
                 Op::RaiseEpoch { account, epoch } => self.epochs.raise(account, epoch),
-                Op::CreateAccount { .. } | Op::CreateSealedAccount { .. } => {}
+                Op::CreateAccount { .. }
+                | Op::CreateSealedAccount { .. }
+                | Op::UpdateAccount { .. } => {}
             }
         }
         Ok(())
@@ -612,6 +693,11 @@ enum StagedOp {
         account: AccountId,
         epoch: u32,
     },
+    UpdateAccount {
+        account: AccountId,
+        /// The new record, sealed while staging.
+        value: Vec<u8>,
+    },
 }
 
 /// One transaction's auth work.
@@ -625,6 +711,8 @@ pub(crate) struct AuthStaged<'e> {
     issued: HashSet<[u8; 32]>,
     /// Epochs this work raised, by account.
     raised: HashMap<AccountId, u32>,
+    /// Account records this work replaced, by account.
+    updated: HashMap<AccountId, AccountRecord>,
 }
 
 impl<'e> AuthStaged<'e> {
@@ -637,6 +725,7 @@ impl<'e> AuthStaged<'e> {
             accounts: HashSet::new(),
             issued: HashSet::new(),
             raised: HashMap::new(),
+            updated: HashMap::new(),
         }
     }
 }
@@ -659,7 +748,9 @@ impl Staged for AuthStaged<'_> {
         self.ops.iter().any(|op| {
             matches!(
                 op,
-                StagedOp::RevokeSession { .. } | StagedOp::RaiseEpoch { .. }
+                StagedOp::RevokeSession { .. }
+                    | StagedOp::RaiseEpoch { .. }
+                    | StagedOp::UpdateAccount { .. }
             )
         })
     }
@@ -743,6 +834,11 @@ fn write_ops(ops: &[StagedOp], out: &mut Vec<u8>) -> Result<()> {
                 w.bytes(account.as_bytes());
                 w.u32(*epoch);
             }
+            StagedOp::UpdateAccount { account, value } => {
+                w.u8(OP_UPDATE_ACCOUNT);
+                w.bytes(account.as_bytes());
+                w.bytes32(value)?;
+            }
         }
     }
     Ok(())
@@ -781,47 +877,109 @@ fn open_value(key: &[u8; 32], store_key: &[u8], value: &[u8]) -> Result<Zeroizin
         .map_err(|_| corrupt())
 }
 
-/// A new account's record, sealed: format, created time, identifier digest,
-/// standing, epoch, then the credential (kind and Argon2id string).
-fn seal_account(
-    engine: &AuthEngine,
-    account: AccountId,
-    digest: &[u8; 32],
+/// An account record: what the account store holds per account.
+struct AccountRecord {
     created_ms: u64,
-    phc: &str,
-) -> Result<Vec<u8>> {
-    let mut plain = Zeroizing::new(Vec::with_capacity(52 + phc.len()));
-    let mut w = Writer::new(&mut plain);
-    w.u8(ACCOUNT_FORMAT_SEALED);
-    w.u64(created_ms);
-    w.bytes(digest);
-    w.u8(STANDING_ACTIVE);
-    w.u32(0);
-    w.u8(CREDENTIAL_PASSWORD);
-    w.str16(phc)?;
-    seal_value(
-        &engine.file_key,
-        &account_key(engine.collection, account),
-        &plain,
-    )
+    digest: [u8; 32],
+    standing: Standing,
+    phc: Zeroizing<String>,
 }
 
-/// The password hash inside an opened sealed account record.
-fn sealed_account_phc(plain: &[u8]) -> Result<Zeroizing<String>> {
-    let mut r = Reader::new(plain, "a sealed account record", 0);
-    if r.u8()? != ACCOUNT_FORMAT_SEALED {
-        return Err(Error::corrupt("a sealed account record", 0));
+impl AccountRecord {
+    /// The sealed plaintext: format, created time, identifier digest,
+    /// standing (code, until, reason), then the credential (kind and
+    /// Argon2id string).
+    fn encode(&self) -> Result<Zeroizing<Vec<u8>>> {
+        let mut plain = Zeroizing::new(Vec::with_capacity(60 + self.phc.len()));
+        let mut w = Writer::new(&mut plain);
+        w.u8(ACCOUNT_FORMAT_SEALED);
+        w.u64(self.created_ms);
+        w.bytes(&self.digest);
+        let (code, until, reason) = encode_standing(self.standing);
+        w.u8(code);
+        w.u64(until);
+        w.u32(reason);
+        w.u8(CREDENTIAL_PASSWORD);
+        w.str16(&self.phc)?;
+        Ok(plain)
     }
-    let _created_ms = r.u64()?;
-    let _digest = r.fixed::<32>()?;
-    let _standing = r.u8()?;
-    let _epoch = r.u32()?;
-    if r.u8()? != CREDENTIAL_PASSWORD {
-        return Err(Error::corrupt("a sealed account record", 0));
+
+    fn decode(plain: &[u8]) -> Result<AccountRecord> {
+        let corrupt = || Error::corrupt("a sealed account record", 0);
+        let mut r = Reader::new(plain, "a sealed account record", 0);
+        if r.u8()? != ACCOUNT_FORMAT_SEALED {
+            return Err(corrupt());
+        }
+        let created_ms = r.u64()?;
+        let digest = r.fixed::<32>()?;
+        let code = r.u8()?;
+        let until = r.u64()?;
+        let reason = r.u32()?;
+        let standing = decode_standing(code, until, reason)?;
+        if r.u8()? != CREDENTIAL_PASSWORD {
+            return Err(corrupt());
+        }
+        let phc = Zeroizing::new(r.str16()?.to_owned());
+        r.finish()?;
+        Ok(AccountRecord {
+            created_ms,
+            digest,
+            standing,
+            phc,
+        })
     }
-    let phc = Zeroizing::new(r.str16()?.to_owned());
-    r.finish()?;
-    Ok(phc)
+
+    /// The record sealed for `account` under the engine's file key.
+    fn seal(&self, engine: &AuthEngine, account: AccountId) -> Result<Vec<u8>> {
+        seal_value(
+            &engine.file_key,
+            &account_key(engine.collection, account),
+            &self.encode()?,
+        )
+    }
+}
+
+/// A standing as stored: code, until (ms, 0 for none), reason.
+fn encode_standing(standing: Standing) -> (u8, u64, u32) {
+    match standing {
+        Standing::PendingVerification => (STANDING_PENDING, 0, 0),
+        Standing::LockedOut { until } => (STANDING_LOCKED_OUT, ms_of(until).max(1), 0),
+        Standing::Suspended { until, reason } => (
+            STANDING_SUSPENDED,
+            until.map_or(0, |t| ms_of(t).max(1)),
+            reason,
+        ),
+        Standing::Banned { reason } => (STANDING_BANNED, 0, reason),
+        // `Standing` is non-exhaustive only for callers; every variant is
+        // listed here.
+        Standing::Active => (STANDING_ACTIVE, 0, 0),
+    }
+}
+
+fn decode_standing(code: u8, until: u64, reason: u32) -> Result<Standing> {
+    Ok(match code {
+        STANDING_ACTIVE => Standing::Active,
+        STANDING_PENDING => Standing::PendingVerification,
+        STANDING_LOCKED_OUT => Standing::LockedOut {
+            until: time_of(until),
+        },
+        STANDING_SUSPENDED => Standing::Suspended {
+            until: (until != 0).then(|| time_of(until)),
+            reason,
+        },
+        STANDING_BANNED => Standing::Banned { reason },
+        _ => return Err(Error::corrupt("an account standing", 0)),
+    })
+}
+
+/// What checking a password found, before failures are counted.
+enum Checked {
+    Verified(AccountId),
+    /// Wrong password (with the account when the identifier exists), or an
+    /// unknown identifier.
+    Wrong(Option<AccountId>),
+    /// The password matched; the account may not sign in until then.
+    Blocked(Option<SystemTime>),
 }
 
 /// Associated data of a sealed section: what binds the ciphertext to its
@@ -948,7 +1106,13 @@ impl AuthTx<'_, '_> {
         self.staged
             .writes
             .push(account_key(engine.collection, account));
-        let value = seal_account(engine, account, &digest, now_ms(), &password.0)?;
+        let value = AccountRecord {
+            created_ms: now_ms(),
+            digest,
+            standing: Standing::Active,
+            phc: Zeroizing::new(password.0.clone()),
+        }
+        .seal(engine, account)?;
         self.staged.ops.push(StagedOp::CreateAccount {
             account,
             digest,
@@ -1079,6 +1243,72 @@ impl AuthTx<'_, '_> {
             at_ms: now_ms(),
         });
         self.stage_session(session.account, now_ms(), session.expires_ms)
+    }
+
+    /// Set the account's standing. A standing that takes access away
+    /// (`LockedOut`, `Suspended`, `Banned`) also ends every session of the
+    /// account, in this commit, ahead of ordinary commits. `by` is the
+    /// administrator who set it, or `None` for an automatic change.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the account does not exist, or was created in
+    /// this same transaction.
+    pub fn set_standing(
+        &mut self,
+        account: AccountId,
+        standing: Standing,
+        by: Option<AccountId>,
+    ) -> Result<()> {
+        // Recorded by the audit chain when it lands; not stored in the record.
+        let _ = by;
+        let engine = self.staged.engine;
+        if self.staged.accounts.contains(&account) {
+            return Err(Error::invalid("account", "created in this transaction"));
+        }
+        let Some(mut record) = self.record(account)? else {
+            return Err(Error::invalid("account", "no such account"));
+        };
+        record.standing = standing;
+        let value = record.seal(engine, account)?;
+        self.staged.ops.retain(
+            |op| !matches!(op, StagedOp::UpdateAccount { account: a, .. } if *a == account),
+        );
+        let _ = self.staged.updated.insert(account, record);
+        self.staged
+            .writes
+            .push(account_key(engine.collection, account));
+        self.staged
+            .ops
+            .push(StagedOp::UpdateAccount { account, value });
+        if standing.blocked_until(now_ms()).is_some() {
+            let _ = self.revoke_all(account)?;
+        }
+        Ok(())
+    }
+
+    /// The account's record as this transaction sees it.
+    fn record(&self, account: AccountId) -> Result<Option<AccountRecord>> {
+        if let Some(record) = self.staged.updated.get(&account) {
+            return Ok(Some(AccountRecord {
+                created_ms: record.created_ms,
+                digest: record.digest,
+                standing: record.standing,
+                phc: record.phc.clone(),
+            }));
+        }
+        self.staged.engine.load_account(account)
+    }
+
+    /// Lock the account out until `until`, unless its standing already keeps
+    /// it from signing in.
+    fn lock_out(&mut self, account: AccountId, until: SystemTime) -> Result<()> {
+        match self.record(account)? {
+            Some(record) if record.standing.blocked_until(now_ms()).is_none() => {
+                self.set_standing(account, Standing::LockedOut { until }, None)
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Revoke the session `token` names. Returns `true` when a session was
@@ -1244,13 +1474,78 @@ impl Auth<'_> {
     /// - [`Error::Busy`] when the hashing slots are full.
     /// - The errors of [`Database::commit`] when issuing the session.
     pub fn sign_in(&self, identifier: &str, password: &str, spec: SessionSpec) -> Result<SignIn> {
-        match self.engine().verify_password(identifier, password)? {
-            Some(account) => {
+        match self.verify_password(identifier, password)? {
+            Login::Verified(account) => {
                 let token = self.issue_session(account, spec)?;
                 Ok(SignIn::Success { account, token })
             }
-            None => Ok(SignIn::Failed),
+            Login::LockedOut { until } => Ok(SignIn::LockedOut { until }),
+            _ => Ok(SignIn::Failed),
         }
+    }
+
+    /// Check `password` for `identifier` inside the engine without issuing
+    /// a session. Failures are counted per account: ten within fifteen
+    /// minutes lock the account out for fifteen minutes, in a durable commit.
+    /// An unknown identifier costs the same work as a wrong password, and
+    /// both give [`Login::Failed`].
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Invalid`] when the password is empty or longer than 1024
+    ///   bytes.
+    /// - [`Error::Busy`] when the hashing slots are full.
+    /// - The errors of [`Database::commit`] when a lock-out is written.
+    pub fn verify_password(&self, identifier: &str, password: &str) -> Result<Login> {
+        let engine = self.engine();
+        match engine.check(identifier, password)? {
+            Checked::Verified(account) => {
+                engine.clear_failures(account);
+                Ok(Login::Verified(account))
+            }
+            Checked::Blocked(until) => Ok(Login::LockedOut { until }),
+            Checked::Wrong(Some(account)) => {
+                let now = now_ms();
+                if engine.count_failure(account, now) >= LOCKOUT_FAILURES {
+                    let until = time_of(now.saturating_add(LOCKOUT_MS));
+                    self.db.commit(|tx| tx.auth().lock_out(account, until))?;
+                    engine.clear_failures(account);
+                }
+                Ok(Login::Failed)
+            }
+            Checked::Wrong(None) => Ok(Login::Failed),
+        }
+    }
+
+    /// The account's standing, or `None` when the account does not exist.
+    /// A lock-out or suspension that has run out reads as
+    /// [`Standing::Active`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] when the record fails its check, and storage
+    /// errors.
+    pub fn standing(&self, account: AccountId) -> Result<Option<Standing>> {
+        Ok(self
+            .engine()
+            .load_account(account)?
+            .map(|record| record.standing.at(now_ms())))
+    }
+
+    /// Set an account's standing in its own commit. See
+    /// [`AuthTx::set_standing`].
+    ///
+    /// # Errors
+    ///
+    /// As [`AuthTx::set_standing`], plus the errors of [`Database::commit`].
+    pub fn set_standing(
+        &self,
+        account: AccountId,
+        standing: Standing,
+        by: Option<AccountId>,
+    ) -> Result<()> {
+        self.db
+            .commit(|tx| tx.auth().set_standing(account, standing, by))
     }
 }
 
@@ -1390,16 +1685,26 @@ mod tests {
         let account = AccountId::from_bytes([1; 16]);
         // A real Argon2id hash string, the longest field of any operation.
         let phc = kdf::argon2_hash(b"a password").unwrap();
-        let mut plain = Zeroizing::new(Vec::new());
-        let mut w = Writer::new(&mut plain);
-        w.u8(ACCOUNT_FORMAT_SEALED);
-        w.u64(u64::MAX);
-        w.bytes(&[2; 32]);
-        w.u8(STANDING_ACTIVE);
-        w.u32(0);
-        w.u8(CREDENTIAL_PASSWORD);
-        w.str16(&phc).unwrap();
-        let value = seal_value(&[5; 32], &account_key(1, account), &plain).unwrap();
+        // The largest record: a suspension with an end and a reason.
+        let record = AccountRecord {
+            created_ms: u64::MAX,
+            digest: [2; 32],
+            standing: Standing::Suspended {
+                until: Some(time_of(u64::MAX / 2)),
+                reason: u32::MAX,
+            },
+            phc: Zeroizing::new(phc),
+        };
+        let value = seal_value(
+            &[5; 32],
+            &account_key(1, account),
+            &record.encode().unwrap(),
+        )
+        .unwrap();
+        let update = sealed_len(StagedOp::UpdateAccount {
+            account,
+            value: value.clone(),
+        });
         let create = sealed_len(StagedOp::CreateAccount {
             account,
             digest: [2; 32],
@@ -1422,6 +1727,7 @@ mod tests {
             epoch: u32::MAX,
         });
         assert_eq!(revoke, raise);
+        assert_eq!(create, update);
         assert_eq!(create, issue);
         assert_eq!(issue, revoke);
     }
@@ -1467,6 +1773,55 @@ mod tests {
         assert!(engine.apply(3, &flagged).is_err());
         drop(engine);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn test_account_record_round_trips_every_standing() {
+        let phc = Zeroizing::new("$argon2id$v=19$m=1,t=1,p=1$c2FsdA$aGFzaA".to_owned());
+        for standing in [
+            Standing::Active,
+            Standing::PendingVerification,
+            Standing::LockedOut {
+                until: time_of(5_000),
+            },
+            Standing::Suspended {
+                until: None,
+                reason: 7,
+            },
+            Standing::Suspended {
+                until: Some(time_of(9_000)),
+                reason: 8,
+            },
+            Standing::Banned { reason: 9 },
+        ] {
+            let record = AccountRecord {
+                created_ms: 3,
+                digest: [1; 32],
+                standing,
+                phc: phc.clone(),
+            };
+            let back = AccountRecord::decode(&record.encode().unwrap()).unwrap();
+            assert_eq!(back.standing, standing);
+            assert_eq!((back.created_ms, back.digest), (3, [1; 32]));
+            assert_eq!(*back.phc, *phc);
+        }
+    }
+
+    #[test]
+    fn test_standing_runs_out_into_active() {
+        let locked = Standing::LockedOut {
+            until: time_of(100),
+        };
+        assert_eq!(locked.at(99), locked);
+        assert_eq!(locked.at(100), Standing::Active);
+        let banned = Standing::Banned { reason: 1 };
+        assert_eq!(banned.at(u64::MAX), banned);
+        assert_eq!(banned.blocked_until(0), Some(None));
+        let open = Standing::Suspended {
+            until: None,
+            reason: 1,
+        };
+        assert_eq!(open.blocked_until(u64::MAX), Some(None));
     }
 
     #[test]

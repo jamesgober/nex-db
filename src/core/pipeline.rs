@@ -4,12 +4,37 @@
 //! the database facade hands it a [`Registry`] of the engines it hosts, and
 //! a commit's staged work as `&dyn Staged`. Nothing here names an engine, so
 //! a new engine needs no change in this file.
+//!
+//! # Group commit
+//!
+//! A commit runs in three parts:
+//!
+//! 1. Under the sequencer lock (short, no I/O): check the queue bound,
+//!    validate against concurrent commits, take the next sequence number,
+//!    encode the record, reserve the written keys, and queue the record.
+//! 2. The writer: a commit that finds no writer at work becomes it, takes
+//!    every queued record, appends them in sequence order, and syncs once.
+//!    Commits queued meanwhile go in the next batch, so under load one sync
+//!    serves many commits, and a lone commit is written and synced at once
+//!    with no added wait. Writing outside the sequencer lock matters on
+//!    Windows, where a write to the log waits for a sync in progress.
+//! 3. In sequence order: apply the record from its encoded bytes, then make
+//!    it visible. A commit waits here for the one before it.
+//!
+//! A failed append, sync, or apply halts the database: every commit not yet
+//! durable or not yet applied fails with `Error::Storage`, and no later
+//! commit is accepted. A failed sync is never retried, because the bytes may already
+//! be gone from the cache; recovery after a restart decides what is durable.
+//!
+//! A priority-class commit needs nothing extra here: a batch is written as
+//! soon as no other batch is being written, so no commit waits for a window
+//! to fill.
 
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{
-        Mutex, PoisonError,
+        Arc, Condvar, Mutex, PoisonError,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
@@ -28,13 +53,29 @@ use crate::{
 /// Times a commit closure runs before [`Error::Conflict`].
 pub(crate) const ATTEMPTS: usize = 4;
 
-/// The commit pipeline's state, behind the commit lock.
+/// Commits between taking a sequence number and becoming visible, before a
+/// new commit is refused with `Error::Busy`. Bounds the memory held by
+/// encoded records waiting for their turn.
+const MAX_IN_FLIGHT: usize = 4096;
+
+/// Records waiting for the writer, and how far the log is durable.
+#[derive(Debug, Default)]
+struct Group {
+    /// Encoded records in sequence order, not yet appended.
+    pending: Vec<(Seq, Arc<[u8]>)>,
+    /// A commit is appending and syncing a batch.
+    writing: bool,
+    /// Every record up to this sequence number is on stable storage.
+    durable: Seq,
+}
+
+/// The sequencer's state, behind the sequencer lock.
 #[derive(Debug, Default)]
 struct CommitState {
-    /// The last committed sequence number.
+    /// The last sequence number appended to the log.
     last: Seq,
-    /// Reused record buffer.
-    buf: Vec<u8>,
+    /// Commits appended and not yet visible (or failed).
+    in_flight: usize,
 }
 
 /// Why one commit attempt did not land.
@@ -59,6 +100,14 @@ pub(crate) struct Core {
     dir: PathBuf,
     log: CommitLog,
     commit: Mutex<CommitState>,
+    /// The writer's queue. Taken after `commit` when both are held.
+    group: Mutex<Group>,
+    /// Woken when a batch is durable or the database halts.
+    written: Condvar,
+    /// The last applied sequence number; commits apply in turn behind it.
+    applied: Mutex<Seq>,
+    /// Woken when `applied` moves or the database halts.
+    turn: Condvar,
     /// The highest sequence number applied in every engine it touched.
     visible: AtomicU64,
     /// Set after a failed log write or apply: no further commits.
@@ -91,6 +140,10 @@ impl Core {
             dir: dir.to_path_buf(),
             log,
             commit: Mutex::new(CommitState::default()),
+            group: Mutex::new(Group::default()),
+            written: Condvar::new(),
+            applied: Mutex::new(0),
+            turn: Condvar::new(),
             visible: AtomicU64::new(0),
             halted: AtomicBool::new(false),
             snapshots: Mutex::new(BTreeMap::new()),
@@ -114,6 +167,11 @@ impl Core {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .last = last;
+        *self.applied.lock().unwrap_or_else(PoisonError::into_inner) = last;
+        self.group
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .durable = last;
         self.visible.store(last, Ordering::Release);
         if new_database && !defaults.is_empty() {
             let staged = CatalogStaged::define(defaults.to_vec());
@@ -235,8 +293,8 @@ impl Core {
         }
     }
 
-    /// The commit pipeline: validate, sequence, encode, log and sync, apply
-    /// from the encoded bytes, publish.
+    /// The commit pipeline (see the module documentation): sequence and
+    /// append under the lock, sync outside it, apply and publish in turn.
     fn write(
         &self,
         engines: &dyn Registry,
@@ -244,12 +302,34 @@ impl Core {
         snapshot: Seq,
         staged: &[&dyn Staged],
     ) -> std::result::Result<(), Attempt> {
+        let (seq, bytes) = self.sequence(engines, kind, snapshot, staged)?;
+        let result = self.complete(engines, seq, &bytes);
+        let mut state = self.commit.lock().unwrap_or_else(PoisonError::into_inner);
+        state.in_flight -= 1;
+        drop(state);
+        if result.is_ok() {
+            self.reclaim(engines);
+        }
+        result.map_err(Attempt::Failed)
+    }
+
+    /// Part 1, under the sequencer lock: validate, number, encode, reserve,
+    /// queue. Returns the sequence number and the record bytes.
+    fn sequence(
+        &self,
+        engines: &dyn Registry,
+        kind: Kind,
+        snapshot: Seq,
+        staged: &[&dyn Staged],
+    ) -> std::result::Result<(Seq, Arc<[u8]>), Attempt> {
         let mut state = self.commit.lock().unwrap_or_else(PoisonError::into_inner);
         if self.halted.load(Ordering::Acquire) {
-            return Err(Attempt::Failed(Error::storage(
-                "committing",
-                "writes stopped after an earlier failed write",
-            )));
+            return Err(Attempt::Failed(halted_error()));
+        }
+        if state.in_flight >= MAX_IN_FLIGHT {
+            return Err(Attempt::Failed(Error::Busy {
+                what: "commit queue",
+            }));
         }
         for work in staged {
             if work.validate(snapshot).is_err() {
@@ -264,8 +344,8 @@ impl Core {
             Class::Durable
         };
         let ids: Vec<EngineId> = staged.iter().map(|w| w.engine()).collect();
-        let buf = std::mem::take(&mut state.buf);
-        let mut record = RecordWriter::new(seq, kind, class, &ids, buf)?;
+        // One buffer per commit: it must outlive the lock until its apply.
+        let mut record = RecordWriter::new(seq, kind, class, &ids, Vec::new())?;
         for work in staged {
             let format = self.engine(engines, work.engine())?.format();
             let body = record.begin_section(work.engine(), format, work.collection())?;
@@ -280,27 +360,108 @@ impl Core {
             )));
         }
 
-        // A failed write or sync is never retried: the bytes may already be
-        // gone from the page cache. Recovery after a restart decides.
-        if let Err(err) = self.log.append_durable(&bytes) {
-            self.halted.store(true, Ordering::Release);
-            return Err(Attempt::Failed(err));
-        }
+        let bytes: Arc<[u8]> = bytes.into();
         for work in staged {
             work.reserve(seq);
         }
-        // Apply from the encoded bytes: the same path recovery takes.
-        let applied = record::decode(&bytes, 0).and_then(|view| self.apply_record(engines, &view));
-        if let Err(err) = applied {
-            self.halted.store(true, Ordering::Release);
-            return Err(Attempt::Failed(err));
-        }
         state.last = seq;
-        state.buf = bytes;
+        state.in_flight += 1;
+        // Queued while the sequencer lock is held, so the queue stays in
+        // sequence order.
+        self.group
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pending
+            .push((seq, Arc::clone(&bytes)));
+        Ok((seq, bytes))
+    }
+
+    /// Part 2: return once the record at `seq` is on stable storage, writing
+    /// the queued batch when no other commit is.
+    fn make_durable(&self, seq: Seq) -> Result<()> {
+        let mut group = self.group.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if group.durable >= seq {
+                return Ok(());
+            }
+            if self.halted() {
+                return Err(halted_error());
+            }
+            if group.writing {
+                group = self
+                    .written
+                    .wait(group)
+                    .unwrap_or_else(PoisonError::into_inner);
+                continue;
+            }
+            let batch = std::mem::take(&mut group.pending);
+            let Some(&(last, _)) = batch.last() else {
+                // Not durable, not queued, no writer: only a halt does this.
+                return Err(halted_error());
+            };
+            group.writing = true;
+            drop(group);
+
+            let written = batch
+                .iter()
+                .try_for_each(|(_, bytes)| self.log.append(bytes))
+                .and_then(|()| self.log.sync());
+
+            group = self.group.lock().unwrap_or_else(PoisonError::into_inner);
+            group.writing = false;
+            if let Err(err) = written {
+                // Never retried: the bytes may already be gone from the
+                // cache. Recovery after a restart decides what is durable.
+                drop(group);
+                self.halt();
+                return Err(err);
+            }
+            group.durable = last;
+            self.written.notify_all();
+        }
+    }
+
+    /// Parts 2 and 3: sync, then wait for the commit before this one, apply
+    /// from the encoded bytes (the path recovery takes), and publish.
+    fn complete(&self, engines: &dyn Registry, seq: Seq, bytes: &[u8]) -> Result<()> {
+        self.make_durable(seq)?;
+        let mut applied = self.applied.lock().unwrap_or_else(PoisonError::into_inner);
+        while *applied + 1 != seq {
+            if self.halted() {
+                return Err(halted_error());
+            }
+            applied = self
+                .turn
+                .wait(applied)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        if self.halted() {
+            return Err(halted_error());
+        }
+        let done = record::decode(bytes, 0).and_then(|view| self.apply_record(engines, &view));
+        if let Err(err) = done {
+            drop(applied);
+            self.halt();
+            return Err(err);
+        }
+        *applied = seq;
         self.visible.store(seq, Ordering::Release);
-        drop(state);
-        self.reclaim(engines);
+        drop(applied);
+        self.turn.notify_all();
         Ok(())
+    }
+
+    /// Stop every later commit and wake every waiting commit, so it fails
+    /// instead of waiting for a record that will not be written or applied.
+    /// Called with neither the writer's queue nor the turn lock held.
+    fn halt(&self) {
+        self.halted.store(true, Ordering::Release);
+        {
+            let _group = self.group.lock().unwrap_or_else(PoisonError::into_inner);
+            self.written.notify_all();
+        }
+        let _applied = self.applied.lock().unwrap_or_else(PoisonError::into_inner);
+        self.turn.notify_all();
     }
 
     /// Replay the log into the engines. Returns the last sequence number.
@@ -374,6 +535,10 @@ impl Core {
         };
         engines.each(&mut |engine| engine.reclaim(watermark));
     }
+}
+
+fn halted_error() -> Error {
+    Error::storage("committing", "writes stopped after an earlier failed write")
 }
 
 /// A running transaction's snapshot, registered so conflict tables keep the

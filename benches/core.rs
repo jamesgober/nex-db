@@ -1,4 +1,4 @@
-//! Benchmarks for the 0.1 hot paths.
+//! Benchmarks for the hot paths.
 //!
 //! ```text
 //! cargo bench --bench core
@@ -149,6 +149,32 @@ fn core(c: &mut Criterion) {
             .unwrap()
         });
     });
+
+    // Commits per second with 1 to 64 writers: each iteration runs one
+    // commit on every writer at once, so group commit can share syncs.
+    let t = TempDb::new("throughput");
+    let db = t.db();
+    let mut group = c.benchmark_group("core/commit_throughput");
+    for writers in [1u64, 4, 16, 64] {
+        let _ = group.throughput(criterion::Throughput::Elements(writers));
+        let _ = group.bench_function(format!("{writers}"), |b| {
+            b.iter(|| {
+                std::thread::scope(|s| {
+                    for _ in 0..writers {
+                        s.spawn(|| {
+                            let i = unique();
+                            db.commit(|tx| {
+                                tx.content()
+                                    .create(Entity::new("note").path(format!("/n/{i}")))
+                            })
+                            .unwrap()
+                        });
+                    }
+                });
+            });
+        });
+    }
+    group.finish();
 }
 
 criterion_group!(benches, auth, content, core);

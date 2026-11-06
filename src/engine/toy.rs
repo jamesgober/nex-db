@@ -519,3 +519,36 @@ fn test_toy_unhosted_engine_in_log_keeps_database_closed() {
     drop(core);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn test_toy_concurrent_commits_all_apply_in_order_and_survive_reopen() {
+    let dir = temp_dir();
+    let db = defined(&dir);
+    let a = db.collection("a");
+    const THREADS: u16 = 8;
+    const EACH: u16 = 50;
+    std::thread::scope(|s| {
+        for t in 0..THREADS {
+            let db = &db;
+            s.spawn(move || {
+                for i in 0..EACH {
+                    let key = t * EACH + i;
+                    db.commit(&[&ToyStaged::new(&db.toys.a, a).put(key, u64::from(key))])
+                        .unwrap();
+                }
+            });
+        }
+    });
+    let total = u64::from(THREADS * EACH);
+    // Two catalog records, then one record per commit.
+    assert_eq!(db.core.visible(), 2 + total);
+    drop(db);
+
+    let db = Db::open(&dir).unwrap();
+    for key in 0..THREADS * EACH {
+        assert_eq!(db.toys.a.get(key), Some(u64::from(key)));
+    }
+    assert_eq!(db.core.visible(), 2 + total);
+    drop(db);
+    std::fs::remove_dir_all(dir).unwrap();
+}

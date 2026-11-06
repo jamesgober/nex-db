@@ -44,9 +44,18 @@ impl CommitLog {
         self.wal.is_empty()
     }
 
-    /// Append `record` and return once it is on stable storage.
-    pub(crate) fn append_durable(&self, record: &[u8]) -> Result<()> {
-        let _lsn = self.wal.append_and_sync(record)?;
+    /// Append `record` to the log. It is in the operating system's cache
+    /// when this returns, not yet on stable storage: call
+    /// [`sync`](Self::sync) before treating it as committed.
+    pub(crate) fn append(&self, record: &[u8]) -> Result<()> {
+        let _lsn = self.wal.append(record)?;
+        Ok(())
+    }
+
+    /// Make every record appended before this call durable. Concurrent calls
+    /// share one sync.
+    pub(crate) fn sync(&self) -> Result<()> {
+        self.wal.sync()?;
         Ok(())
     }
 
@@ -73,8 +82,9 @@ mod tests {
         ));
         let log = CommitLog::open(&dir).unwrap();
         assert!(log.is_empty());
-        log.append_durable(b"one").unwrap();
-        log.append_durable(b"two").unwrap();
+        log.append(b"one").unwrap();
+        log.append(b"two").unwrap();
+        log.sync().unwrap();
         drop(log);
 
         let log = CommitLog::open(&dir).unwrap();

@@ -2,7 +2,7 @@
 
 > One milestone at a time, each ending with something that runs. Work only on the current milestone. Requirements (FR, NFR) are in [`PLAN.md`](./PLAN.md).
 
-**Current milestone: 0.2.0 (design lock: `docs/API.md` ready for James's review). 0.1.0 is built and waits for CI and for James to run the example.**
+**Current milestone: 0.3.0 (core and auth). 0.2.0 is done: James approved `docs/API.md` on 2026-11-05. 0.1.0 is merged and waits for James to run the example before it is tagged.**
 
 ---
 
@@ -27,7 +27,7 @@
 - [x] The engine contract as code with documentation; a toy third engine in the tests (`PLAN.md` D-030 to D-033).
 - [x] Building-block checks done (`PLAN.md` D-038, D-039).
 - [x] Upstream requests filed (2026-10-29, on James's go): crypt-io, lsm-db, txn-db, index-db, audit-trail, key-vault; wal-db strict open shipped in wal-db 1.1; dependency clean-ups wait on OD-5 (`PLAN.md` D-040).
-- **Exit:** James approves `docs/API.md`.
+- [x] **Exit:** James approves `docs/API.md` (2026-11-05, `PLAN.md` D-044).
 - Blockers recorded for 0.3, each requested from its crate:
   - crypt-io has no AEAD call that takes the caller's nonce, which sealed auth sections need (`PLAN.md` D-039).
   - lsm-db 1.1 has no checksum on its manifest (a damaged manifest can drop runs without an error) and drops the memtable when a flush fails.

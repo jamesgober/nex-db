@@ -24,8 +24,8 @@ operations (Tier 2), then the parts few applications need (Tier 3).
 
 Every item carries the version it arrives in. Items marked **0.1** exist now;
 their examples are compiled and run as doctests. Later items are shown as
-signatures. Their names and shapes are settled by this document; changing one
-after approval needs a recorded decision.
+signatures. Their names and shapes were approved on 2026-11-05; changing one
+needs a recorded decision.
 
 Grades say how much an item matters: **P0** required, **P1** expected, **P2**
 high value, **P3** nice to have. Every P0 and P1 item exists by 0.5.

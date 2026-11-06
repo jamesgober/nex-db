@@ -166,6 +166,7 @@ Tier 1 (above) covers the common uses with no builder; Tier 2 adds a builder, ty
 | D-041 | (0.2) wal-db 1.1 with `OpenPolicy::Strict`: only an unfinished last record is cut; mid-log damage, a missing segment, or a record above the limit fails the open and leaves the log unchanged. Cost: an open that meets a damaged tail reads on to confirm nothing intact follows it (bounded by the log's size, at open only). D-015's check stays as a second guard |
 | D-042 | (2026-11-02) James made the repository public, so CI runs on GitHub's public runners on the full matrix. Repository visibility only: the crate stays `publish = false`, and tagging 1.0 still needs James. The low profile stays: no announcements, topics, or promotion |
 | D-043 | (2026-11-02) James's rule for every crate: go back and fix issues and tune performance before getting close to release. The roadmap gets a 0.9.x review milestone before any 1.0 release candidate; anything still open goes in the 1.0 readiness note James reads |
+| D-044 | (2026-11-05) James approved `docs/API.md`. From here every change to a public name or shape it lists needs a decision in this log, and `docs/API.md` changes in the same commit |
 
 ### Third-party runtime dependencies brought in by first-party crates (OD-5, temporary)
 

@@ -24,7 +24,7 @@ use crate::{
         fs,
         log::CommitLog,
         pipeline::{Attempt, Core},
-        record::{self, Class, Seq},
+        record::{self, Class, Section, Seq},
     },
     error::{Error, Result},
 };
@@ -99,15 +99,15 @@ impl Engine for ToyEngine {
         }
     }
 
-    fn apply(&self, seq: Seq, _collection: u32, format: u16, body: &[u8]) -> Result<()> {
-        if format != FORMAT {
+    fn apply(&self, seq: Seq, section: &Section<'_>) -> Result<()> {
+        if section.format != FORMAT || section.flags != 0 {
             return Err(Error::corrupt("a toy section format", seq));
         }
         if seq <= self.applied.load(Ordering::Acquire) {
             return Ok(());
         }
         let mut puts = Vec::new();
-        let mut r = Reader::new(body, "a toy section", seq);
+        let mut r = Reader::new(section.body, "a toy section", seq);
         while !r.is_empty() {
             puts.push((r.u16()?, r.u64()?));
         }
@@ -124,9 +124,10 @@ impl Engine for ToyEngine {
         self.durable.load(Ordering::Acquire)
     }
 
-    fn checkpoint(&self) -> Result<Seq> {
+    fn checkpoint(&self, upto: Seq) -> Result<Seq> {
         let cells = self.cells.lock().unwrap_or_else(PoisonError::into_inner);
-        let through = self.applied.load(Ordering::Acquire);
+        let through = upto.max(self.applied.load(Ordering::Acquire));
+        self.applied.store(through, Ordering::Release);
         let mut bytes = Vec::new();
         let mut w = Writer::new(&mut bytes);
         w.u64(through);
@@ -267,7 +268,7 @@ impl Db {
 
     fn commit(&self, staged: &[&dyn Staged]) -> std::result::Result<(), Attempt> {
         let snapshot = self.core.snapshot();
-        self.core.commit(&self.toys, snapshot.seq(), staged)
+        self.core.commit(&self.toys, &snapshot, staged)
     }
 }
 
@@ -349,7 +350,7 @@ fn test_toy_checkpointed_engine_skips_what_it_holds() {
         let two = ToyStaged::new(&db.toys.b, b).put(1, i);
         db.commit(&[&one, &two]).unwrap();
     }
-    let _ = db.toys.a.checkpoint().unwrap();
+    let _ = db.toys.a.checkpoint(db.core.visible()).unwrap();
     drop(db);
 
     let db = Db::open(&dir).unwrap();
@@ -370,13 +371,11 @@ fn test_toy_concurrent_write_of_same_key_conflicts() {
         .unwrap();
     let late = ToyStaged::new(&db.toys.a, a).put(7, 2);
     assert!(matches!(
-        db.core.commit(&db.toys, early.seq(), &[&late]),
+        db.core.commit(&db.toys, &early, &[&late]),
         Err(Attempt::Conflict)
     ));
     let other_key = ToyStaged::new(&db.toys.a, a).put(8, 2);
-    db.core
-        .commit(&db.toys, early.seq(), &[&other_key])
-        .unwrap();
+    db.core.commit(&db.toys, &early, &[&other_key]).unwrap();
     drop(early);
     drop(db);
     std::fs::remove_dir_all(dir).unwrap();
@@ -479,7 +478,7 @@ fn test_toy_engine_ahead_of_log_refuses_open() {
     let a = db.collection("a");
     db.commit(&[&ToyStaged::new(&db.toys.a, a).put(1, 1)])
         .unwrap();
-    let _ = db.toys.a.checkpoint().unwrap();
+    let _ = db.toys.a.checkpoint(db.core.visible()).unwrap();
     drop(db);
     // A checkpoint claiming a commit the log never had.
     let file = dir.join("toy").join("toy-62.state");
@@ -517,5 +516,38 @@ fn test_toy_unhosted_engine_in_log_keeps_database_closed() {
     ));
     drop(only);
     drop(core);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn test_toy_concurrent_commits_all_apply_in_order_and_survive_reopen() {
+    let dir = temp_dir();
+    let db = defined(&dir);
+    let a = db.collection("a");
+    const THREADS: u16 = 8;
+    const EACH: u16 = 50;
+    std::thread::scope(|s| {
+        for t in 0..THREADS {
+            let db = &db;
+            s.spawn(move || {
+                for i in 0..EACH {
+                    let key = t * EACH + i;
+                    db.commit(&[&ToyStaged::new(&db.toys.a, a).put(key, u64::from(key))])
+                        .unwrap();
+                }
+            });
+        }
+    });
+    let total = u64::from(THREADS * EACH);
+    // Two catalog records, then one record per commit.
+    assert_eq!(db.core.visible(), 2 + total);
+    drop(db);
+
+    let db = Db::open(&dir).unwrap();
+    for key in 0..THREADS * EACH {
+        assert_eq!(db.toys.a.get(key), Some(u64::from(key)));
+    }
+    assert_eq!(db.core.visible(), 2 + total);
+    drop(db);
     std::fs::remove_dir_all(dir).unwrap();
 }

@@ -62,6 +62,13 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
+/// Make the names in `dir` (files created, renamed, or removed) durable,
+/// as [`sync_dir`] does, for a directory another crate wrote.
+#[cfg_attr(not(any(feature = "auth", feature = "content")), allow(dead_code))]
+pub(crate) fn sync_names(dir: &Path) -> Result<()> {
+    sync_dir(dir).map_err(|e| Error::storage("syncing a directory", e))
+}
+
 /// Ownership of a database directory. Held for the life of the database;
 /// released by the operating system when the process ends, however it ends.
 #[derive(Debug)]

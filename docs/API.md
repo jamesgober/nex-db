@@ -165,9 +165,11 @@ From 0.3 the builder configures what `open` takes by default:
 | Builder call | Since | Default |
 |---|---|---|
 | `Database::builder(dir)` | 0.3 | |
-| `.keys(Keys::vault(name))`, `Keys::file(path)`, `Keys::env(var)` | 0.3 | a key file in the directory |
+| `.keys(Keys::file(path))`, `Keys::env(var)`, `Keys::in_directory()` | 0.3 | `Keys::in_directory()` |
+| `.keys(Keys::vault(name))`: the OS keychain | 0.4 | |
 | `.auth(AuthMode::embedded())`, `AuthMode::separate_process()` | 0.3 / 0.5 | embedded |
 | `.max_snapshot_age(Duration)` | 0.3 | 60 s |
+| `.checkpoint_every(bytes)`: log written between checkpoints, which bound the log and the time an open takes | 0.3 | 64 MiB |
 | `.commit_queue(n)`, `.hashing_slots(n)` | 0.3 | 4,096; one per CPU |
 | `.idempotency_window(Duration)` | 0.3 | 24 hours |
 | `.cache(bytes)` | 0.4 | 256 MiB |
@@ -192,8 +194,8 @@ collections are **spaces** (one or more sites). A new database has the realm
 |---|---|---|
 | `db.auth() -> Auth` (default realm) | 0.1 | P0 |
 | `db.content() -> Content` (default space) | 0.1 | P0 |
-| `db.define_realm(name, RealmPolicy) -> Result<()>` | 0.3 | P1 |
-| `db.auth_realm(name) -> Result<Auth>` | 0.3 | P1 |
+| `db.define_realm(name, RealmPolicy) -> Result<()>` | 0.4 | P1 |
+| `db.auth_realm(name) -> Result<Auth>` | 0.4 | P1 |
 | `db.define_space(name, SpaceSpec) -> Result<()>` | 0.4 | P1 |
 | `db.content_space(name) -> Result<Content>` | 0.4 | P1 |
 | `db.collections() -> Vec<CollectionInfo>` (names and engines) | 0.4 | P2 |
@@ -214,7 +216,8 @@ read several things as of one moment, use `db.read`:
 | Call | Since | Grade |
 |---|---|---|
 | `db.read(\|r\| ..) -> Result<T>` | 0.3 | P0 |
-| `r.auth() -> AuthRead`, `r.content() -> ContentRead`: the read operations of each engine | 0.3 | P0 |
+| `r.auth() -> AuthRead`: `validate(token)` (latest), `standing(account)` | 0.3 | P0 |
+| `r.content() -> ContentRead`: `get(rid)`, `resolve(site, path)` | 0.3 | P0 |
 
 Every read inside the closure sees the same commit. A snapshot held longer
 than the configured maximum fails with `Error::SnapshotTooOld`, so a forgotten
@@ -275,7 +278,7 @@ Rules:
 |---|---|---|
 | `db.commit(\|tx\| ..) -> Result<T>` | 0.1 | P0 |
 | `tx.auth() -> AuthTx`, `tx.content() -> ContentTx` | 0.1 | P0 |
-| `db.commit_serializable(\|tx\| ..) -> Result<T>` (also checks what the closure read) | 0.3 | P1 |
+| `db.commit_serializable(\|tx\| ..) -> Result<T>` (also checks what the closure read) | 0.4 | P1 |
 | `db.commit_with(CommitOptions, \|tx\| ..) -> Result<Committed<T>>` (retries, idempotency key) | 0.3 | P2 |
 
 An idempotency key makes a retried request commit at most once. A commit with
@@ -346,7 +349,7 @@ opaque to nex-db.
 | Call | Since |
 |---|---|
 | `SessionSpec::web()` (30 days), `SessionSpec::new(ttl)` (up to 400 days) | 0.1 |
-| `.idle(Duration)`, `.payload(bytes)`, `.recheck_after(Duration)` | 0.3 |
+| `.idle(Duration)`, `.recheck_after(Duration)`, `.payload(bytes) -> Result<SessionSpec>` (at most 256 bytes) | 0.3 |
 | `.device(DeviceId)` | 0.4 |
 
 | Operation | Since | Grade | Notes |
@@ -404,7 +407,7 @@ it.
 | `hash_password(password) -> Result<HashedPassword>` | 0.1 | P0 | before `commit` |
 | `create_account(identifier, &HashedPassword) -> Result<AccountId>` | 0.1 | P0 | unique by identifier |
 | `sign_in(identifier, password, spec) -> Result<SignIn>` | 0.1 | P0 | check and issue in one call |
-| `verify_password(identifier, password) -> Result<Login>` | 0.3 | P1 | check only; counts failures |
+| `verify_password(identifier, password) -> Result<Login>` | 0.3 | P1 | check only; ten failures within fifteen minutes lock the account out for fifteen minutes (set per realm from `RealmPolicy`) |
 | `account(id) -> Result<Option<Account>>` | 0.3 | P0 | standing, created, roles; never the hash, never identifiers |
 | `standing(account) -> Result<Option<Standing>>` | 0.3 | P0 | the read a request makes when a session's `recheck_at` has passed |
 | `set_standing(account, Standing, by: Option<AccountId>) -> Result<()>` | 0.3 | P0 | a ban or lock-out ends every session at once; `by` is `None` for an automatic lock-out |
@@ -413,18 +416,22 @@ it.
 | `erase_account(account) -> Result<()>` | 0.5 | P2 | destroys the account's key: its data in every copy and backup becomes unreadable |
 
 `SignIn` (non-exhaustive): `Success { account, token }` and `Failed` (0.1);
-`LockedOut { until }` (0.3) and `NeedsSecondFactor { challenge }` (0.4).
-`LockedOut` is returned only after the password matched. A wrong password on a
+`LockedOut { until: Option<SystemTime> }` (0.3) and
+`NeedsSecondFactor { challenge }` (0.4). `LockedOut` covers a lock-out, a
+suspension, and a ban; `until` is `None` when only an administrator can lift
+it. It is returned only after the password matched. A wrong password on a
 locked-out account, or an unknown identifier, gives `Failed` after the same
-work, so only the account's owner can learn it is locked out.
+work, so only someone who knows the password learns the account is locked.
 
 `Login` is `SignIn` without the session: `Verified(AccountId)`, `Failed`,
 `LockedOut { until }`, `NeedsSecondFactor { challenge }`.
 
 `Standing` (non-exhaustive): `Active`, `PendingVerification`,
-`LockedOut { until, reason }`, `Suspended { until, reason }`,
-`Banned { reason }`. Who set it is in the audit log. A change of standing that
-takes access away revokes every session of the account in the same commit.
+`LockedOut { until }`, `Suspended { until: Option<SystemTime>, reason }`,
+`Banned { reason }`. A reason is an application-defined `u32` code. A lock-out
+or suspension whose `until` has passed reads as `Active`. Who set a standing
+is in the audit log. A change of standing that takes access away revokes
+every session of the account in the same commit.
 
 ### Second factors, tokens, keys, roles (0.4)
 

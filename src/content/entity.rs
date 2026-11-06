@@ -1,9 +1,6 @@
 //! Entities: what the content engine stores.
 
-use std::{
-    collections::HashSet,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashSet, time::SystemTime};
 
 use crate::{
     core::codec::{Reader, Writer},
@@ -381,7 +378,7 @@ impl Entry {
     /// When the entity was created.
     #[must_use]
     pub fn created_at(&self) -> SystemTime {
-        UNIX_EPOCH + Duration::from_millis(self.created_ms)
+        crate::core::time_of(self.created_ms)
     }
 
     /// The site and path the entity is served at, if it has a path.
@@ -476,7 +473,7 @@ mod tests {
             Some(rid())
         );
         assert_eq!(entry.fields().count(), 5);
-        assert_eq!(entry.created_at(), UNIX_EPOCH + Duration::from_millis(5));
+        assert_eq!(entry.created_at(), crate::core::time_of(5));
     }
 
     #[test]

@@ -11,8 +11,11 @@ mod routes;
 use std::{
     collections::HashSet,
     fmt,
-    path::Path,
-    sync::atomic::{AtomicU64, Ordering},
+    path::{Path, PathBuf},
+    sync::{
+        Mutex, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use lsm_db::{Batch, Lsm};
@@ -27,7 +30,9 @@ use crate::{
         codec::{Reader, Writer},
         conflict::ConflictTable,
         now_ms,
-        record::Seq,
+        pipeline::SnapshotGuard,
+        record::{Section, Seq},
+        versions::Versions,
     },
     engine::{Conflict, Engine, EngineId, Staged},
     error::{Error, Result},
@@ -68,10 +73,17 @@ fn route_key(site: &str, path: &str) -> Vec<u8> {
 /// The content engine.
 pub(crate) struct ContentEngine {
     collection: u32,
+    dir: PathBuf,
     store: Lsm,
-    /// Highest seq the store holds.
+    /// Highest seq the store holds (in memory or on disk).
     applied: AtomicU64,
+    /// Highest seq the store holds on disk: the mark at the last flush.
+    durable: AtomicU64,
+    /// Keeps a checkpoint's mark from interleaving with an apply's batch.
+    writing: Mutex<()>,
     routes: RouteTable,
+    /// Entity versions kept for running snapshots.
+    versions: Versions,
     conflicts: ConflictTable,
 }
 
@@ -107,14 +119,18 @@ impl ContentEngine {
         for (_, value) in store.scan(start..end)? {
             let entry = Entry::decode(&value, applied)?;
             if let Some((site, path)) = entry.route() {
-                routes.insert(site, path, route_entry(&entry));
+                routes.insert(site, path, 0, route_entry(&entry));
             }
         }
         Ok(ContentEngine {
             collection,
+            dir: dir.to_path_buf(),
             store,
             applied: AtomicU64::new(applied),
+            durable: AtomicU64::new(applied),
+            writing: Mutex::new(()),
             routes,
+            versions: Versions::new(),
             conflicts: ConflictTable::new(),
         })
     }
@@ -123,6 +139,15 @@ impl ContentEngine {
         match self.store.get(entity_key(self.collection, rid))? {
             Some(bytes) => Ok(Some(Entry::decode(&bytes, 0)?)),
             None => Ok(None),
+        }
+    }
+
+    /// The entity as a snapshot at `at` sees it.
+    fn get_at(&self, rid: Rid, at: Seq) -> Result<Option<Entry>> {
+        match self.versions.at(&entity_key(self.collection, rid), at) {
+            Some(Some(bytes)) => Ok(Some(Entry::decode(&bytes, at)?)),
+            Some(None) => Ok(None),
+            None => self.get(rid),
         }
     }
 }
@@ -161,14 +186,14 @@ impl Engine for ContentEngine {
         }
     }
 
-    fn apply(&self, seq: Seq, collection: u32, format: u16, body: &[u8]) -> Result<()> {
-        if format != FORMAT || collection != self.collection {
+    fn apply(&self, seq: Seq, section: &Section<'_>) -> Result<()> {
+        if section.format != FORMAT || section.flags != 0 || section.collection != self.collection {
             return Err(Error::corrupt("a content section header", seq));
         }
         if seq <= self.applied.load(Ordering::Acquire) {
             return Ok(());
         }
-        let mut r = Reader::new(body, "a content section", seq);
+        let mut r = Reader::new(section.body, "a content section", seq);
         let mut entries = Vec::new();
         while !r.is_empty() {
             if r.u8()? != OP_CREATE {
@@ -179,30 +204,51 @@ impl Engine for ContentEngine {
         }
         let mut batch = Batch::new();
         for (entry, record) in &entries {
-            batch.put(entity_key(self.collection, entry.rid()), record);
+            let key = entity_key(self.collection, entry.rid());
+            self.versions
+                .record(&key, seq, Some(record), || Ok(self.store.get(&key)?))?;
+            batch.put(key, record);
         }
         batch.put(META_APPLIED, seq.to_le_bytes());
-        self.store.write(batch)?;
-        self.applied.store(seq, Ordering::Release);
+        {
+            let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
+            self.store.write(batch)?;
+            self.applied.store(seq, Ordering::Release);
+        }
         for (entry, _) in &entries {
             if let Some((site, path)) = entry.route() {
-                self.routes.insert(site, path, route_entry(entry));
+                self.routes.insert(site, path, seq, route_entry(entry));
             }
         }
         Ok(())
     }
 
     fn durable_through(&self) -> Seq {
-        self.applied.load(Ordering::Acquire)
+        self.durable.load(Ordering::Acquire)
     }
 
-    fn checkpoint(&self) -> Result<Seq> {
+    fn checkpoint(&self, upto: Seq) -> Result<Seq> {
+        // The store holds every content section through `upto`; say so in
+        // its mark, so a store untouched by recent commits does not hold the
+        // log back.
+        let mark = {
+            let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
+            let mark = upto.max(self.applied.load(Ordering::Acquire));
+            let mut batch = Batch::new();
+            batch.put(META_APPLIED, mark.to_le_bytes());
+            self.store.write(batch)?;
+            self.applied.store(mark, Ordering::Release);
+            mark
+        };
         self.store.flush()?;
-        Ok(self.durable_through())
+        crate::core::fs::sync_names(&self.dir)?;
+        let _ = self.durable.fetch_max(mark, Ordering::AcqRel);
+        Ok(mark)
     }
 
     fn reclaim(&self, watermark: Seq) {
         self.conflicts.prune(watermark);
+        self.versions.prune(watermark);
     }
 }
 
@@ -373,6 +419,45 @@ impl Content<'_> {
     /// As [`ContentTx::create`], plus the errors of [`Database::commit`].
     pub fn create(&self, entity: Entity) -> Result<Rid> {
         self.db.commit(|tx| tx.content().create(entity.clone()))
+    }
+}
+
+/// Content reads at one snapshot, inside [`Database::read`](crate::Database::read).
+///
+/// Returned by [`Read::content`](crate::Read::content).
+#[derive(Debug)]
+pub struct ContentRead<'r> {
+    pub(crate) engine: &'r ContentEngine,
+    pub(crate) snapshot: &'r SnapshotGuard<'r>,
+}
+
+impl ContentRead<'_> {
+    fn at(&self) -> Result<Seq> {
+        if self.snapshot.expired() {
+            return Err(Error::SnapshotTooOld);
+        }
+        Ok(self.snapshot.seq())
+    }
+
+    /// The entity with `rid` as of the snapshot, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SnapshotTooOld`] past the snapshot age limit, and the errors
+    /// of [`Content::get`].
+    pub fn get(&self, rid: Rid) -> Result<Option<Entry>> {
+        let at = self.at()?;
+        self.engine.get_at(rid, at)
+    }
+
+    /// The route at `path` on `site` as of the snapshot, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SnapshotTooOld`] past the snapshot age limit.
+    pub fn resolve(&self, site: &str, path: &str) -> Result<Option<RouteEntry>> {
+        let at = self.at()?;
+        Ok(self.engine.routes.get_at(site, path, at))
     }
 }
 

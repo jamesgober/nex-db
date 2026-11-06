@@ -77,6 +77,10 @@ impl Class {
     }
 }
 
+/// Section flag: the body is encrypted by its engine; the rest of the
+/// database moves the bytes without reading them.
+pub(crate) const SEALED: u8 = 1;
+
 /// One engine's part of a record, borrowed from the record bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Section<'a> {
@@ -157,6 +161,7 @@ impl RecordWriter {
     pub(crate) fn begin_section(
         &mut self,
         engine: EngineId,
+        flags: u8,
         format: u16,
         collection: u32,
     ) -> Result<&mut Vec<u8>> {
@@ -168,7 +173,7 @@ impl RecordWriter {
         }
         let mut w = Writer::new(&mut self.buf);
         w.u16(engine.0);
-        w.u8(0);
+        w.u8(flags);
         w.u16(format);
         w.u32(collection);
         let length_at = w.position();
@@ -258,11 +263,11 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        w.begin_section(EngineId(1), 1, 10)
+        w.begin_section(EngineId(1), SEALED, 1, 10)
             .unwrap()
             .extend_from_slice(b"auth");
         w.end_section().unwrap();
-        w.begin_section(EngineId(2), 3, 20)
+        w.begin_section(EngineId(2), 0, 3, 20)
             .unwrap()
             .extend_from_slice(b"content!");
         w.end_section().unwrap();
@@ -283,6 +288,7 @@ mod tests {
         assert_eq!(view.sections.len(), 2);
         assert_eq!(view.sections[0].engine, EngineId(1));
         assert_eq!(view.sections[0].collection, 10);
+        assert_eq!(view.sections[0].flags, SEALED);
         assert_eq!(view.sections[0].body, b"auth");
         assert_eq!(view.sections[1].format, 3);
         assert_eq!(view.sections[1].body, b"content!");
@@ -322,7 +328,7 @@ mod tests {
     fn test_writer_undeclared_engine_is_refused() {
         let mut w =
             RecordWriter::new(1, Kind::Commit, Class::Durable, &[EngineId(1)], Vec::new()).unwrap();
-        assert!(w.begin_section(EngineId(2), 1, 0).is_err());
+        assert!(w.begin_section(EngineId(2), 0, 1, 0).is_err());
     }
 
     #[test]

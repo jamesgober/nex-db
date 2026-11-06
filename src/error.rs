@@ -70,6 +70,9 @@ pub enum Error {
         /// The underlying error.
         source: Box<dyn StdError + Send + Sync + 'static>,
     },
+    /// A [`Database::read`](crate::Database::read) ran longer than the
+    /// snapshot age limit (60 seconds). Read again.
+    SnapshotTooOld,
 }
 
 impl Error {
@@ -89,6 +92,7 @@ impl Error {
             Error::Locked => "NEX-1006",
             Error::Corrupt { .. } => "NEX-1007",
             Error::Storage { .. } => "NEX-1008",
+            Error::SnapshotTooOld => "NEX-1009",
         }
     }
 
@@ -146,6 +150,10 @@ impl fmt::Display for Error {
                 "{code}: storage failed while {what}: {source}. Check the disk, then restart the \
                  process"
             ),
+            Error::SnapshotTooOld => write!(
+                f,
+                "{code}: the read ran past the snapshot age limit; read again"
+            ),
         }
     }
 }
@@ -190,6 +198,7 @@ mod tests {
             Error::Locked,
             Error::corrupt("x", 0),
             Error::storage("x", "y"),
+            Error::SnapshotTooOld,
         ];
         let mut codes: Vec<&str> = all.iter().map(Error::code).collect();
         codes.sort_unstable();

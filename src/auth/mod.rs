@@ -1596,7 +1596,7 @@ mod tests {
         assert!(!identifier_key(1, &[0; 32]).starts_with(META_APPLIED));
     }
 
-    fn sealed_section<'a>(body: &'a [u8], seq: Seq) -> (Seq, Section<'a>) {
+    fn sealed_section(body: &[u8], seq: Seq) -> (Seq, Section<'_>) {
         (
             seq,
             Section {

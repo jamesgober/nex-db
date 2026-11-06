@@ -14,6 +14,9 @@ use crate::{
 /// Longest session lifetime accepted: 400 days.
 const MAX_TTL: Duration = Duration::from_secs(400 * 24 * 60 * 60);
 
+/// Largest session payload, in bytes.
+pub(crate) const MAX_PAYLOAD: usize = 256;
+
 /// How a new session behaves.
 ///
 /// ```
@@ -22,14 +25,32 @@ const MAX_TTL: Duration = Duration::from_secs(400 * 24 * 60 * 60);
 ///
 /// let web = SessionSpec::web();
 /// assert_eq!(web.ttl(), Duration::from_secs(30 * 24 * 60 * 60));
-/// let short = SessionSpec::new(Duration::from_secs(3600))?;
+/// let short = SessionSpec::new(Duration::from_secs(3600))?
+///     .idle(Duration::from_secs(900))
+///     .recheck_after(Duration::from_secs(300))
+///     .payload(b"role=editor")?;
 /// assert_eq!(short.ttl(), Duration::from_secs(3600));
 /// assert!(SessionSpec::new(Duration::ZERO).is_err());
+/// assert!(SessionSpec::web().payload(&[0; 257]).is_err());
 /// # Ok::<(), nex_db::Error>(())
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SessionSpec {
     ttl: Duration,
+    idle: Option<Duration>,
+    recheck: Option<Duration>,
+    payload: Payload,
+}
+
+impl fmt::Debug for SessionSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionSpec")
+            .field("ttl", &self.ttl)
+            .field("idle", &self.idle)
+            .field("recheck", &self.recheck)
+            .field("payload_len", &self.payload.len)
+            .finish()
+    }
 }
 
 impl SessionSpec {
@@ -38,7 +59,57 @@ impl SessionSpec {
     pub const fn web() -> Self {
         SessionSpec {
             ttl: Duration::from_secs(30 * 24 * 60 * 60),
+            idle: None,
+            recheck: None,
+            payload: Payload::EMPTY,
         }
+    }
+
+    /// End the session when it goes unused for `limit` (a validation counts
+    /// as use). `Duration::ZERO` means no idle limit. Use is remembered in
+    /// memory and saved by each checkpoint, so after a crash an idle session
+    /// may end up to one checkpoint early or late.
+    #[must_use]
+    pub const fn idle(mut self, limit: Duration) -> Self {
+        self.idle = if limit.is_zero() { None } else { Some(limit) };
+        self
+    }
+
+    /// Ask the application to check the account again (its standing, its
+    /// roles) once `after` has passed since issue: [`Session::recheck_at`]
+    /// says when. nex-db does nothing at that time itself.
+    #[must_use]
+    pub const fn recheck_after(mut self, after: Duration) -> Self {
+        self.recheck = Some(after);
+        self
+    }
+
+    /// Up to 256 bytes stored with the session and returned with every
+    /// validation (permissions, attributes). Opaque to nex-db, and not a
+    /// secret: it is held unencrypted in memory, like the rest of the
+    /// session.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when `bytes` is longer than 256 bytes.
+    pub fn payload(mut self, bytes: &[u8]) -> Result<Self> {
+        self.payload = Payload::new(bytes)?;
+        Ok(self)
+    }
+
+    pub(crate) fn idle_ms(&self) -> u64 {
+        self.idle.map_or(0, |d| {
+            u64::try_from(d.as_millis()).unwrap_or(u64::MAX).max(1)
+        })
+    }
+
+    pub(crate) fn recheck_ms(&self) -> Option<u64> {
+        self.recheck
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+    }
+
+    pub(crate) fn payload_bytes(&self) -> &[u8] {
+        self.payload.as_bytes()
     }
 
     /// A session valid for `ttl` from issue.
@@ -53,7 +124,10 @@ impl SessionSpec {
                 "must be 1 ms to 400 days",
             ));
         }
-        Ok(SessionSpec { ttl })
+        Ok(SessionSpec {
+            ttl,
+            ..SessionSpec::web()
+        })
     }
 
     /// How long the session stays valid after issue.
@@ -67,9 +141,37 @@ impl SessionSpec {
     }
 }
 
-/// A valid session, as [`Validation::Valid`] returns it. A small `Copy`
-/// value: validating allocates nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Up to [`MAX_PAYLOAD`] bytes, inline.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Payload {
+    len: u16,
+    bytes: [u8; MAX_PAYLOAD],
+}
+
+impl Payload {
+    pub(crate) const EMPTY: Payload = Payload {
+        len: 0,
+        bytes: [0; MAX_PAYLOAD],
+    };
+
+    pub(crate) fn new(bytes: &[u8]) -> Result<Payload> {
+        if bytes.len() > MAX_PAYLOAD {
+            return Err(Error::invalid("session payload", "longer than 256 bytes"));
+        }
+        let mut payload = Payload::EMPTY;
+        payload.bytes[..bytes.len()].copy_from_slice(bytes);
+        payload.len = bytes.len() as u16;
+        Ok(payload)
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+}
+
+/// A valid session, as [`Validation::Valid`] returns it. A `Copy` value of
+/// fixed size, the payload inline: validating allocates nothing.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Session {
     pub(crate) account: AccountId,
     pub(crate) created_ms: u64,
@@ -77,6 +179,23 @@ pub struct Session {
     /// The account's epoch when the session was issued. Signing the account
     /// out everywhere raises the epoch, which ends every older session.
     pub(crate) epoch: u32,
+    /// Idle limit in milliseconds; 0 for none.
+    pub(crate) idle_ms: u64,
+    /// When the application should check the account again, in ms; 0 for
+    /// never.
+    pub(crate) recheck_ms: u64,
+    pub(crate) payload: Payload,
+}
+
+impl fmt::Debug for Session {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Session")
+            .field("account", &self.account)
+            .field("created_ms", &self.created_ms)
+            .field("expires_ms", &self.expires_ms)
+            .field("payload_len", &self.payload.len)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Session {
@@ -96,6 +215,24 @@ impl Session {
     #[must_use]
     pub fn expires_at(&self) -> SystemTime {
         time_of(self.expires_ms)
+    }
+
+    /// The idle limit, if the session has one.
+    #[must_use]
+    pub fn idle_limit(&self) -> Option<Duration> {
+        (self.idle_ms != 0).then(|| Duration::from_millis(self.idle_ms))
+    }
+
+    /// When the application should check the account again, if it asked.
+    #[must_use]
+    pub fn recheck_at(&self) -> Option<SystemTime> {
+        (self.recheck_ms != 0).then(|| time_of(self.recheck_ms))
+    }
+
+    /// The bytes stored with the session.
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        self.payload.as_bytes()
     }
 }
 
@@ -117,6 +254,9 @@ pub enum RevokeReason {
 /// caller is not signed in.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// `Valid` carries the session by value, payload inline, so validating
+// allocates nothing; boxing it would allocate on every request.
+#[allow(clippy::large_enum_variant)]
 pub enum Validation {
     /// The token names a live session.
     Valid(Session),
@@ -297,6 +437,9 @@ mod tests {
             created_ms: 1,
             expires_ms: 2,
             epoch: 0,
+            idle_ms: 0,
+            recheck_ms: 0,
+            payload: Payload::EMPTY,
         };
         assert_eq!(Validation::Valid(session).session(), Some(session));
         assert_eq!(Validation::Unknown.session(), None);

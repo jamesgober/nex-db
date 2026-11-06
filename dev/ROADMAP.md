@@ -41,6 +41,7 @@
   - [x] Snapshots: `db.read` with versions kept for running snapshots (`PLAN.md` D-052).
   - [x] Checkpoints and log truncation (`PLAN.md` D-056).
   - [x] Audit chain (`PLAN.md` D-057).
+  - [x] Session payload, idle limit, and recheck time (`PLAN.md` D-059).
 - Key hierarchy through key-vault and crypt-io; sealed auth sections.
   - [x] Sealed and padded auth sections in the log (`PLAN.md` D-047).
   - [x] Sealed account records in the account store (`PLAN.md` D-048).

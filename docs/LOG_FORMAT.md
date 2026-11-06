@@ -157,8 +157,9 @@ tag [16]
 
 with associated data `seq u64 | engine u16 | collection u32 | format u16`, so
 a body copied to another commit, engine, or collection fails to open. The
-plaintext is `length u32 | operations | zeros`, padded to a multiple of 256
-bytes, so a section of any single operation has the same size. Non-zero
+plaintext is `length u32 | operations | zeros`, padded to a multiple of 512
+bytes, so a section of any single operation (the largest is a session with a
+full 256-byte payload) has the same size. Non-zero
 padding, a wrong key id, or a failed tag keeps the database closed. The log
 seal key is `keyed BLAKE3(root key, "nex-db 2026 auth log seal")`.
 
@@ -173,7 +174,7 @@ The operations:
 | 2 | issue session | `token digest [32]`, `account [16]`, `created ms u64`, `expires ms u64` |
 | 3 | revoke session | `token digest [32]`, `reason u8` (1 = revoked, 2 = rotated), `at ms u64` |
 | 4 | create account (sealed record) | `account [16]`, `identifier digest [32]`, `record bytes32` |
-| 5 | issue session at an epoch | `token digest [32]`, `account [16]`, `created ms u64`, `expires ms u64`, `epoch u32` |
+| 5 | issue session at an epoch | `token digest [32]`, `account [16]`, `created ms u64`, `expires ms u64`, `epoch u32`, `idle ms u64` (0: none), `recheck ms u64` (0: none), `payload bytes16` (at most 256) |
 | 6 | raise an account's epoch | `account [16]`, `epoch u32`, `at ms u64` |
 | 7 | replace an account's record | `account [16]`, `record bytes32` (sealed, as in operation 4), `at ms u64` |
 

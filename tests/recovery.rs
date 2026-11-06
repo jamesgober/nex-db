@@ -381,3 +381,26 @@ fn test_truncated_log_without_its_session_checkpoint_stays_closed() {
     fs::remove_file(&file).unwrap();
     assert!(matches!(Database::open(&dir.0), Err(Error::Corrupt { .. })));
 }
+
+#[test]
+fn test_session_payload_survives_a_checkpoint() {
+    let dir = TempDir::new("payload-ckpt");
+    let token = {
+        let db = checkpointing(&dir.0);
+        let password = db.auth().hash_password(PASSWORD).unwrap();
+        let ann = db
+            .auth()
+            .create_account("ann@example.com", &password)
+            .unwrap();
+        let spec = SessionSpec::web().payload(b"perm=admin").unwrap();
+        let token = db.auth().issue_session(ann, spec).unwrap();
+        // One more commit, so the checkpoint after it holds the session.
+        let _ = populate(&db, 0, 1);
+        token
+    };
+    let db = Database::open(&dir.0).unwrap();
+    match db.auth().validate(&token).unwrap() {
+        Validation::Valid(session) => assert_eq!(session.payload(), b"perm=admin"),
+        other => panic!("{other:?}"),
+    }
+}

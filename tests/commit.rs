@@ -604,3 +604,45 @@ fn test_read_sees_one_snapshot_while_others_commit() {
         .unwrap();
     assert_eq!(now, (Some(Standing::Banned { reason: 1 }), true, true));
 }
+
+#[test]
+fn test_session_carries_payload_recheck_and_idle_limit() {
+    let dir = TempDir::new("session-spec");
+    let db = Database::open(&dir.0).unwrap();
+    let password = db.auth().hash_password("pw").unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    let spec = SessionSpec::web()
+        .recheck_after(Duration::from_secs(300))
+        .payload(b"perm=editor")
+        .unwrap();
+    let token = db.auth().issue_session(ann, spec).unwrap();
+    let Validation::Valid(session) = db.auth().validate(&token).unwrap() else {
+        panic!("valid");
+    };
+    assert_eq!(session.payload(), b"perm=editor");
+    assert!(session.recheck_at().is_some());
+    assert_eq!(session.idle_limit(), None);
+
+    // Rotation keeps the payload.
+    let rotated = db.auth().rotate(&token).unwrap();
+    let Validation::Valid(after) = db.auth().validate(&rotated).unwrap() else {
+        panic!("valid");
+    };
+    assert_eq!(after.payload(), b"perm=editor");
+
+    // An idle limit ends a session left unused.
+    let idle = db
+        .auth()
+        .issue_session(ann, SessionSpec::web().idle(Duration::from_millis(50)))
+        .unwrap();
+    assert!(matches!(
+        db.auth().validate(&idle).unwrap(),
+        Validation::Valid(_)
+    ));
+    thread::sleep(Duration::from_millis(120));
+    assert_eq!(db.auth().validate(&idle).unwrap(), Validation::Expired);
+    assert!(SessionSpec::web().payload(&[0; 257]).is_err());
+}

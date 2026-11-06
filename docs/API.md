@@ -349,7 +349,7 @@ opaque to nex-db.
 | Call | Since |
 |---|---|
 | `SessionSpec::web()` (30 days), `SessionSpec::new(ttl)` (up to 400 days) | 0.1 |
-| `.idle(Duration)`, `.payload(bytes)`, `.recheck_after(Duration)` | 0.3 |
+| `.idle(Duration)`, `.recheck_after(Duration)`, `.payload(bytes) -> Result<SessionSpec>` (at most 256 bytes) | 0.3 |
 | `.device(DeviceId)` | 0.4 |
 
 | Operation | Since | Grade | Notes |

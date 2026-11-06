@@ -34,8 +34,8 @@ use self::{
     sessions::{EpochTable, SessionTable, Slot},
     token::Token,
     types::{
-        HashedPassword, Login, RevokeReason, Session, SessionSpec, SignIn, Standing, Validation,
-        ms_of, time_of,
+        HashedPassword, Login, Payload, RevokeReason, Session, SessionSpec, SignIn, Standing,
+        Validation, ms_of, time_of,
     },
 };
 use crate::{
@@ -68,9 +68,9 @@ const FORMAT: u16 = 2;
 const SEAL_KEY_ID: u32 = 1;
 
 /// Sealed plaintext is padded to a multiple of this many bytes, so one
-/// operation of any kind (the largest, a new account, is about 160 bytes)
-/// gives a section of the same size.
-const PAD_BUCKET: usize = 256;
+/// operation of any kind (the largest, a session with a full 256-byte
+/// payload, is about 350 bytes) gives a section of the same size.
+const PAD_BUCKET: usize = 512;
 
 /// Create an account with its record and credential in plain form (format
 /// 1 logs only; read, never written).
@@ -313,8 +313,8 @@ impl AuthEngine {
             for (account, epoch) in checkpoint.epochs {
                 engine.epochs.raise(account, epoch);
             }
-            for (digest, slot) in checkpoint.slots {
-                engine.sessions.restore(digest, slot);
+            for (digest, slot, seen) in checkpoint.slots {
+                engine.sessions.restore(digest, slot, seen);
             }
             engine
                 .sessions_through
@@ -340,7 +340,7 @@ impl AuthEngine {
             w.u32(*epoch);
         }
         w.u32(u32::try_from(slots.len()).map_err(|_| Error::invalid("sessions", "too many"))?);
-        for (digest, slot) in &slots {
+        for (digest, slot, seen) in &slots {
             w.bytes(digest);
             match slot {
                 Slot::Live(session) => {
@@ -349,6 +349,10 @@ impl AuthEngine {
                     w.u64(session.created_ms);
                     w.u64(session.expires_ms);
                     w.u32(session.epoch);
+                    w.u64(session.idle_ms);
+                    w.u64(session.recheck_ms);
+                    w.bytes16(session.payload.as_bytes())?;
+                    w.u64(*seen);
                 }
                 Slot::Revoked(reason) => {
                     w.u8(SLOT_REVOKED);
@@ -551,16 +555,25 @@ impl AuthEngine {
             return Validation::Malformed;
         };
         let digest = self.token_digest(&random);
-        match self.sessions.get(&digest) {
+        let now = now_ms();
+        match self.sessions.get_seen(&digest) {
             None => Validation::Unknown,
-            Some(Slot::Revoked(reason)) => Validation::Revoked { reason },
-            Some(Slot::Live(session)) if now_ms() >= session.expires_ms => Validation::Expired,
-            Some(Slot::Live(session)) if session.epoch != self.epochs.get(session.account) => {
+            Some((Slot::Revoked(reason), _)) => Validation::Revoked { reason },
+            Some((Slot::Live(session), _)) if now >= session.expires_ms => Validation::Expired,
+            Some((Slot::Live(session), seen))
+                if session.idle_ms != 0 && now.saturating_sub(seen) >= session.idle_ms =>
+            {
+                Validation::Expired
+            }
+            Some((Slot::Live(session), _)) if session.epoch != self.epochs.get(session.account) => {
                 Validation::Revoked {
                     reason: RevokeReason::SignedOutEverywhere,
                 }
             }
-            Some(Slot::Live(session)) => Validation::Valid(session),
+            Some((Slot::Live(session), _)) => {
+                self.sessions.touch(&digest, now);
+                Validation::Valid(session)
+            }
         }
     }
 
@@ -626,6 +639,9 @@ impl Drop for HashingSlot<'_> {
 }
 
 /// One decoded auth operation, borrowing the section bytes.
+// Lives for one commit, a few at a time: the session inside is kept by
+// value rather than boxed.
+#[allow(clippy::large_enum_variant)]
 enum Op<'a> {
     CreateAccount {
         account: AccountId,
@@ -687,6 +703,9 @@ fn decode_ops(seq: Seq, body: &[u8]) -> Result<Vec<Op<'_>>> {
                         created_ms,
                         expires_ms,
                         epoch: 0,
+                        idle_ms: 0,
+                        recheck_ms: 0,
+                        payload: Payload::EMPTY,
                     },
                 }
             }
@@ -696,6 +715,10 @@ fn decode_ops(seq: Seq, body: &[u8]) -> Result<Vec<Op<'_>>> {
                 let created_ms = r.u64()?;
                 let expires_ms = r.u64()?;
                 let epoch = r.u32()?;
+                let idle_ms = r.u64()?;
+                let recheck_ms = r.u64()?;
+                let payload = Payload::new(r.bytes16()?)
+                    .map_err(|_| Error::corrupt("a session payload", seq))?;
                 Op::IssueSession {
                     digest,
                     session: Session {
@@ -703,6 +726,9 @@ fn decode_ops(seq: Seq, body: &[u8]) -> Result<Vec<Op<'_>>> {
                         created_ms,
                         expires_ms,
                         epoch,
+                        idle_ms,
+                        recheck_ms,
+                        payload,
                     },
                 }
             }
@@ -882,6 +908,9 @@ impl Engine for AuthEngine {
 }
 
 /// An auth operation staged in a transaction.
+// Lives for one commit, a few at a time: the session inside is kept by
+// value rather than boxed.
+#[allow(clippy::large_enum_variant)]
 enum StagedOp {
     CreateAccount {
         account: AccountId,
@@ -891,10 +920,7 @@ enum StagedOp {
     },
     IssueSession {
         digest: [u8; 32],
-        account: AccountId,
-        created_ms: u64,
-        expires_ms: u64,
-        epoch: u32,
+        session: Session,
     },
     RevokeSession {
         digest: [u8; 32],
@@ -1016,19 +1042,16 @@ fn write_ops(ops: &[StagedOp], out: &mut Vec<u8>) -> Result<()> {
                 w.bytes(digest);
                 w.bytes32(value)?;
             }
-            StagedOp::IssueSession {
-                digest,
-                account,
-                created_ms,
-                expires_ms,
-                epoch,
-            } => {
+            StagedOp::IssueSession { digest, session } => {
                 w.u8(OP_ISSUE_SESSION_AT_EPOCH);
                 w.bytes(digest);
-                w.bytes(account.as_bytes());
-                w.u64(*created_ms);
-                w.u64(*expires_ms);
-                w.u32(*epoch);
+                w.bytes(session.account.as_bytes());
+                w.u64(session.created_ms);
+                w.u64(session.expires_ms);
+                w.u32(session.epoch);
+                w.u64(session.idle_ms);
+                w.u64(session.recheck_ms);
+                w.bytes16(session.payload.as_bytes())?;
             }
             StagedOp::RevokeSession {
                 digest,
@@ -1211,7 +1234,7 @@ struct Checkpoint {
     through: Seq,
     tail: Tail,
     epochs: Vec<(AccountId, u32)>,
-    slots: Vec<([u8; 32], Slot)>,
+    slots: Vec<([u8; 32], Slot, u64)>,
 }
 
 /// Read the session checkpoint at `path`, when there is one. A damaged one
@@ -1238,13 +1261,21 @@ fn read_checkpoint(path: &Path, file_key: &[u8; 32]) -> Result<Option<Checkpoint
     let mut slots = Vec::new();
     for _ in 0..r.u32()? {
         let digest = r.fixed::<32>()?;
+        let mut seen = 0;
         let slot = match r.u8()? {
-            SLOT_LIVE => Slot::Live(Session {
-                account: AccountId::from_bytes(r.fixed()?),
-                created_ms: r.u64()?,
-                expires_ms: r.u64()?,
-                epoch: r.u32()?,
-            }),
+            SLOT_LIVE => {
+                let session = Session {
+                    account: AccountId::from_bytes(r.fixed()?),
+                    created_ms: r.u64()?,
+                    expires_ms: r.u64()?,
+                    epoch: r.u32()?,
+                    idle_ms: r.u64()?,
+                    recheck_ms: r.u64()?,
+                    payload: Payload::new(r.bytes16()?).map_err(|_| corrupt())?,
+                };
+                seen = r.u64()?;
+                Slot::Live(session)
+            }
             SLOT_REVOKED => Slot::Revoked(match r.u8()? {
                 REASON_REVOKED => RevokeReason::Revoked,
                 REASON_ROTATED => RevokeReason::Rotated,
@@ -1253,7 +1284,7 @@ fn read_checkpoint(path: &Path, file_key: &[u8; 32]) -> Result<Option<Checkpoint
             }),
             _ => return Err(corrupt()),
         };
-        slots.push((digest, slot));
+        slots.push((digest, slot, seen));
     }
     r.finish()?;
     Ok(Some(Checkpoint {
@@ -1429,34 +1460,31 @@ impl AuthTx<'_, '_> {
             });
         }
         let created_ms = now_ms();
-        self.stage_session(
+        self.stage_session(Session {
             account,
             created_ms,
-            created_ms.saturating_add(spec.ttl_ms()),
-        )
+            expires_ms: created_ms.saturating_add(spec.ttl_ms()),
+            epoch: 0,
+            idle_ms: spec.idle_ms(),
+            recheck_ms: spec
+                .recheck_ms()
+                .map_or(0, |after| created_ms.saturating_add(after).max(1)),
+            payload: Payload::new(spec.payload_bytes())?,
+        })
     }
 
     /// Stage a session for `account` at its current epoch (counting a raise
     /// staged in this transaction).
-    fn stage_session(
-        &mut self,
-        account: AccountId,
-        created_ms: u64,
-        expires_ms: u64,
-    ) -> Result<Token> {
+    fn stage_session(&mut self, mut session: Session) -> Result<Token> {
         let engine = self.staged.engine;
         let (token, random) = Token::generate()?;
         let digest = engine.token_digest(&random);
-        let epoch = self.epoch(account);
+        session.epoch = self.epoch(session.account);
         let _ = self.staged.issued.insert(digest);
         self.staged.writes.push(session_key(&digest));
-        self.staged.ops.push(StagedOp::IssueSession {
-            digest,
-            account,
-            created_ms,
-            expires_ms,
-            epoch,
-        });
+        self.staged
+            .ops
+            .push(StagedOp::IssueSession { digest, session });
         Ok(token)
     }
 
@@ -1492,7 +1520,7 @@ impl AuthTx<'_, '_> {
         // Sessions staged earlier in this transaction end too.
         self.staged
             .ops
-            .retain(|op| !matches!(op, StagedOp::IssueSession { account: a, .. } if *a == account));
+            .retain(|op| !matches!(op, StagedOp::IssueSession { session, .. } if session.account == account));
         let _ = self.staged.raised.insert(account, next);
         self.staged.writes.push(epoch_key(&account));
         self.staged.ops.push(StagedOp::RaiseEpoch {
@@ -1533,7 +1561,12 @@ impl AuthTx<'_, '_> {
             reason: RevokeReason::Rotated,
             at_ms: now_ms(),
         });
-        self.stage_session(session.account, now_ms(), session.expires_ms)
+        // The new token keeps the session's expiry, idle limit, recheck
+        // time, and payload.
+        self.stage_session(Session {
+            created_ms: now_ms(),
+            ..session
+        })
     }
 
     /// Set the account's standing. A standing that takes access away
@@ -2045,12 +2078,18 @@ mod tests {
             digest: [2; 32],
             value,
         });
+        // A session with the largest payload is the largest single operation.
         let issue = sealed_len(StagedOp::IssueSession {
             digest: [2; 32],
-            account,
-            created_ms: u64::MAX,
-            expires_ms: u64::MAX,
-            epoch: u32::MAX,
+            session: Session {
+                account,
+                created_ms: u64::MAX,
+                expires_ms: u64::MAX,
+                epoch: u32::MAX,
+                idle_ms: u64::MAX,
+                recheck_ms: u64::MAX,
+                payload: Payload::new(&[7; crate::auth::types::MAX_PAYLOAD]).unwrap(),
+            },
         });
         let revoke = sealed_len(StagedOp::RevokeSession {
             digest: [2; 32],

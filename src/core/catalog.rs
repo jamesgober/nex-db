@@ -214,9 +214,10 @@ impl Engine for Catalog {
             .through
     }
 
-    fn checkpoint(&self) -> Result<Seq> {
-        // Every change is written as it is applied.
-        Ok(self.durable_through())
+    fn checkpoint(&self, upto: Seq) -> Result<Seq> {
+        // Every change is written as it is applied, so the catalog holds
+        // everything through any point.
+        Ok(upto.max(self.durable_through()))
     }
 
     fn reclaim(&self, _watermark: Seq) {}

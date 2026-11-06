@@ -140,14 +140,19 @@ pub(crate) trait Engine: Send + Sync {
     /// replays the log from just above the lowest mark of all engines.
     fn durable_through(&self) -> Seq;
 
-    /// Write the engine's own files up to everything applied so far and
-    /// return the new durable mark.
+    /// Make the engine's own files hold everything through `upto` and
+    /// return the new durable mark (`upto`, or more). Every commit at or
+    /// below `upto` has been applied when this is called; commits above it
+    /// may be applying at the same time, and a checkpoint that includes some
+    /// of them is fine, since `apply` is idempotent. The log is truncated
+    /// below the lowest mark of all engines, so a mark must hold after a
+    /// crash: the engine's files are synced before it returns.
     ///
     /// # Errors
     ///
     /// [`Error::Storage`] when a write fails. The log still holds every
-    /// commit, so a failed checkpoint only makes the next replay longer.
-    fn checkpoint(&self) -> Result<Seq>;
+    /// commit, so a failed checkpoint only means the log is not truncated.
+    fn checkpoint(&self, upto: Seq) -> Result<Seq>;
 
     /// No running transaction has a snapshot below `watermark`: state kept
     /// only for older snapshots (conflict entries, old versions) may go.

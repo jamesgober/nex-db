@@ -53,7 +53,16 @@ fn kill_child() {
         return;
     };
     let start: u64 = start.parse().unwrap();
-    let db = Database::open(&dir).unwrap();
+    // Half the children checkpoint (and truncate the log) every few
+    // commits, so kills land inside checkpoints too.
+    let mut builder = Database::builder(&dir);
+    if let Some(every) = env::var("NEX_KILL_CHECKPOINT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        builder = builder.checkpoint_every(every);
+    }
+    let db = builder.open().unwrap();
     let password = db.auth().hash_password("kill test password").unwrap();
     let mut out = std::io::stdout().lock();
     writeln!(out, "READY").unwrap();
@@ -150,7 +159,11 @@ fn check_commit(db: &Database, i: u64, known: &Known) {
 }
 
 fn run_child(dir: &Path, start: u64, rng: &mut Rng) -> Vec<String> {
-    let mut child = Command::new(env::current_exe().unwrap())
+    let mut command = Command::new(env::current_exe().unwrap());
+    if rng.below(2) == 0 {
+        let _ = command.env("NEX_KILL_CHECKPOINT", (1 + rng.below(4096)).to_string());
+    }
+    let mut child = command
         .args(["kill_child", "--exact", "--nocapture", "--test-threads=1"])
         .env("NEX_KILL_CHILD", dir)
         .env("NEX_KILL_START", start.to_string())

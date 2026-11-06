@@ -73,6 +73,23 @@ impl SessionTable {
             .unwrap_or_else(PoisonError::into_inner)
             .len()
     }
+
+    /// Every slot except sessions that expired before `now_ms`, for a
+    /// checkpoint.
+    pub(crate) fn snapshot(&self, now_ms: u64) -> Vec<([u8; 32], Slot)> {
+        let slots = self.slots.read().unwrap_or_else(PoisonError::into_inner);
+        slots
+            .iter()
+            .filter(|(_, slot)| !matches!(slot, Slot::Live(s) if s.expires_ms <= now_ms))
+            .map(|(digest, slot)| (*digest, *slot))
+            .collect()
+    }
+
+    /// Put a slot back as a checkpoint held it.
+    pub(crate) fn restore(&self, digest: [u8; 32], slot: Slot) {
+        let mut slots = self.slots.write().unwrap_or_else(PoisonError::into_inner);
+        let _ = slots.insert(digest, slot);
+    }
 }
 
 /// The current epoch of each account that was ever signed out everywhere.
@@ -99,6 +116,12 @@ impl EpochTable {
         let mut epochs = self.epochs.write().unwrap_or_else(PoisonError::into_inner);
         let current = epochs.entry(account).or_insert(0);
         *current = (*current).max(epoch);
+    }
+
+    /// Every account's epoch, for a checkpoint.
+    pub(crate) fn snapshot(&self) -> Vec<(AccountId, u32)> {
+        let epochs = self.epochs.read().unwrap_or_else(PoisonError::into_inner);
+        epochs.iter().map(|(a, e)| (*a, *e)).collect()
     }
 }
 

@@ -39,6 +39,7 @@
 - Full commit pipeline (snapshot isolation, serializable option, group commit, bounded queue, fsync halt), write classes, snapshots and versioned overlays, checkpoints, log truncation, catalog locks.
   - [x] Group commit with a bounded queue; a failed write, sync, or apply halts writes (`PLAN.md` D-045).
   - [x] Snapshots: `db.read` with versions kept for running snapshots (`PLAN.md` D-052).
+  - [x] Checkpoints and log truncation (`PLAN.md` D-056).
 - Key hierarchy through key-vault and crypt-io; sealed auth sections.
   - [x] Sealed and padded auth sections in the log (`PLAN.md` D-047).
   - [x] Sealed account records in the account store (`PLAN.md` D-048).

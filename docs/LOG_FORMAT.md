@@ -201,6 +201,20 @@ an Argon2id string in the PHC format.
 The entity record is the one stored in the content store; see
 [FILE_FORMATS.md](./FILE_FORMATS.md#entity-record).
 
+## Checkpoints and truncation
+
+A checkpoint makes every engine's own files hold everything through the last
+visible commit, then drops the log records below the lowest engine mark; the
+record at that mark stays, so the log is never empty. A checkpoint runs after
+each `checkpoint_every` bytes of log (64 MiB by default) and at close (close
+does not truncate; the next open does, after recovery). wal-db drops whole
+segments, so disk space comes back 16 MiB at a time.
+
+A truncated log starts at a later sequence number. Recovery accepts that only
+when every engine holds every commit before the first record; otherwise the
+database stays closed. The catalog file then holds every catalog change the
+log no longer has.
+
 ## Reading a log
 
 A record is accepted only when:

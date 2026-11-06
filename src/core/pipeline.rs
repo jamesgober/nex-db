@@ -34,7 +34,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{
-        Arc, Condvar, Mutex, PoisonError,
+        Arc, Condvar, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -63,6 +63,9 @@ pub(crate) const MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(60);
 /// During recovery, engines drop their snapshot versions every this many
 /// records (no snapshot runs before recovery ends).
 const REPLAY_RECLAIM_EVERY: u64 = 1024;
+
+/// Log bytes written between checkpoints, by default: 64 MiB.
+pub(crate) const CHECKPOINT_EVERY: u64 = 64 * 1024 * 1024;
 
 /// Commits between taking a sequence number and becoming visible, before a
 /// new commit is refused with `Error::Busy`. Bounds the memory held by
@@ -128,6 +131,12 @@ pub(crate) struct Core {
     snapshots: Mutex<BTreeMap<Seq, (usize, Instant)>>,
     /// Serializes collection definitions (id choice and name check).
     defining: Mutex<()>,
+    /// One checkpoint at a time.
+    checkpointing: Mutex<()>,
+    /// Log bytes written since the last checkpoint.
+    since_checkpoint: AtomicU64,
+    /// Log bytes that start a checkpoint.
+    checkpoint_every: AtomicU64,
     catalog: Catalog,
     _lock: DirLock,
 }
@@ -160,6 +169,9 @@ impl Core {
             halted: AtomicBool::new(false),
             snapshots: Mutex::new(BTreeMap::new()),
             defining: Mutex::new(()),
+            checkpointing: Mutex::new(()),
+            since_checkpoint: AtomicU64::new(0),
+            checkpoint_every: AtomicU64::new(CHECKPOINT_EVERY),
             catalog,
             _lock: lock,
         };
@@ -175,6 +187,11 @@ impl Core {
         defaults: &[Collection],
     ) -> Result<()> {
         let last = self.replay(engines)?;
+        // The engines hold everything replay read: drop what the last
+        // checkpoint covers.
+        let mut floor = Seq::MAX;
+        engines.each(&mut |engine| floor = floor.min(engine.durable_through()));
+        self.truncate_held(floor)?;
         self.commit
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -291,14 +308,77 @@ impl Core {
         Ok(id)
     }
 
-    /// Write every engine's applied changes to its own files. Best effort:
-    /// the log holds every commit, so a failure only lengthens the next
-    /// replay.
-    pub(crate) fn checkpoint(&self, engines: &dyn Registry) {
-        let _ = self.catalog.checkpoint();
-        engines.each(&mut |engine| {
-            let _ = engine.checkpoint();
+    /// Start a checkpoint after `bytes` more log bytes (at least 1).
+    pub(crate) fn set_checkpoint_every(&self, bytes: u64) {
+        self.checkpoint_every.store(bytes.max(1), Ordering::Release);
+    }
+
+    /// Make every engine's files hold everything visible now. With
+    /// `truncate`, then drop the log records every engine holds; the record
+    /// at the lowest mark stays, so the log is never empty and replay can
+    /// check where it starts. Closing the database checkpoints without
+    /// truncating, so a clean close leaves the whole log; the next open
+    /// truncates once recovery is done.
+    ///
+    /// # Errors
+    ///
+    /// The first engine's error; the log is then not truncated.
+    pub(crate) fn checkpoint(&self, engines: &dyn Registry, truncate: bool) -> Result<()> {
+        let one = self
+            .checkpointing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.checkpoint_locked(engines, truncate, &one)
+    }
+
+    /// The checkpoint itself, with the checkpoint lock held.
+    fn checkpoint_locked(
+        &self,
+        engines: &dyn Registry,
+        truncate: bool,
+        _one: &MutexGuard<'_, ()>,
+    ) -> Result<()> {
+        if self.halted() {
+            return Err(halted_error());
+        }
+        let upto = self.visible();
+        let mut floor = Seq::MAX;
+        let mut failed = None;
+        engines.each(&mut |engine| match engine.checkpoint(upto) {
+            Ok(mark) => floor = floor.min(mark),
+            Err(err) => failed = failed.take().or(Some(err)),
         });
+        if let Some(err) = failed {
+            return Err(err);
+        }
+        self.since_checkpoint.store(0, Ordering::Release);
+        if truncate {
+            self.truncate_held(floor)?;
+        }
+        Ok(())
+    }
+
+    /// Drop the log records below `floor`, the lowest mark of all engines.
+    fn truncate_held(&self, floor: Seq) -> Result<()> {
+        if floor != Seq::MAX && floor > 1 {
+            self.log.truncate_below(floor)?;
+        }
+        Ok(())
+    }
+
+    /// Run a checkpoint when enough log was written since the last one and
+    /// no other is running. Best effort: a failed checkpoint leaves the log
+    /// as it is.
+    fn maybe_checkpoint(&self, engines: &dyn Registry) {
+        let due = self.since_checkpoint.load(Ordering::Acquire)
+            >= self.checkpoint_every.load(Ordering::Acquire);
+        if !due {
+            return;
+        }
+        // Another commit is already checkpointing: leave it to that one.
+        if let Ok(one) = self.checkpointing.try_lock() {
+            let _ = self.checkpoint_locked(engines, true, &one);
+        }
     }
 
     fn write_or_fail(
@@ -331,6 +411,7 @@ impl Core {
         drop(state);
         if result.is_ok() {
             self.reclaim(engines);
+            self.maybe_checkpoint(engines);
         }
         result.map_err(Attempt::Failed)
     }
@@ -383,6 +464,9 @@ impl Core {
             )));
         }
 
+        let _ = self
+            .since_checkpoint
+            .fetch_add(bytes.len() as u64, Ordering::AcqRel);
         let bytes: Arc<[u8]> = bytes.into();
         for work in staged {
             work.reserve(seq);
@@ -489,19 +573,29 @@ impl Core {
 
     /// Replay the log into the engines. Returns the last sequence number.
     fn replay(&self, engines: &dyn Registry) -> Result<Seq> {
-        let mut floor = self.catalog.durable_through();
-        let mut top = floor;
+        // Engines skip what they hold; the catalog file holds every catalog
+        // change it applied, so replay never skips past it.
+        let mut engines_floor = Seq::MAX;
+        let mut top = self.catalog.durable_through();
         engines.each(&mut |engine| {
-            floor = floor.min(engine.durable_through());
+            engines_floor = engines_floor.min(engine.durable_through());
             top = top.max(engine.durable_through());
         });
-        let mut last: Seq = 0;
+        let floor = engines_floor.min(self.catalog.durable_through());
+        let mut last: Option<Seq> = None;
         self.log.replay(|lsn, bytes| {
             let view = record::decode(bytes, lsn)?;
-            if view.seq != last + 1 {
+            let expected = match last {
+                Some(last) => last + 1,
+                // A log truncated by a checkpoint starts later: every
+                // engine must hold everything before its first record.
+                None if view.seq == 1 || view.seq - 1 <= engines_floor => view.seq,
+                None => return Err(Error::corrupt("the commit log (records missing)", view.seq)),
+            };
+            if view.seq != expected {
                 return Err(Error::corrupt("the commit log sequence", view.seq));
             }
-            last = view.seq;
+            last = Some(view.seq);
             if view.seq % REPLAY_RECLAIM_EVERY == 0 {
                 engines.each(&mut |engine| engine.reclaim(view.seq - 1));
             }
@@ -510,6 +604,7 @@ impl Core {
             }
             self.apply_record(engines, &view)
         })?;
+        let last = last.unwrap_or(0);
         // An engine holding a commit the log does not have means the log
         // lost records: refuse to open rather than serve a mix.
         if top > last {

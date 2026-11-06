@@ -169,6 +169,7 @@ From 0.3 the builder configures what `open` takes by default:
 | `.keys(Keys::vault(name))`: the OS keychain | 0.4 | |
 | `.auth(AuthMode::embedded())`, `AuthMode::separate_process()` | 0.3 / 0.5 | embedded |
 | `.max_snapshot_age(Duration)` | 0.3 | 60 s |
+| `.checkpoint_every(bytes)`: log written between checkpoints, which bound the log and the time an open takes | 0.3 | 64 MiB |
 | `.commit_queue(n)`, `.hashing_slots(n)` | 0.3 | 4,096; one per CPU |
 | `.idempotency_window(Duration)` | 0.3 | 24 hours |
 | `.cache(bytes)` | 0.4 | 256 MiB |

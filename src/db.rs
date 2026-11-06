@@ -15,7 +15,7 @@ use crate::{
         catalog::{DEFAULT_REALM, DEFAULT_SPACE},
         fs,
         keys::{self, Keys},
-        pipeline::{ATTEMPTS, Attempt, Core, SnapshotGuard},
+        pipeline::{ATTEMPTS, Attempt, CHECKPOINT_EVERY, Core, SnapshotGuard},
         record::Seq,
     },
     engine::{Engine, EngineId, Registry, Staged},
@@ -97,6 +97,7 @@ impl Registry for Engines {
 pub struct Builder {
     dir: std::path::PathBuf,
     keys: Keys,
+    checkpoint_every: u64,
 }
 
 impl Builder {
@@ -104,6 +105,16 @@ impl Builder {
     /// database directory; see [`Keys`].
     pub fn keys(mut self, keys: Keys) -> Self {
         self.keys = keys;
+        self
+    }
+
+    /// How much log to write between checkpoints, in bytes (default 64
+    /// MiB). A checkpoint writes every engine's own files and drops the log
+    /// records they hold, so the log, and the time an open takes, stay
+    /// bounded. It runs on the thread of the commit that crosses the mark,
+    /// after that commit is visible, and at close.
+    pub fn checkpoint_every(mut self, bytes: u64) -> Self {
+        self.checkpoint_every = bytes;
         self
     }
 
@@ -155,11 +166,13 @@ impl Database {
         Builder {
             dir: path.as_ref().to_path_buf(),
             keys: Keys::default(),
+            checkpoint_every: CHECKPOINT_EVERY,
         }
     }
 
     fn open_with(builder: Builder) -> Result<Database> {
         let (core, new_database) = Core::open(&builder.dir)?;
+        core.set_checkpoint_every(builder.checkpoint_every);
         let dir = core.dir().to_path_buf();
         let auth_dir = dir.join("auth");
         fs::create_dir(&auth_dir)?;
@@ -361,7 +374,7 @@ impl Drop for Database {
     fn drop(&mut self) {
         // Best effort: the log holds every commit, so a failure here only
         // means a longer replay at the next open.
-        self.core.checkpoint(&self.engines);
+        let _ = self.core.checkpoint(&self.engines, false);
     }
 }
 

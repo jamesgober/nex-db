@@ -13,12 +13,14 @@ All notable changes to `nex-db` are documented in this file. The format is based
 - `Auth::verify_password`, `Login`, `Auth::standing`, `set_standing`, and `Standing`; ten failed sign-ins within fifteen minutes lock an account out for fifteen minutes. `SignIn::LockedOut`.
 - `RevokeReason::Rotated` and `RevokeReason::SignedOutEverywhere`.
 - `Database::builder`, `Builder`, and `Keys`: the root key from a file outside the directory (`Keys::file`) or an environment variable (`Keys::env`). `auth/key.check` makes the wrong key fail as `KeyUnavailable`.
+- Checkpoints and log truncation: the log stays bounded and an open replays only what came after the last checkpoint. `Builder::checkpoint_every` (64 MiB by default). Sessions and epochs are kept in a sealed `auth/sessions.ckpt`.
 - `Database::read`, `Read`, `AuthRead`, and `ContentRead`: reads across engines at one snapshot. `Error::SnapshotTooOld` (NEX-1009) after 60 seconds.
 
 ### Changed
 
 - Auth sections in the log are sealed and padded (format 2); account records in the account store are sealed. Logs and stores written by 0.1 and 0.2 still read.
-- `Engine::apply` (internal) takes the decoded section.
+- `Engine::apply` (internal) takes the decoded section; `Engine::checkpoint` takes the mark to reach.
+- wal-db 1.1.1.
 
 ### Fixed
 

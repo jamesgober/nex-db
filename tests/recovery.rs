@@ -308,3 +308,76 @@ fn test_key_outside_the_directory_is_needed_to_open() {
         SignIn::Success { .. }
     ));
 }
+
+fn checkpointing(dir: &Path) -> Database {
+    // A checkpoint, with truncation, after every commit.
+    Database::builder(dir).checkpoint_every(1).open().unwrap()
+}
+
+#[test]
+fn test_truncated_log_reopens_with_everything() {
+    let dir = TempDir::new("truncated");
+    let tokens = {
+        let db = checkpointing(&dir.0);
+        let tokens = populate(&db, 0, 6);
+        assert!(db.auth().revoke(&tokens[1]).unwrap());
+        let account = match db.auth().validate(&tokens[2]).unwrap() {
+            Validation::Valid(s) => s.account(),
+            other => panic!("{other:?}"),
+        };
+        let _ = db.auth().revoke_all(account).unwrap();
+        tokens
+    };
+    let db = Database::open(&dir.0).unwrap();
+    assert!(matches!(
+        db.auth().validate(&tokens[0]).unwrap(),
+        Validation::Valid(_)
+    ));
+    assert_eq!(
+        db.auth().validate(&tokens[1]).unwrap(),
+        Validation::Revoked {
+            reason: RevokeReason::Revoked
+        }
+    );
+    assert_eq!(
+        db.auth().validate(&tokens[2]).unwrap(),
+        Validation::Revoked {
+            reason: RevokeReason::SignedOutEverywhere
+        }
+    );
+    assert!(matches!(
+        db.auth()
+            .sign_in("u5@example.com", PASSWORD, SessionSpec::web())
+            .unwrap(),
+        SignIn::Success { .. }
+    ));
+    assert!(
+        db.content()
+            .resolve(nex_db::DEFAULT_SITE, "/u/5")
+            .unwrap()
+            .is_some()
+    );
+    drop(db);
+
+    // The log no longer starts at the first commit: without its file, the
+    // catalog cannot be rebuilt, and the database stays closed.
+    fs::remove_file(dir.0.join("core").join("catalog.ckpt")).unwrap();
+    assert!(matches!(Database::open(&dir.0), Err(Error::Corrupt { .. })));
+}
+
+#[test]
+fn test_truncated_log_without_its_session_checkpoint_stays_closed() {
+    let dir = TempDir::new("no-sessions");
+    {
+        let db = checkpointing(&dir.0);
+        let _ = populate(&db, 0, 3);
+    }
+    let file = dir.0.join("auth").join("sessions.ckpt");
+    let mut bytes = fs::read(&file).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    fs::write(&file, &bytes).unwrap();
+    assert!(matches!(Database::open(&dir.0), Err(Error::Corrupt { .. })));
+    fs::remove_file(&file).unwrap();
+    assert!(matches!(Database::open(&dir.0), Err(Error::Corrupt { .. })));
+}

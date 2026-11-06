@@ -11,8 +11,11 @@ mod routes;
 use std::{
     collections::HashSet,
     fmt,
-    path::Path,
-    sync::atomic::{AtomicU64, Ordering},
+    path::{Path, PathBuf},
+    sync::{
+        Mutex, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use lsm_db::{Batch, Lsm};
@@ -70,9 +73,14 @@ fn route_key(site: &str, path: &str) -> Vec<u8> {
 /// The content engine.
 pub(crate) struct ContentEngine {
     collection: u32,
+    dir: PathBuf,
     store: Lsm,
-    /// Highest seq the store holds.
+    /// Highest seq the store holds (in memory or on disk).
     applied: AtomicU64,
+    /// Highest seq the store holds on disk: the mark at the last flush.
+    durable: AtomicU64,
+    /// Keeps a checkpoint's mark from interleaving with an apply's batch.
+    writing: Mutex<()>,
     routes: RouteTable,
     /// Entity versions kept for running snapshots.
     versions: Versions,
@@ -116,8 +124,11 @@ impl ContentEngine {
         }
         Ok(ContentEngine {
             collection,
+            dir: dir.to_path_buf(),
             store,
             applied: AtomicU64::new(applied),
+            durable: AtomicU64::new(applied),
+            writing: Mutex::new(()),
             routes,
             versions: Versions::new(),
             conflicts: ConflictTable::new(),
@@ -199,8 +210,11 @@ impl Engine for ContentEngine {
             batch.put(key, record);
         }
         batch.put(META_APPLIED, seq.to_le_bytes());
-        self.store.write(batch)?;
-        self.applied.store(seq, Ordering::Release);
+        {
+            let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
+            self.store.write(batch)?;
+            self.applied.store(seq, Ordering::Release);
+        }
         for (entry, _) in &entries {
             if let Some((site, path)) = entry.route() {
                 self.routes.insert(site, path, seq, route_entry(entry));
@@ -210,12 +224,26 @@ impl Engine for ContentEngine {
     }
 
     fn durable_through(&self) -> Seq {
-        self.applied.load(Ordering::Acquire)
+        self.durable.load(Ordering::Acquire)
     }
 
-    fn checkpoint(&self) -> Result<Seq> {
+    fn checkpoint(&self, upto: Seq) -> Result<Seq> {
+        // The store holds every content section through `upto`; say so in
+        // its mark, so a store untouched by recent commits does not hold the
+        // log back.
+        let mark = {
+            let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
+            let mark = upto.max(self.applied.load(Ordering::Acquire));
+            let mut batch = Batch::new();
+            batch.put(META_APPLIED, mark.to_le_bytes());
+            self.store.write(batch)?;
+            self.applied.store(mark, Ordering::Release);
+            mark
+        };
         self.store.flush()?;
-        Ok(self.durable_through())
+        crate::core::fs::sync_names(&self.dir)?;
+        let _ = self.durable.fetch_max(mark, Ordering::AcqRel);
+        Ok(mark)
     }
 
     fn reclaim(&self, watermark: Seq) {

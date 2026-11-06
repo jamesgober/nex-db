@@ -17,7 +17,7 @@ pub(crate) mod types;
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Mutex, OnceLock, PoisonError,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -41,6 +41,7 @@ use crate::{
     core::{
         codec::{Reader, Writer},
         conflict::ConflictTable,
+        fs,
         keys::RootKey,
         now_ms,
         pipeline::SnapshotGuard,
@@ -109,6 +110,20 @@ const MAX_SESSIONS: usize = 1_000_000;
 
 /// Key of the account store's applied-through mark.
 const META_APPLIED: &[u8] = b"\0meta/applied";
+
+/// The session checkpoint file, next to the account store.
+const SESSIONS_FILE: &str = "sessions.ckpt";
+
+/// Format of the session checkpoint file.
+const SESSIONS_FORMAT: u16 = 1;
+
+/// Slot kinds in the session checkpoint.
+const SLOT_LIVE: u8 = 1;
+const SLOT_REVOKED: u8 = 2;
+
+/// A revocation by `revoke_all`, kept only in checkpoints (the log raises
+/// the epoch instead).
+const REASON_SIGNED_OUT_EVERYWHERE: u8 = 3;
 
 /// Account record format.
 const ACCOUNT_FORMAT: u8 = 1;
@@ -199,6 +214,10 @@ fn check_password(password: &str) -> Result<()> {
 /// The auth engine.
 pub(crate) struct AuthEngine {
     collection: u32,
+    /// The account store's directory.
+    dir: PathBuf,
+    /// The session checkpoint file.
+    sessions_file: PathBuf,
     token_key: Zeroizing<[u8; 32]>,
     identifier_key: Zeroizing<[u8; 32]>,
     /// Seals and opens this engine's log sections.
@@ -208,6 +227,12 @@ pub(crate) struct AuthEngine {
     accounts: Lsm,
     /// Highest seq whose account changes the account store holds.
     applied: AtomicU64,
+    /// The account store's mark at its last flush.
+    accounts_durable: AtomicU64,
+    /// Highest seq whose session changes the session checkpoint holds.
+    sessions_through: AtomicU64,
+    /// Keeps a checkpoint's mark from interleaving with an apply's batch.
+    writing: Mutex<()>,
     sessions: SessionTable,
     epochs: EpochTable,
     /// Account record versions kept for running snapshots.
@@ -236,6 +261,9 @@ impl AuthEngine {
     /// Open the engine's store in `dir`.
     pub(crate) fn open(dir: &Path, root: &RootKey, collection: u32) -> Result<Self> {
         let accounts = Lsm::open(dir)?;
+        let sessions_file = dir
+            .parent()
+            .map_or_else(|| PathBuf::from(SESSIONS_FILE), |p| p.join(SESSIONS_FILE));
         let applied = match accounts.get(META_APPLIED)? {
             Some(bytes) => {
                 let bytes: [u8; 8] = bytes
@@ -247,14 +275,19 @@ impl AuthEngine {
             None => 0,
         };
         let max_hashing = std::thread::available_parallelism().map_or(1, usize::from);
-        Ok(AuthEngine {
+        let engine = AuthEngine {
             collection,
+            dir: dir.to_path_buf(),
+            sessions_file,
             token_key: root.derive(TOKEN_KEY_LABEL),
             identifier_key: root.derive(IDENTIFIER_KEY_LABEL),
             seal_key: root.derive(SEAL_KEY_LABEL),
             file_key: root.derive(FILE_KEY_LABEL),
             accounts,
             applied: AtomicU64::new(applied),
+            accounts_durable: AtomicU64::new(applied),
+            sessions_through: AtomicU64::new(0),
+            writing: Mutex::new(()),
             sessions: SessionTable::new(),
             epochs: EpochTable::new(),
             versions: Versions::new(),
@@ -263,7 +296,98 @@ impl AuthEngine {
             hashing: AtomicUsize::new(0),
             max_hashing,
             dummy: OnceLock::new(),
-        })
+        };
+        engine.load_sessions()?;
+        Ok(engine)
+    }
+
+    /// Load the session checkpoint, when there is one. A damaged one keeps
+    /// the database closed: the log below its mark may be gone.
+    fn load_sessions(&self) -> Result<()> {
+        let corrupt = || Error::corrupt("the session checkpoint", 0);
+        let Some(bytes) = fs::read_optional(&self.sessions_file)? else {
+            return Ok(());
+        };
+        let mut r = Reader::new(&bytes, "the session checkpoint", 0);
+        if r.u16()? != SESSIONS_FORMAT {
+            return Err(corrupt());
+        }
+        let through = r.u64()?;
+        let sealed = r.bytes32()?;
+        r.finish()?;
+        let plain = open_value(&self.file_key, &sessions_aad(through), sealed)?;
+        let mut r = Reader::new(&plain, "the session checkpoint", 0);
+        for _ in 0..r.u32()? {
+            let account = AccountId::from_bytes(r.fixed()?);
+            self.epochs.raise(account, r.u32()?);
+        }
+        for _ in 0..r.u32()? {
+            let digest = r.fixed::<32>()?;
+            let slot = match r.u8()? {
+                SLOT_LIVE => Slot::Live(Session {
+                    account: AccountId::from_bytes(r.fixed()?),
+                    created_ms: r.u64()?,
+                    expires_ms: r.u64()?,
+                    epoch: r.u32()?,
+                }),
+                SLOT_REVOKED => Slot::Revoked(match r.u8()? {
+                    REASON_REVOKED => RevokeReason::Revoked,
+                    REASON_ROTATED => RevokeReason::Rotated,
+                    REASON_SIGNED_OUT_EVERYWHERE => RevokeReason::SignedOutEverywhere,
+                    _ => return Err(corrupt()),
+                }),
+                _ => return Err(corrupt()),
+            };
+            self.sessions.restore(digest, slot);
+        }
+        r.finish()?;
+        self.sessions_through.store(through, Ordering::Release);
+        Ok(())
+    }
+
+    /// Write the session checkpoint through `through`: sessions not yet
+    /// expired, tombstones, and epochs, sealed under the file key.
+    fn save_sessions(&self, through: Seq) -> Result<()> {
+        let epochs = self.epochs.snapshot();
+        let slots = self.sessions.snapshot(now_ms());
+        let mut plain =
+            Zeroizing::new(Vec::with_capacity(8 + epochs.len() * 20 + slots.len() * 70));
+        let mut w = Writer::new(&mut plain);
+        w.u32(u32::try_from(epochs.len()).map_err(|_| Error::invalid("epochs", "too many"))?);
+        for (account, epoch) in &epochs {
+            w.bytes(account.as_bytes());
+            w.u32(*epoch);
+        }
+        w.u32(u32::try_from(slots.len()).map_err(|_| Error::invalid("sessions", "too many"))?);
+        for (digest, slot) in &slots {
+            w.bytes(digest);
+            match slot {
+                Slot::Live(session) => {
+                    w.u8(SLOT_LIVE);
+                    w.bytes(session.account.as_bytes());
+                    w.u64(session.created_ms);
+                    w.u64(session.expires_ms);
+                    w.u32(session.epoch);
+                }
+                Slot::Revoked(reason) => {
+                    w.u8(SLOT_REVOKED);
+                    w.u8(match reason {
+                        RevokeReason::Rotated => REASON_ROTATED,
+                        RevokeReason::SignedOutEverywhere => REASON_SIGNED_OUT_EVERYWHERE,
+                        _ => REASON_REVOKED,
+                    });
+                }
+            }
+        }
+        let sealed = seal_value(&self.file_key, &sessions_aad(through), &plain)?;
+        let mut file = Vec::with_capacity(14 + sealed.len());
+        let mut w = Writer::new(&mut file);
+        w.u16(SESSIONS_FORMAT);
+        w.u64(through);
+        w.bytes32(&sealed)?;
+        fs::write_atomic(&self.sessions_file, &file)?;
+        self.sessions_through.store(through, Ordering::Release);
+        Ok(())
     }
 
     fn token_digest(&self, random: &[u8; 32]) -> [u8; 32] {
@@ -663,12 +787,17 @@ impl Engine for AuthEngine {
             }
             if !batch.is_empty() {
                 batch.put(META_APPLIED, seq.to_le_bytes());
+                let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
                 self.accounts.write(batch)?;
                 self.applied.store(seq, Ordering::Release);
             }
         }
 
-        // Sessions live in memory and are rebuilt from the whole log.
+        // Sessions live in memory: the checkpoint holds them through its
+        // mark, and the log the rest.
+        if seq <= self.sessions_through.load(Ordering::Acquire) {
+            return Ok(());
+        }
         for op in ops {
             match op {
                 Op::IssueSession { digest, session } => self.sessions.insert(digest, session),
@@ -683,14 +812,25 @@ impl Engine for AuthEngine {
     }
 
     fn durable_through(&self) -> Seq {
-        // The session table has no checkpoint in this version, so recovery
-        // replays the auth sections of the whole log. Account changes the
-        // store already holds are skipped by `apply`.
-        0
+        self.accounts_durable
+            .load(Ordering::Acquire)
+            .min(self.sessions_through.load(Ordering::Acquire))
     }
 
-    fn checkpoint(&self) -> Result<Seq> {
+    fn checkpoint(&self, upto: Seq) -> Result<Seq> {
+        let mark = {
+            let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
+            let mark = upto.max(self.applied.load(Ordering::Acquire));
+            let mut batch = Batch::new();
+            batch.put(META_APPLIED, mark.to_le_bytes());
+            self.accounts.write(batch)?;
+            self.applied.store(mark, Ordering::Release);
+            mark
+        };
         self.accounts.flush()?;
+        fs::sync_names(&self.dir)?;
+        let _ = self.accounts_durable.fetch_max(mark, Ordering::AcqRel);
+        self.save_sessions(upto)?;
         Ok(self.durable_through())
     }
 
@@ -1011,6 +1151,14 @@ enum Checked {
     Wrong(Option<AccountId>),
     /// The password matched; the account may not sign in until then.
     Blocked(Option<SystemTime>),
+}
+
+/// Associated data of the session checkpoint: binds it to its mark.
+fn sessions_aad(through: Seq) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(SESSIONS_FILE.len() + 8);
+    aad.extend_from_slice(SESSIONS_FILE.as_bytes());
+    aad.extend_from_slice(&through.to_le_bytes());
+    aad
 }
 
 /// Associated data of a sealed section: what binds the ciphertext to its

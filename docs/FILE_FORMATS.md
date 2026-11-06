@@ -39,6 +39,7 @@ length, then the bytes).
 ├─ auth/
 │   ├─ keys              the root key (default key source only)
 │   ├─ key.check         a check of the root key
+│   ├─ sessions.ckpt     sessions and epochs, as of the last checkpoint
 │   └─ accounts/         the account store (lsm-db)
 └─ content/
     └─ store/            the content store (lsm-db)
@@ -130,7 +131,9 @@ changes reach a store as one batch that also writes the store's mark:
 | `\0meta/applied` | `u64`: the last commit sequence number the store holds |
 
 On open, recovery replays the commit log from the lowest mark of all engines;
-a store skips the commits it already holds. A store whose mark is above the
+a store skips the commits it already holds. A checkpoint writes `upto` (every
+commit visible when it started) as the mark, flushes the store, and syncs its
+directory, so a store no recent commit touched does not hold the log back. A store whose mark is above the
 end of the log means the log lost records, and the database stays closed.
 
 Keys start with the collection id (`u32`, **big endian**, so a collection's
@@ -185,8 +188,36 @@ account record            format u8 (1), created ms u64, identifier digest [32],
 credential record         kind u8 (1 = password), password hash str16
 ```
 
-Sessions are not stored here: in this version they live in memory and are
-rebuilt from the commit log at open.
+Sessions are not stored here; see [auth/sessions.ckpt](#authsessionsckpt).
+
+## auth/sessions.ckpt
+
+Sessions and account epochs live in memory. A checkpoint writes them here,
+whole, with the sequence number they hold through; at open they are loaded
+and the log after that number is replayed.
+
+```text
+format u16                1
+through u64               the checkpoint holds every commit up to this one
+sealed bytes32            as a sealed account record (marker, key id, nonce,
+                          ciphertext, tag) under the file key, with
+                          "sessions.ckpt" and `through` as associated data
+```
+
+The plaintext:
+
+```text
+epoch count u32
+epoch count times:        account [16], epoch u32
+slot count u32
+slot count times:         token digest [32], kind u8, then by kind:
+    1 live session        account [16], created ms u64, expires ms u64, epoch u32
+    2 revoked             reason u8 (1 revoked, 2 rotated, 3 signed out everywhere)
+```
+
+Sessions already expired are left out. A damaged file keeps the database
+closed: the log below its mark may be gone, so nothing else holds those
+sessions.
 
 ### Content store (`content/store/`)
 

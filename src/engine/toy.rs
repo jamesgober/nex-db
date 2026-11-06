@@ -124,9 +124,10 @@ impl Engine for ToyEngine {
         self.durable.load(Ordering::Acquire)
     }
 
-    fn checkpoint(&self) -> Result<Seq> {
+    fn checkpoint(&self, upto: Seq) -> Result<Seq> {
         let cells = self.cells.lock().unwrap_or_else(PoisonError::into_inner);
-        let through = self.applied.load(Ordering::Acquire);
+        let through = upto.max(self.applied.load(Ordering::Acquire));
+        self.applied.store(through, Ordering::Release);
         let mut bytes = Vec::new();
         let mut w = Writer::new(&mut bytes);
         w.u64(through);
@@ -349,7 +350,7 @@ fn test_toy_checkpointed_engine_skips_what_it_holds() {
         let two = ToyStaged::new(&db.toys.b, b).put(1, i);
         db.commit(&[&one, &two]).unwrap();
     }
-    let _ = db.toys.a.checkpoint().unwrap();
+    let _ = db.toys.a.checkpoint(db.core.visible()).unwrap();
     drop(db);
 
     let db = Db::open(&dir).unwrap();
@@ -477,7 +478,7 @@ fn test_toy_engine_ahead_of_log_refuses_open() {
     let a = db.collection("a");
     db.commit(&[&ToyStaged::new(&db.toys.a, a).put(1, 1)])
         .unwrap();
-    let _ = db.toys.a.checkpoint().unwrap();
+    let _ = db.toys.a.checkpoint(db.core.visible()).unwrap();
     drop(db);
     // A checkpoint claiming a commit the log never had.
     let file = dir.join("toy").join("toy-62.state");

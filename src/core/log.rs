@@ -59,6 +59,31 @@ impl CommitLog {
         Ok(())
     }
 
+    /// Drop every record below the first one whose sequence number is at
+    /// least `seq`; that record and the ones after it stay. Does nothing when
+    /// no record reaches `seq`, so the log is never emptied.
+    pub(crate) fn truncate_below(&self, seq: u64) -> Result<()> {
+        let mut keep = None;
+        for entry in self.wal.iter()? {
+            let record = entry.map_err(Error::from)?;
+            // The sequence number follows the two-byte record format.
+            let at = record
+                .data()
+                .get(2..10)
+                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                .map(u64::from_le_bytes)
+                .ok_or(Error::corrupt("a log record", record.lsn().get()))?;
+            if at >= seq {
+                keep = Some(record.lsn());
+                break;
+            }
+        }
+        if let Some(lsn) = keep {
+            let _ = self.wal.truncate_before(lsn)?;
+        }
+        Ok(())
+    }
+
     /// Call `f` with each record in log order, with its log offset.
     pub(crate) fn replay(&self, mut f: impl FnMut(u64, &[u8]) -> Result<()>) -> Result<()> {
         for entry in self.wal.iter()? {

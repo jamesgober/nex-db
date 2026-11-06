@@ -93,7 +93,7 @@ let account = db.commit(|tx| {
 })?;
 ```
 
-Tier 1 (above) covers the common uses with no builder; Tier 2 adds a builder, type definitions, listings, and pinned reads; Tier 3 is the engine contract and the change feed. `docs/API.md` (0.2) holds the full API.
+Tier 1 (above) covers the common uses with no builder; Tier 2 adds a builder, type definitions, listings, and pinned reads; Tier 3 is the change feed, observers, and backups. The engine contract is internal (D-030). `docs/API.md` holds the full API.
 
 ## 7. Security requirements
 
@@ -108,9 +108,9 @@ Tier 1 (above) covers the common uses with no builder; Tier 2 adds a builder, ty
 
 | Id | Question | Recommendation |
 |---|---|---|
-| OD-1 | when the repository goes public and the crate is published | private through 0.x; decide at 0.8 |
-| OD-2 | password verification inside the auth engine (changes WASP's identity store trait) | yes |
-| OD-3 | nex-db as the store for James's site and WASP's first deployment | yes |
+| OD-1 | when the crate is published | decide at 0.8. The repository itself went public on 2026-11-02 (D-042); `publish = false` stays until James decides |
+| OD-2 | password verification inside the auth engine (changes the application's identity store trait) | yes |
+| OD-3 | nex-db as the store for James's site and the first deployment | yes |
 | OD-4 | 1.0 scope and the order of work after 1.0 | 1.0: auth, content, split auth, read replica; then log, blob, hot engines, then server and distribution |
 | OD-5 | upstream releases removing third-party runtime dependencies from the building blocks | yes, before 1.0 |
 | OD-6 | when to start a query language | after 1.0, read-oriented first |
@@ -145,13 +145,28 @@ Tier 1 (above) covers the common uses with no builder; Tier 2 adds a builder, ty
 | D-020 | (0.1) Passwords: Argon2id with crypt-io's defaults (19 MiB, 2 passes, 1 lane); at most one hash per core at a time (`Error::Busy` beyond); an unknown identifier costs one Argon2id check against a dummy hash |
 | D-021 | (0.1) Content: entities in lsm-db; routes in standard maps (site, then path) behind the route-index seam, rebuilt from the store at open. Replaced in 0.4. A path belongs to a site; the default site is `default` |
 | D-022 | (0.1) Directory lock: the standard library file lock when built with Rust 1.89 or later; below that, an exclusive-share open on Windows and a pid file on Unix, checked through `/proc` on Linux and `ps` elsewhere (when `ps` cannot run, the directory stays locked) |
-| D-023 | (0.1) The engine contract (`Engine`, `Staged`) is internal until the design lock (0.2) |
+| D-023 | (0.1) The engine contract (`Engine`, `Staged`) is internal until the design lock (0.2). Settled by D-030 |
 | D-024 | (0.1) Engines sit behind the `auth` and `content` features (both default). A database that uses an engine the build lacks refuses to open |
 | D-025 | (0.1) Limits: identifier 320 bytes, password 1024 bytes, session lifetime 400 days, 1,000,000 sessions, names 64 bytes, site 253 bytes, path 2048 bytes, 256 fields, text 1 MiB, commit 16 MiB. Configurable from 0.3 |
 | D-026 | (0.1) Known gap until 0.3: auth sections and account records are not sealed, so the Argon2id hash is stored in plain form in the log and the account store |
-| D-027 | (0.1) Known gap until wal-db 1.1 (requested): wal-db 1.0 cuts the log at the first damaged record when it opens, also in the middle of the log. D-015's check catches this whenever a store has flushed past the cut |
+| D-027 | (0.1) Known gap until wal-db 1.1 (requested): wal-db 1.0 cuts the log at the first damaged record when it opens, also in the middle of the log. D-015's check catches this whenever a store has flushed past the cut. Closed by D-041 |
 | D-028 | (0.1) The dev profile builds `argon2` and `blake2` with optimisation, so tests and examples hash at release speed |
-| D-029 | (0.1) `cargo audit` ignores RUSTSEC-2026-0385 (`ctutils`) in `.cargo/audit.toml`: the crate is reachable only through crypt-io features nex-db does not enable, so it is not built (`cargo deny`, which follows enabled features, passes). Removed when nex-db moves to crypt-io 1.2.2 |
+| D-029 | (0.1) `cargo audit` ignores RUSTSEC-2026-0385 (`ctutils`) in `.cargo/audit.toml`: the crate is reachable only through crypt-io features nex-db does not enable, so it is not built (`cargo deny`, which follows enabled features, passes). Removed when nex-db moves to crypt-io 1.2.2. Done in 0.2 (D-035) |
+| D-030 | (0.2) The engine contract stays crate-internal through 1.0. Engines are modules of this crate (one package, one version), so the contract can change with the core; making it public later is additive. Cost: no engine from outside the crate before then |
+| D-031 | (0.2) Contract settled: `Engine` is `id`, `name`, `format`, `define`, `apply`, `durable_through`, `checkpoint`, `reclaim`; `Staged` is `engine`, `collection`, `is_empty`, `priority`, `validate`, `reserve`, `encode`. `define` checks a collection definition while staging (never during replay); the catalog stores the bytes. Staging is not a trait method: each engine's staging type sits in the transaction facade behind its feature. The change-feed hook (`describe`) and `health` arrive in 0.4 as provided methods with defaults |
+| D-032 | (0.2) The commit pipeline, recovery, and catalog live in `core::pipeline::Core`, which reaches engines only through a `Registry` trait the facade implements over its typed fields (no allocation per lookup). A toy engine in the tests runs on `Core` alone, also in a build with no engine feature |
+| D-033 | (0.2) Collections are created through `Core::define_collection`: definitions take their own lock (new id = highest + 1; a taken name is `AlreadyExists { what: "collection" }`), so ordinary commits never wait on a definition. The definition is checked by its engine and stored by the catalog |
+| D-034 | (0.2) Catalog format 2 adds the definition (`bytes32`, at most 64 KiB). Before 1.0 a format changes behind its number and an unknown number keeps the database closed; 0.1 was never released, so format 1 has no reader. The 0.1 example's directory must be deleted before running the 0.2 example |
+| D-035 | (0.2) crypt-io 1.2.2 (published 2026-10-26): `ctutils` and `hmac` leave the lockfile and the `cargo audit` ignore of D-029 is removed |
+| D-036 | (0.2) `docs/API.md` settles the public API through 1.0. Content, after the survey of common content systems: statuses `Draft`, `Review`, `Published`, `Archived`, `Trashed`, with visibility (`Public`, `Members`, `Password`, `Private`) and schedules kept apart from status; one working draft per entity that saves without making revisions; publish state per locale; releases; who created, updated, and published; `unique` and `singleton` type flags; references found in a body passed in by the caller; redirects 301/302/307/308 to a route or a URL; term routes; redirect chains shortened |
+| D-037 | (0.2) `Content::get(rid)` keeps reading the space's default locale; `get_in(rid, locale)` follows the fallback chain. Tier 1 keeps one argument |
+| D-038 | (0.2) Building-block checks that shape 0.3: any lsm-db write or flush error halts writes (a failed flush drops the memtable from the live handle); nex-db syncs a store's directory itself before trusting a flush; the log's 16 MiB record limit is a format constant; audit-trail takes its time from the caller (the commit's time) and needs a durable sink from nex-db; page-db writes evicted pages without waiting for the log, so auth checkpoint pages are written only after the log covers them |
+| D-039 | (0.2) Sealed auth sections need a nonce derived from the sequence number; crypt-io 1.x draws every nonce itself. Requested upstream (crypt-io 1.3). If it is not there by 0.3, sections use XChaCha20-Poly1305 with random 24-byte nonces, at 24 bytes more per auth section |
+| D-040 | (0.2) The upstream requests were drafted first and posted on James's go (2026-10-29), worded for each crate's general use: the building-block repositories are public. The wal-db strict-open request is built in wal-db's own repository; dependency clean-ups wait on OD-5 |
+| D-041 | (0.2) wal-db 1.1 with `OpenPolicy::Strict`: only an unfinished last record is cut; mid-log damage, a missing segment, or a record above the limit fails the open and leaves the log unchanged. Cost: an open that meets a damaged tail reads on to confirm nothing intact follows it (bounded by the log's size, at open only). D-015's check stays as a second guard |
+| D-042 | (2026-11-02) James made the repository public, so CI runs on GitHub's public runners on the full matrix. Repository visibility only: the crate stays `publish = false`, and tagging 1.0 still needs James. The low profile stays: no announcements, topics, or promotion |
+| D-043 | (2026-11-02) James's rule for every crate: go back and fix issues and tune performance before getting close to release. The roadmap gets a 0.9.x review milestone before any 1.0 release candidate; anything still open goes in the 1.0 readiness note James reads |
+| D-044 | (2026-11-05) James approved `docs/API.md`. From here every change to a public name or shape it lists needs a decision in this log, and `docs/API.md` changes in the same commit |
 
 ### Third-party runtime dependencies brought in by first-party crates (OD-5, temporary)
 
@@ -159,9 +174,9 @@ nex-db adds none of its own. `cargo tree -e normal` (default features, 0.1.0):
 
 | Through | Crates | Status |
 |---|---|---|
-| wal-db 1.0, lsm-db 1.1 | `crc32c` | exception until OD-5 |
+| wal-db 1.1, lsm-db 1.1 | `crc32c` | exception until OD-5 |
 | wal-db, lsm-db (through error-forge 1.0) | `pastey`, `parking_lot`, `parking_lot_core`, `lock_api`, `scopeguard`, `smallvec`, `cfg-if`; `windows-link` on Windows, `libc` on Unix | exception until OD-5 |
-| crypt-io 1.2 (audited cryptography) | `argon2`, `blake2`, `password-hash`, `base64ct`, `rand_core`, `getrandom` (`libc` on Unix), `blake3`, `arrayvec`, `constant_time_eq`, `cpufeatures`, `chacha20poly1305`, `chacha20`, `poly1305`, `aead`, `cipher`, `universal-hash`, `inout`, `crypto-common`, `digest`, `block-buffer`, `generic-array`, `typenum`, `opaque-debug`, `subtle`, `zeroize` | allowed (cryptography through crypt-io) |
+| crypt-io 1.2.2 (audited cryptography) | `argon2`, `blake2`, `password-hash`, `base64ct`, `rand_core`, `getrandom` (`libc` on Unix), `blake3`, `arrayvec`, `constant_time_eq`, `cpufeatures`, `chacha20poly1305`, `chacha20`, `poly1305`, `aead`, `cipher`, `universal-hash`, `inout`, `crypto-common`, `digest`, `block-buffer`, `generic-array`, `typenum`, `opaque-debug`, `subtle`, `zeroize` | allowed (cryptography through crypt-io) |
 | crypt-io (first-party) | `mod-rand` | first-party |
 
 ### Defence ideas
@@ -169,3 +184,4 @@ nex-db adds none of its own. `cargo tree -e normal` (default features, 0.1.0):
 | Version | Idea | Method | Cost |
 |---|---|---|---|
 | 0.1 | A log cut by damage shows as a store holding commits past the log's end | compare every engine's applied mark with the last log seq at open; refuse to open when a mark is higher | one comparison per engine at open |
+| 0.2 | A section can only reach the engine its collection is bound to | the core checks every section's collection against the catalog before `apply`; a mismatch halts writes and keeps the database closed (tested with two toy engines) | one catalog lookup per section |

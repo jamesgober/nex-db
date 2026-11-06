@@ -7,6 +7,9 @@
 //! passes its soft limit, so its size follows the write rate times the age of
 //! the oldest open transaction, not the history.
 
+// A build with no engine feature uses the table only in tests.
+#![cfg_attr(not(any(feature = "auth", feature = "content")), allow(dead_code))]
+
 use std::{
     collections::HashMap,
     sync::{Mutex, PoisonError},

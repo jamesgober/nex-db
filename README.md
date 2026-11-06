@@ -65,12 +65,18 @@ cargo run --example site
 - A commit that returned `Ok` survives a crash of the process at any point; a commit that did not return never appears in part. `tests/kill.rs` kills a writing process at random points and checks every reopen.
 - Every state change is applied from the bytes written to the log, by the same code after a commit and during recovery.
 - A failed log write or sync stops all further commits; it is never retried.
-- A missing key file or a damaged log keeps the database closed.
+- A missing key file or a damaged log keeps the database closed. Only an unfinished last record, which never returned `Ok`, is cut.
 - A revoked session never validates again.
 
 ## Status
 
 Version 0.1: the first working build. File formats and the API will change before 1.0. The plan is in [`dev/PLAN.md`](./dev/PLAN.md) and the schedule in [`dev/ROADMAP.md`](./dev/ROADMAP.md).
+
+## Documentation
+
+- [`docs/API.md`](./docs/API.md): the public API through 1.0, with the version each item arrives in.
+- [`docs/LOG_FORMAT.md`](./docs/LOG_FORMAT.md): the bytes of a commit log record.
+- [`docs/FILE_FORMATS.md`](./docs/FILE_FORMATS.md): the database directory and its files.
 
 ## License
 

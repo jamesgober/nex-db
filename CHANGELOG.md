@@ -16,5 +16,13 @@ All notable changes to `nex-db` are documented in this file. The format is based
 - `examples/site.rs`, integration tests, a kill test (`tests/kill.rs`), and criterion benchmarks (`benches/core.rs`).
 - Repository scaffold: `Cargo.toml` (edition 2024, MSRV 1.85, no dependencies), `src/lib.rs` with `VERSION`, CI on Linux, macOS, and Windows (stable and 1.85), `cargo deny` configuration.
 - `dev/PLAN.md`, `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
+- `docs/API.md` (the public API through 1.0; its examples run as doctests), `docs/LOG_FORMAT.md`, and `docs/FILE_FORMATS.md`.
+- The engine contract as documented internal code, with a toy engine in the tests that runs on the core with no other engine.
+
+### Changed
+
+- Catalog format 2: a collection keeps its engine's definition. A database written by the unreleased 0.1 build does not open; delete its directory.
+- crypt-io 1.2.2.
+- wal-db 1.1, opened under its strict policy: damage before the end of the log, or a missing segment, now always keeps the database closed and leaves the log unchanged.
 
 [Unreleased]: https://github.com/jamesgober/nex-db/commits/main

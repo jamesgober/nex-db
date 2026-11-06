@@ -61,9 +61,9 @@ content = ["dep:lsm-db"]
 # runtime dependency of nex-db's own; the ones these crates bring are recorded
 # as temporary exceptions in dev/PLAN.md (OD-5).
 [dependencies]
-wal-db = "1.0"
+wal-db = "1.1"
 id-forge = { version = "1.0", default-features = false, features = ["ulid"] }
-crypt-io = { version = "1.2.1", default-features = false, features = [
+crypt-io = { version = "1.2.2", default-features = false, features = [
     "std",
     "zeroize",
     "hash-blake3",

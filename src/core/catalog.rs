@@ -1,6 +1,8 @@
 //! The catalog: engine 0.
 //!
-//! The catalog binds every collection to one engine, for good. Its changes
+//! The catalog binds every collection to one engine, for good, and keeps the
+//! collection's definition: bytes the engine checked when the collection was
+//! created and that only the engine interprets. Its changes
 //! are ordinary log records (`kind = Catalog`), applied like any other
 //! section, so catalog and data agree at every sequence number. After each
 //! change the whole catalog is written to `core/catalog.ckpt` (atomic
@@ -9,6 +11,7 @@
 //! closed.
 
 use std::{
+    borrow::Cow,
     path::PathBuf,
     sync::{PoisonError, RwLock},
 };
@@ -26,14 +29,18 @@ use crate::{
 /// Catalog checkpoint file name, inside `core/`.
 pub(crate) const CHECKPOINT: &str = "catalog.ckpt";
 
-/// Format version of the catalog section and checkpoint.
-const FORMAT: u16 = 1;
+/// Format version of the catalog section and checkpoint. Format 2 added the
+/// collection definition; format 1 was never released.
+const FORMAT: u16 = 2;
 
 /// The one catalog operation in this version.
 const OP_DEFINE: u8 = 1;
 
 /// Longest collection name.
-const MAX_NAME: usize = 64;
+pub(crate) const MAX_NAME: usize = 64;
+
+/// Longest collection definition.
+pub(crate) const MAX_DEFINITION: usize = 64 * 1024;
 
 /// The default auth realm, created with the database.
 pub(crate) const DEFAULT_REALM: Collection = Collection::fixed(1, EngineId::AUTH, "users");
@@ -41,12 +48,14 @@ pub(crate) const DEFAULT_REALM: Collection = Collection::fixed(1, EngineId::AUTH
 /// The default content space, created with the database.
 pub(crate) const DEFAULT_SPACE: Collection = Collection::fixed(2, EngineId::CONTENT, "site");
 
-/// A collection: an id, the engine it belongs to, and a name.
+/// A collection: an id, the engine it belongs to, a name, and the engine's
+/// definition of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Collection {
     pub(crate) id: u32,
     pub(crate) engine: EngineId,
-    pub(crate) name: std::borrow::Cow<'static, str>,
+    pub(crate) name: Cow<'static, str>,
+    pub(crate) definition: Cow<'static, [u8]>,
 }
 
 impl Collection {
@@ -54,7 +63,8 @@ impl Collection {
         Collection {
             id,
             engine,
-            name: std::borrow::Cow::Borrowed(name),
+            name: Cow::Borrowed(name),
+            definition: Cow::Borrowed(&[]),
         }
     }
 }
@@ -99,10 +109,40 @@ impl Catalog {
         state.collections.iter().find(|c| c.id == id).cloned()
     }
 
-    /// Work that defines the default collections, for a new database.
-    pub(crate) fn bootstrap() -> CatalogStaged {
+    /// True when `id` is defined and bound to `engine`. Checked for every
+    /// section before it reaches its engine; allocates nothing.
+    pub(crate) fn binds(&self, id: u32, engine: EngineId) -> bool {
+        let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
+        state
+            .collections
+            .iter()
+            .any(|c| c.id == id && c.engine == engine)
+    }
+
+    /// The collection named `name`, if defined.
+    pub(crate) fn named(&self, name: &str) -> Option<Collection> {
+        let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
+        state.collections.iter().find(|c| c.name == name).cloned()
+    }
+
+    /// The id the next new collection gets: one above the highest in use.
+    pub(crate) fn next_id(&self) -> Option<u32> {
+        let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
+        state
+            .collections
+            .iter()
+            .map(|c| c.id)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+    }
+}
+
+impl CatalogStaged {
+    /// Work that defines `collections`.
+    pub(crate) fn define(collections: Vec<Collection>) -> CatalogStaged {
         CatalogStaged {
-            defines: vec![DEFAULT_REALM, DEFAULT_SPACE],
+            defines: collections,
         }
     }
 }
@@ -118,6 +158,10 @@ impl Engine for Catalog {
 
     fn format(&self) -> u16 {
         FORMAT
+    }
+
+    fn define(&self, _definition: &[u8]) -> Result<()> {
+        Err(Error::invalid("engine", "the catalog holds no collections"))
     }
 
     fn apply(&self, seq: Seq, _collection: u32, format: u16, body: &[u8]) -> Result<()> {
@@ -137,16 +181,22 @@ impl Engine for Catalog {
             let id = r.u32()?;
             let engine = EngineId(r.u16()?);
             let name = r.str16()?;
+            let definition = r.bytes32()?;
             match next.iter().find(|c| c.id == id || c.name == name) {
-                // A collection's engine never changes.
-                Some(existing) if existing.engine != engine || existing.id != id => {
-                    return Err(Error::corrupt("a catalog change (engine rebinding)", seq));
+                // A collection's engine and definition never change here.
+                Some(existing)
+                    if existing.engine != engine
+                        || existing.id != id
+                        || *existing.definition != *definition =>
+                {
+                    return Err(Error::corrupt("a catalog change (rebinding)", seq));
                 }
                 Some(_) => {}
                 None => next.push(Collection {
                     id,
                     engine,
                     name: name.to_owned().into(),
+                    definition: definition.to_vec().into(),
                 }),
             }
         }
@@ -168,6 +218,8 @@ impl Engine for Catalog {
         // Every change is written as it is applied.
         Ok(self.durable_through())
     }
+
+    fn reclaim(&self, _watermark: Seq) {}
 }
 
 /// Catalog work in one transaction.
@@ -202,10 +254,17 @@ impl Staged for CatalogStaged {
             if c.name.is_empty() || c.name.len() > MAX_NAME {
                 return Err(Error::invalid("collection name", "must be 1 to 64 bytes"));
             }
+            if c.definition.len() > MAX_DEFINITION {
+                return Err(Error::invalid(
+                    "collection definition",
+                    "larger than 64 KiB",
+                ));
+            }
             w.u8(OP_DEFINE);
             w.u32(c.id);
             w.u16(c.engine.0);
             w.str16(&c.name)?;
+            w.bytes32(&c.definition)?;
         }
         Ok(())
     }
@@ -221,6 +280,7 @@ fn encode_checkpoint(through: Seq, collections: &[Collection]) -> Result<Vec<u8>
         w.u32(c.id);
         w.u16(c.engine.0);
         w.str16(&c.name)?;
+        w.bytes32(&c.definition)?;
     }
     let sum = crypt_io::hash::blake3(&buf);
     buf.extend_from_slice(&sum);
@@ -245,7 +305,13 @@ fn decode_checkpoint(bytes: &[u8]) -> Result<State> {
         let id = r.u32()?;
         let engine = EngineId(r.u16()?);
         let name = r.str16()?.to_owned().into();
-        collections.push(Collection { id, engine, name });
+        let definition = r.bytes32()?.to_vec().into();
+        collections.push(Collection {
+            id,
+            engine,
+            name,
+            definition,
+        });
     }
     r.finish()?;
     Ok(State {
@@ -270,7 +336,9 @@ mod tests {
 
     fn bootstrap_body() -> Vec<u8> {
         let mut body = Vec::new();
-        Catalog::bootstrap().encode(1, &mut body).unwrap();
+        CatalogStaged::define(vec![DEFAULT_REALM, DEFAULT_SPACE])
+            .encode(1, &mut body)
+            .unwrap();
         body
     }
 
@@ -286,6 +354,30 @@ mod tests {
         assert_eq!(catalog.durable_through(), 1);
         assert_eq!(catalog.collection(1), Some(DEFAULT_REALM));
         assert_eq!(catalog.collection(2), Some(DEFAULT_SPACE));
+        assert!(catalog.binds(1, EngineId::AUTH));
+        assert!(!catalog.binds(1, EngineId::CONTENT));
+        assert_eq!(catalog.next_id(), Some(3));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn test_definition_round_trips_through_checkpoint() {
+        let dir = temp_dir();
+        let catalog = Catalog::open(&dir).unwrap();
+        let mut body = Vec::new();
+        CatalogStaged::define(vec![Collection {
+            id: 7,
+            engine: EngineId(9),
+            name: "notes".into(),
+            definition: b"def".to_vec().into(),
+        }])
+        .encode(1, &mut body)
+        .unwrap();
+        catalog.apply(1, 0, FORMAT, &body).unwrap();
+        drop(catalog);
+        let catalog = Catalog::open(&dir).unwrap();
+        let notes = catalog.named("notes").unwrap();
+        assert_eq!((notes.id, &*notes.definition), (7, &b"def"[..]));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -305,11 +397,9 @@ mod tests {
         let catalog = Catalog::open(&dir).unwrap();
         catalog.apply(1, 0, FORMAT, &bootstrap_body()).unwrap();
         let mut body = Vec::new();
-        CatalogStaged {
-            defines: vec![Collection::fixed(1, EngineId::CONTENT, "users")],
-        }
-        .encode(2, &mut body)
-        .unwrap();
+        CatalogStaged::define(vec![Collection::fixed(1, EngineId::CONTENT, "users")])
+            .encode(2, &mut body)
+            .unwrap();
         assert!(matches!(
             catalog.apply(2, 0, FORMAT, &body),
             Err(Error::Corrupt { .. })

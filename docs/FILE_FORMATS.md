@@ -104,6 +104,7 @@ Derived keys are `keyed BLAKE3(root key, label)`:
 |---|---|
 | `nex-db 2026 auth token digest` | session token digests |
 | `nex-db 2026 auth identifier digest` | identifier digests |
+| `nex-db 2026 auth log seal` | sealed auth sections in the log (0.3) |
 
 ## The engine stores
 

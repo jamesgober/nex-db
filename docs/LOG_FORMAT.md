@@ -95,7 +95,7 @@ A record is Priority when any of its sections asks for it.
 ```text
 offset  size  field
 0       2     engine      engine id
-2       1     flags       must be 0 in format 1
+2       1     flags       bit 0: sealed; other bits 0
 3       2     format      the engine's section format
 5       4     collection  the collection the section belongs to
 9       4     length      length of the body
@@ -106,9 +106,10 @@ offset  size  field
   section for any other collection keeps the database closed.
 - **format** is the engine's own format number for the body. An engine reads
   every format it has ever written.
-- **flags** bit 0 will mark a sealed section (0.3): an auth section whose
-  body is encrypted with the auth engine's keys, so the rest of the database
-  moves its bytes without being able to read them. Other bits are reserved.
+- **flags** bit 0 marks a sealed section: a body encrypted by its engine,
+  so the rest of the database moves the bytes without being able to read
+  them. Other bits are reserved and must be 0. Auth sections are sealed from
+  0.3; no other engine seals.
 
 ### Engine ids
 
@@ -142,7 +143,29 @@ version. Format 1 (without the definition) was never released.
 The first record of a new database is a Catalog record that defines the
 realm `users` (id 1, auth) and the space `site` (id 2, content).
 
-### Auth (engine 1), format 1
+### Auth (engine 1)
+
+Format 2 (written from 0.3) is sealed: the section's flags have bit 0 set and
+its body is
+
+```text
+key id u32          1: XChaCha20-Poly1305 under the log seal key
+nonce [24]          random
+ciphertext          the padded plaintext, encrypted
+tag [16]
+```
+
+with associated data `seq u64 | engine u16 | collection u32 | format u16`, so
+a body copied to another commit, engine, or collection fails to open. The
+plaintext is `length u32 | operations | zeros`, padded to a multiple of 256
+bytes, so a section of any single operation has the same size. Non-zero
+padding, a wrong key id, or a failed tag keeps the database closed. The log
+seal key is `keyed BLAKE3(root key, "nex-db 2026 auth log seal")`.
+
+Format 1 (0.1 and 0.2) is the same operations in plain form, with the flags
+0. It is still read, never written.
+
+The operations:
 
 | Code | Operation | Fields |
 |---|---|---|
@@ -154,9 +177,6 @@ Times are milliseconds since the Unix epoch, chosen when the operation was
 staged, so a replay reaches the same state. Digests are keyed BLAKE3 values;
 the token itself and the identifier itself never appear. The password hash is
 an Argon2id string in the PHC format.
-
-From 0.3 auth sections are sealed and padded, and this table describes the
-plaintext inside.
 
 ### Content (engine 2), format 1
 
@@ -176,7 +196,8 @@ A record is accepted only when:
 3. the sections parse exactly to the end of the record and their engines
    match the mask;
 4. `seq` is one more than the previous record's;
-5. every section's collection is bound to its engine, and its `flags` are 0.
+5. every section's collection is bound to its engine, and its `flags` hold
+   no bit other than sealed.
 
 A failure of any of these keeps the database closed with `Error::Corrupt`,
 with one exception: a failed checksum (1) on the last record, with no intact

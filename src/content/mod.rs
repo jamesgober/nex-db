@@ -27,7 +27,7 @@ use crate::{
         codec::{Reader, Writer},
         conflict::ConflictTable,
         now_ms,
-        record::Seq,
+        record::{Section, Seq},
     },
     engine::{Conflict, Engine, EngineId, Staged},
     error::{Error, Result},
@@ -161,14 +161,14 @@ impl Engine for ContentEngine {
         }
     }
 
-    fn apply(&self, seq: Seq, collection: u32, format: u16, body: &[u8]) -> Result<()> {
-        if format != FORMAT || collection != self.collection {
+    fn apply(&self, seq: Seq, section: &Section<'_>) -> Result<()> {
+        if section.format != FORMAT || section.flags != 0 || section.collection != self.collection {
             return Err(Error::corrupt("a content section header", seq));
         }
         if seq <= self.applied.load(Ordering::Acquire) {
             return Ok(());
         }
-        let mut r = Reader::new(body, "a content section", seq);
+        let mut r = Reader::new(section.body, "a content section", seq);
         let mut entries = Vec::new();
         while !r.is_empty() {
             if r.u8()? != OP_CREATE {

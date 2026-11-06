@@ -24,7 +24,7 @@ use std::{
     },
 };
 
-use crypt_io::{Zeroizing, kdf, mac};
+use crypt_io::{Crypt, Zeroizing, kdf, mac};
 use lsm_db::{Batch, Lsm};
 
 use self::{
@@ -39,15 +39,29 @@ use crate::{
         conflict::ConflictTable,
         keys::RootKey,
         now_ms,
-        record::Seq,
+        record::{SEALED, Section, Seq},
     },
     engine::{Conflict, Engine, EngineId, Staged},
     error::{Error, Result},
     ids::AccountId,
 };
 
-/// Section format version.
-const FORMAT: u16 = 1;
+/// Section format 1: the operations in plain form (0.1 and 0.2 logs). Read,
+/// never written.
+const FORMAT_PLAIN: u16 = 1;
+
+/// Section format 2, written from 0.3: the operations padded and encrypted
+/// (see [`seal`]).
+const FORMAT: u16 = 2;
+
+/// Id of the key that seals format 2 sections: XChaCha20-Poly1305 under the
+/// log seal key derived from the root key. A later key gets a new id.
+const SEAL_KEY_ID: u32 = 1;
+
+/// Sealed plaintext is padded to a multiple of this many bytes, so one
+/// operation of any kind (the largest, a new account, is about 160 bytes)
+/// gives a section of the same size.
+const PAD_BUCKET: usize = 256;
 
 const OP_CREATE_ACCOUNT: u8 = 1;
 const OP_ISSUE_SESSION: u8 = 2;
@@ -77,6 +91,7 @@ const CREDENTIAL_PASSWORD: u8 = 1;
 /// Key labels for the keys derived from the root key.
 const TOKEN_KEY_LABEL: &[u8] = b"nex-db 2026 auth token digest";
 const IDENTIFIER_KEY_LABEL: &[u8] = b"nex-db 2026 auth identifier digest";
+const SEAL_KEY_LABEL: &[u8] = b"nex-db 2026 auth log seal";
 
 fn store_key(collection: u32, tag: u8, id: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(5 + id.len());
@@ -130,6 +145,8 @@ pub(crate) struct AuthEngine {
     collection: u32,
     token_key: Zeroizing<[u8; 32]>,
     identifier_key: Zeroizing<[u8; 32]>,
+    /// Seals and opens this engine's log sections.
+    seal_key: Zeroizing<[u8; 32]>,
     accounts: Lsm,
     /// Highest seq whose account changes the account store holds.
     applied: AtomicU64,
@@ -171,6 +188,7 @@ impl AuthEngine {
             collection,
             token_key: root.derive(TOKEN_KEY_LABEL),
             identifier_key: root.derive(IDENTIFIER_KEY_LABEL),
+            seal_key: root.derive(SEAL_KEY_LABEL),
             accounts,
             applied: AtomicU64::new(applied),
             sessions: SessionTable::new(),
@@ -391,10 +409,19 @@ impl Engine for AuthEngine {
         }
     }
 
-    fn apply(&self, seq: Seq, collection: u32, format: u16, body: &[u8]) -> Result<()> {
-        if format != FORMAT || collection != self.collection {
+    fn apply(&self, seq: Seq, section: &Section<'_>) -> Result<()> {
+        if section.collection != self.collection {
             return Err(Error::corrupt("an auth section header", seq));
         }
+        let plain;
+        let body = match (section.format, section.flags) {
+            (FORMAT_PLAIN, 0) => section.body,
+            (FORMAT, SEALED) => {
+                plain = open(&self.seal_key, seq, section)?;
+                unpad(&plain, seq)?
+            }
+            _ => return Err(Error::corrupt("an auth section header", seq)),
+        };
         let ops = decode_ops(seq, body)?;
 
         // Account changes: one batch with the applied mark, skipped when the
@@ -542,44 +569,122 @@ impl Staged for AuthStaged<'_> {
             .record(self.writes.iter().map(Vec::as_slice), seq);
     }
 
-    fn encode(&self, _seq: Seq, out: &mut Vec<u8>) -> Result<()> {
-        let mut w = Writer::new(out);
-        for op in &self.ops {
-            match op {
-                StagedOp::CreateAccount {
-                    account,
-                    digest,
-                    created_ms,
-                    phc,
-                } => {
-                    w.u8(OP_CREATE_ACCOUNT);
-                    w.bytes(account.as_bytes());
-                    w.bytes(digest);
-                    w.u64(*created_ms);
-                    w.str16(phc)?;
-                }
-                StagedOp::IssueSession {
-                    digest,
-                    account,
-                    created_ms,
-                    expires_ms,
-                } => {
-                    w.u8(OP_ISSUE_SESSION);
-                    w.bytes(digest);
-                    w.bytes(account.as_bytes());
-                    w.u64(*created_ms);
-                    w.u64(*expires_ms);
-                }
-                StagedOp::RevokeSession { digest, at_ms } => {
-                    w.u8(OP_REVOKE_SESSION);
-                    w.bytes(digest);
-                    w.u8(1);
-                    w.u64(*at_ms);
-                }
+    fn sealed(&self) -> bool {
+        true
+    }
+
+    fn encode(&self, seq: Seq, out: &mut Vec<u8>) -> Result<()> {
+        let engine = self.engine;
+        let mut plain = Zeroizing::new(Vec::with_capacity(PAD_BUCKET));
+        plain.extend_from_slice(&[0; 4]);
+        write_ops(&self.ops, &mut plain)?;
+        seal(&engine.seal_key, seq, engine.collection, &mut plain, out)
+    }
+}
+
+/// The operations in plain form: the body of format 1, and the plaintext of
+/// format 2.
+fn write_ops(ops: &[StagedOp], out: &mut Vec<u8>) -> Result<()> {
+    let mut w = Writer::new(out);
+    for op in ops {
+        match op {
+            StagedOp::CreateAccount {
+                account,
+                digest,
+                created_ms,
+                phc,
+            } => {
+                w.u8(OP_CREATE_ACCOUNT);
+                w.bytes(account.as_bytes());
+                w.bytes(digest);
+                w.u64(*created_ms);
+                w.str16(phc)?;
+            }
+            StagedOp::IssueSession {
+                digest,
+                account,
+                created_ms,
+                expires_ms,
+            } => {
+                w.u8(OP_ISSUE_SESSION);
+                w.bytes(digest);
+                w.bytes(account.as_bytes());
+                w.u64(*created_ms);
+                w.u64(*expires_ms);
+            }
+            StagedOp::RevokeSession { digest, at_ms } => {
+                w.u8(OP_REVOKE_SESSION);
+                w.bytes(digest);
+                w.u8(1);
+                w.u64(*at_ms);
             }
         }
-        Ok(())
     }
+    Ok(())
+}
+
+/// Associated data of a sealed section: what binds the ciphertext to its
+/// place in the log, so a section copied to another commit or engine fails to
+/// open.
+fn seal_aad(seq: Seq, collection: u32) -> [u8; 16] {
+    let mut aad = [0u8; 16];
+    aad[..8].copy_from_slice(&seq.to_le_bytes());
+    aad[8..10].copy_from_slice(&EngineId::AUTH.0.to_le_bytes());
+    aad[10..14].copy_from_slice(&collection.to_le_bytes());
+    aad[14..].copy_from_slice(&FORMAT.to_le_bytes());
+    aad
+}
+
+/// Seal `plain` into `out` as a format 2 body:
+/// `key id u32 | nonce [24] | ciphertext | tag [16]`.
+///
+/// `plain` starts with four bytes reserved for its length; it is padded with
+/// zeros to a multiple of [`PAD_BUCKET`] before encryption, so the section's
+/// size says how many buckets it holds, not which operations. XChaCha20 takes
+/// a random 192-bit nonce, which cannot repeat in practice under one key.
+fn seal(
+    key: &[u8; 32],
+    seq: Seq,
+    collection: u32,
+    plain: &mut Zeroizing<Vec<u8>>,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let len = u32::try_from(plain.len() - 4).map_err(|_| Error::invalid("commit", "too large"))?;
+    plain[..4].copy_from_slice(&len.to_le_bytes());
+    let padded = plain.len().div_ceil(PAD_BUCKET) * PAD_BUCKET;
+    plain.resize(padded, 0);
+    let sealed = Crypt::xchacha20_poly1305()
+        .encrypt_with_aad(&key[..], plain, &seal_aad(seq, collection))
+        .map_err(|e| Error::storage("sealing an auth section", e))?;
+    out.extend_from_slice(&SEAL_KEY_ID.to_le_bytes());
+    out.extend_from_slice(&sealed);
+    Ok(())
+}
+
+/// Open a format 2 body. Any change to the body, or to its sequence number,
+/// engine, collection, or format, fails as damage.
+fn open(key: &[u8; 32], seq: Seq, section: &Section<'_>) -> Result<Zeroizing<Vec<u8>>> {
+    let corrupt = || Error::corrupt("a sealed auth section", seq);
+    let (id, sealed) = section.body.split_at_checked(4).ok_or_else(corrupt)?;
+    if id != SEAL_KEY_ID.to_le_bytes() {
+        return Err(corrupt());
+    }
+    Crypt::xchacha20_poly1305()
+        .decrypt_with_aad(&key[..], sealed, &seal_aad(seq, section.collection))
+        .map(Zeroizing::new)
+        .map_err(|_| corrupt())
+}
+
+/// The operations inside opened plaintext, without the padding.
+fn unpad(plain: &[u8], seq: Seq) -> Result<&[u8]> {
+    let mut r = Reader::new(plain, "a sealed auth section", seq);
+    let len =
+        usize::try_from(r.u32()?).map_err(|_| Error::corrupt("a sealed auth section", seq))?;
+    let ops = r.take(len)?;
+    if r.take(plain.len() - 4 - len)?.iter().any(|&b| b != 0) {
+        return Err(Error::corrupt("a sealed auth section", seq));
+    }
+    Ok(ops)
 }
 
 /// Auth operations inside a [`Transaction`](crate::Transaction).
@@ -868,5 +973,160 @@ mod tests {
         assert_ne!(account_key(1, account), credential_key(1, account));
         assert_ne!(account_key(1, account), account_key(2, account));
         assert!(!identifier_key(1, &[0; 32]).starts_with(META_APPLIED));
+    }
+
+    fn sealed_section<'a>(body: &'a [u8], seq: Seq) -> (Seq, Section<'a>) {
+        (
+            seq,
+            Section {
+                engine: EngineId::AUTH,
+                flags: SEALED,
+                format: FORMAT,
+                collection: 1,
+                body,
+            },
+        )
+    }
+
+    fn sealed_body(key: &[u8; 32], seq: Seq, ops: &[u8]) -> Vec<u8> {
+        let mut plain = Zeroizing::new(vec![0; 4]);
+        plain.extend_from_slice(ops);
+        let mut out = Vec::new();
+        seal(key, seq, 1, &mut plain, &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn test_seal_open_round_trips_and_pads_to_bucket() {
+        let key = [7u8; 32];
+        let body = sealed_body(&key, 5, b"some operations");
+        // Anything up to one bucket seals to the same size; more takes the
+        // next bucket.
+        let one = sealed_body(&key, 5, &[1]).len();
+        assert_eq!(body.len(), one);
+        assert_eq!(sealed_body(&key, 5, &[1; PAD_BUCKET - 4]).len(), one);
+        assert_eq!(
+            sealed_body(&key, 5, &[1; PAD_BUCKET]).len(),
+            one + PAD_BUCKET
+        );
+        let (seq, section) = sealed_section(&body, 5);
+        let plain = open(&key, seq, &section).unwrap();
+        assert_eq!(unpad(&plain, seq).unwrap(), b"some operations");
+    }
+
+    #[test]
+    fn test_open_any_changed_byte_is_corrupt() {
+        let key = [7u8; 32];
+        let body = sealed_body(&key, 5, b"ops");
+        for i in 0..body.len() {
+            let mut bad = body.clone();
+            bad[i] ^= 1;
+            let (seq, section) = sealed_section(&bad, 5);
+            assert!(open(&key, seq, &section).is_err(), "byte {i}");
+        }
+    }
+
+    #[test]
+    fn test_open_elsewhere_in_the_log_is_corrupt() {
+        let key = [7u8; 32];
+        let body = sealed_body(&key, 5, b"ops");
+        let (_, section) = sealed_section(&body, 5);
+        assert!(open(&key, 6, &section).is_err());
+        let moved = Section {
+            collection: 2,
+            ..section
+        };
+        assert!(open(&key, 5, &moved).is_err());
+        assert!(open(&[8u8; 32], 5, &section).is_err());
+    }
+
+    #[test]
+    fn test_unpad_nonzero_padding_is_corrupt() {
+        let mut plain = vec![0u8; PAD_BUCKET];
+        plain[..4].copy_from_slice(&3u32.to_le_bytes());
+        assert!(unpad(&plain, 1).is_ok());
+        plain[PAD_BUCKET - 1] = 1;
+        assert!(unpad(&plain, 1).is_err());
+        plain[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(unpad(&plain, 1).is_err());
+    }
+
+    fn sealed_len(op: StagedOp) -> usize {
+        let mut plain = Zeroizing::new(vec![0; 4]);
+        write_ops(&[op], &mut plain).unwrap();
+        let mut out = Vec::new();
+        seal(&[3u8; 32], 9, 1, &mut plain, &mut out).unwrap();
+        out.len()
+    }
+
+    #[test]
+    fn test_sealed_single_operations_have_one_size() {
+        let account = AccountId::from_bytes([1; 16]);
+        // A real Argon2id hash string, the longest field of any operation.
+        let phc = kdf::argon2_hash(b"a password").unwrap();
+        let create = sealed_len(StagedOp::CreateAccount {
+            account,
+            digest: [2; 32],
+            created_ms: u64::MAX,
+            phc: Zeroizing::new(phc),
+        });
+        let issue = sealed_len(StagedOp::IssueSession {
+            digest: [2; 32],
+            account,
+            created_ms: u64::MAX,
+            expires_ms: u64::MAX,
+        });
+        let revoke = sealed_len(StagedOp::RevokeSession {
+            digest: [2; 32],
+            at_ms: u64::MAX,
+        });
+        assert_eq!(create, issue);
+        assert_eq!(issue, revoke);
+    }
+
+    #[test]
+    fn test_apply_reads_plain_format_1_and_refuses_mixed_headers() {
+        let dir = std::env::temp_dir().join(format!(
+            "nex-db-auth-plain-{}-{}",
+            std::process::id(),
+            id_forge::ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::core::keys::create_if_missing(&dir).unwrap();
+        let root = crate::core::keys::load(&dir).unwrap();
+        let engine = AuthEngine::open(&dir.join("accounts"), &root, 1).unwrap();
+        let mut body = Vec::new();
+        write_ops(
+            &[StagedOp::IssueSession {
+                digest: [4; 32],
+                account: AccountId::from_bytes([1; 16]),
+                created_ms: 0,
+                expires_ms: u64::MAX,
+            }],
+            &mut body,
+        )
+        .unwrap();
+        let plain = Section {
+            engine: EngineId::AUTH,
+            flags: 0,
+            format: FORMAT_PLAIN,
+            collection: 1,
+            body: &body,
+        };
+        engine.apply(1, &plain).unwrap();
+        assert!(matches!(engine.sessions.get(&[4; 32]), Some(Slot::Live(_))));
+        // A format 2 section must be sealed, and a format 1 one must not.
+        let unsealed = Section {
+            format: FORMAT,
+            ..plain
+        };
+        assert!(engine.apply(2, &unsealed).is_err());
+        let flagged = Section {
+            flags: SEALED,
+            ..plain
+        };
+        assert!(engine.apply(3, &flagged).is_err());
+        drop(engine);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

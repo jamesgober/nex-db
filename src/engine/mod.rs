@@ -52,7 +52,7 @@
 //! contract can change between versions without breaking callers.
 
 use crate::{
-    core::record::Seq,
+    core::record::{Section, Seq},
     error::{Error, Result},
 };
 
@@ -125,16 +125,16 @@ pub(crate) trait Engine: Send + Sync {
     /// [`Error::Invalid`] when the definition is not one this engine accepts.
     fn define(&self, definition: &[u8]) -> Result<()>;
 
-    /// Install a committed section at `seq` for `collection`, written in
-    /// section format `format`. Deterministic and idempotent: a section at
-    /// or below what the engine already holds is skipped.
+    /// Install a committed section at `seq`. The section carries its
+    /// collection, format, flags, and body. Deterministic and idempotent: a
+    /// section at or below what the engine already holds is skipped.
     ///
     /// # Errors
     ///
     /// [`Error::Corrupt`] when the section cannot be decoded, and
     /// [`Error::Storage`] when the engine's own files refuse the change. Any
     /// error halts the database's writes.
-    fn apply(&self, seq: Seq, collection: u32, format: u16, body: &[u8]) -> Result<()>;
+    fn apply(&self, seq: Seq, section: &Section<'_>) -> Result<()>;
 
     /// The highest sequence number this engine's own files hold. Recovery
     /// replays the log from just above the lowest mark of all engines.
@@ -169,6 +169,12 @@ pub(crate) trait Staged {
     /// True when the work must take effect ahead of ordinary commits (a
     /// revocation). One such part makes the whole record priority class.
     fn priority(&self) -> bool {
+        false
+    }
+
+    /// True when [`encode`](Self::encode) writes an encrypted body: the
+    /// section is then marked sealed in the log.
+    fn sealed(&self) -> bool {
         false
     }
 

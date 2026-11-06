@@ -229,3 +229,33 @@ fn test_reopen_missing_catalog_is_rebuilt_from_log() {
         Validation::Valid(_)
     ));
 }
+
+/// Every file under `dir`, read whole.
+fn all_bytes(dir: &Path) -> Vec<u8> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            out.extend(all_bytes(&path));
+        } else {
+            out.extend(fs::read(&path).unwrap());
+        }
+    }
+    out
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+#[test]
+fn test_log_holds_no_password_hash_or_identifier() {
+    let dir = TempDir::new("sealed");
+    let db = Database::open(&dir.0).unwrap();
+    let _ = populate(&db, 0, 3);
+    drop(db);
+    let log = all_bytes(&dir.0.join("core").join("log"));
+    assert!(!log.is_empty());
+    assert!(!contains(&log, b"$argon2id$"));
+    assert!(!contains(&log, b"u1@example.com"));
+}

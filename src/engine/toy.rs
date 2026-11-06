@@ -24,7 +24,7 @@ use crate::{
         fs,
         log::CommitLog,
         pipeline::{Attempt, Core},
-        record::{self, Class, Seq},
+        record::{self, Class, Section, Seq},
     },
     error::{Error, Result},
 };
@@ -99,15 +99,15 @@ impl Engine for ToyEngine {
         }
     }
 
-    fn apply(&self, seq: Seq, _collection: u32, format: u16, body: &[u8]) -> Result<()> {
-        if format != FORMAT {
+    fn apply(&self, seq: Seq, section: &Section<'_>) -> Result<()> {
+        if section.format != FORMAT || section.flags != 0 {
             return Err(Error::corrupt("a toy section format", seq));
         }
         if seq <= self.applied.load(Ordering::Acquire) {
             return Ok(());
         }
         let mut puts = Vec::new();
-        let mut r = Reader::new(body, "a toy section", seq);
+        let mut r = Reader::new(section.body, "a toy section", seq);
         while !r.is_empty() {
             puts.push((r.u16()?, r.u64()?));
         }

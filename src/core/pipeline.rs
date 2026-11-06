@@ -348,7 +348,8 @@ impl Core {
         let mut record = RecordWriter::new(seq, kind, class, &ids, Vec::new())?;
         for work in staged {
             let format = self.engine(engines, work.engine())?.format();
-            let body = record.begin_section(work.engine(), format, work.collection())?;
+            let flags = if work.sealed() { record::SEALED } else { 0 };
+            let body = record.begin_section(work.engine(), flags, format, work.collection())?;
             work.encode(seq, body)?;
             record.end_section()?;
         }
@@ -499,7 +500,7 @@ impl Core {
             if catalog_section != (view.kind == Kind::Catalog) {
                 return Err(Error::corrupt("a log record (kind)", view.seq));
             }
-            if section.flags != 0 {
+            if section.flags & !record::SEALED != 0 {
                 return Err(Error::corrupt("a log section (flags)", view.seq));
             }
             if !catalog_section && !self.catalog.binds(section.collection, section.engine) {
@@ -507,7 +508,7 @@ impl Core {
             }
             let engine = self.engine(engines, section.engine)?;
             debug_assert_eq!(engine.id(), section.engine);
-            engine.apply(view.seq, section.collection, section.format, section.body)?;
+            engine.apply(view.seq, section)?;
         }
         Ok(())
     }

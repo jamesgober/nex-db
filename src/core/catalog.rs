@@ -19,7 +19,7 @@ use std::{
 use super::{
     codec::{Reader, Writer},
     fs,
-    record::Seq,
+    record::{Section, Seq},
 };
 use crate::{
     engine::{Conflict, Engine, EngineId, Staged},
@@ -164,8 +164,8 @@ impl Engine for Catalog {
         Err(Error::invalid("engine", "the catalog holds no collections"))
     }
 
-    fn apply(&self, seq: Seq, _collection: u32, format: u16, body: &[u8]) -> Result<()> {
-        if format != FORMAT {
+    fn apply(&self, seq: Seq, section: &Section<'_>) -> Result<()> {
+        if section.format != FORMAT || section.flags != 0 {
             return Err(Error::corrupt("a catalog section format", seq));
         }
         let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
@@ -173,7 +173,7 @@ impl Engine for Catalog {
             return Ok(());
         }
         let mut next = state.collections.clone();
-        let mut r = Reader::new(body, "a catalog section", seq);
+        let mut r = Reader::new(section.body, "a catalog section", seq);
         while !r.is_empty() {
             if r.u8()? != OP_DEFINE {
                 return Err(Error::corrupt("a catalog operation", seq));
@@ -334,6 +334,16 @@ mod tests {
         dir
     }
 
+    fn section(body: &[u8]) -> Section<'_> {
+        Section {
+            engine: EngineId::CATALOG,
+            flags: 0,
+            format: FORMAT,
+            collection: 0,
+            body,
+        }
+    }
+
     fn bootstrap_body() -> Vec<u8> {
         let mut body = Vec::new();
         CatalogStaged::define(vec![DEFAULT_REALM, DEFAULT_SPACE])
@@ -347,7 +357,7 @@ mod tests {
         let dir = temp_dir();
         let catalog = Catalog::open(&dir).unwrap();
         assert!(catalog.is_empty());
-        catalog.apply(1, 0, FORMAT, &bootstrap_body()).unwrap();
+        catalog.apply(1, &section(&bootstrap_body())).unwrap();
         drop(catalog);
 
         let catalog = Catalog::open(&dir).unwrap();
@@ -373,7 +383,7 @@ mod tests {
         }])
         .encode(1, &mut body)
         .unwrap();
-        catalog.apply(1, 0, FORMAT, &body).unwrap();
+        catalog.apply(1, &section(&body)).unwrap();
         drop(catalog);
         let catalog = Catalog::open(&dir).unwrap();
         let notes = catalog.named("notes").unwrap();
@@ -385,8 +395,8 @@ mod tests {
     fn test_apply_same_seq_twice_is_skipped() {
         let dir = temp_dir();
         let catalog = Catalog::open(&dir).unwrap();
-        catalog.apply(1, 0, FORMAT, &bootstrap_body()).unwrap();
-        catalog.apply(1, 0, FORMAT, b"garbage").unwrap();
+        catalog.apply(1, &section(&bootstrap_body())).unwrap();
+        catalog.apply(1, &section(b"garbage")).unwrap();
         assert_eq!(catalog.durable_through(), 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -395,13 +405,13 @@ mod tests {
     fn test_apply_engine_rebinding_is_corrupt() {
         let dir = temp_dir();
         let catalog = Catalog::open(&dir).unwrap();
-        catalog.apply(1, 0, FORMAT, &bootstrap_body()).unwrap();
+        catalog.apply(1, &section(&bootstrap_body())).unwrap();
         let mut body = Vec::new();
         CatalogStaged::define(vec![Collection::fixed(1, EngineId::CONTENT, "users")])
             .encode(2, &mut body)
             .unwrap();
         assert!(matches!(
-            catalog.apply(2, 0, FORMAT, &body),
+            catalog.apply(2, &section(&body)),
             Err(Error::Corrupt { .. })
         ));
         std::fs::remove_dir_all(dir).unwrap();
@@ -411,7 +421,7 @@ mod tests {
     fn test_open_damaged_checkpoint_is_corrupt() {
         let dir = temp_dir();
         let catalog = Catalog::open(&dir).unwrap();
-        catalog.apply(1, 0, FORMAT, &bootstrap_body()).unwrap();
+        catalog.apply(1, &section(&bootstrap_body())).unwrap();
         drop(catalog);
         let path = dir.join(CHECKPOINT);
         let mut bytes = std::fs::read(&path).unwrap();

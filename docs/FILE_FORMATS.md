@@ -147,6 +147,7 @@ keys sort together), then a one-byte tag.
 | `collection, 'a', account [16]` | account record, sealed (from 0.3) or plain |
 | `collection, 'i', identifier digest [32]` | `account [16]` |
 | `collection, 'c', account [16]` | credential record, plain accounts only |
+| `collection, 'p'` | the realm's roles (0.4), plain: `format u8 (1)`, `role count u16`, then per role `name str16`, `permission count u16`, `permission str16` each, `inherited count u16`, `role id u32` each. A role's id is its position |
 
 A sealed account record (written from 0.3) is
 
@@ -163,18 +164,21 @@ fails to open. The file key is `keyed BLAKE3(root key, "nex-db 2026 auth
 file")`. Inside, the credential travels with the account:
 
 ```text
-format u8                 2
+format u8                 3 (2 in 0.3: ends after the password hash)
 created ms u64
-identifier digest [32]
+identifier digest [32]    the first identifier
 standing u8               1 active, 2 pending verification, 3 locked out,
                           4 suspended, 5 banned
 until ms u64              when a lock-out or suspension ends; 0 for none
 reason u32                application-defined; 0 for none
 credential kind u8        1 = password
 password hash str16       Argon2id, PHC format
+identifier count u8       further identifiers (at most 4), then each [32]
+role count u8             at most 16, then each role id u32
 ```
 
-A standing change writes the whole record again, sealed with a new nonce.
+A change of standing, password, identifiers, or roles writes the whole record
+again, sealed with a new nonce.
 Account epochs are not in the record: they live in the log.
 
 Records are sealed when the commit is staged, not when it is applied, and the

@@ -176,12 +176,17 @@ The operations:
 | 4 | create account (sealed record) | `account [16]`, `identifier digest [32]`, `record bytes32` |
 | 5 | issue session at an epoch | `token digest [32]`, `account [16]`, `created ms u64`, `expires ms u64`, `epoch u32`, `idle ms u64` (0: none), `recheck ms u64` (0: none), `payload bytes16` (at most 256) |
 | 6 | raise an account's epoch | `account [16]`, `epoch u32`, `at ms u64` |
-| 7 | replace an account's record | `account [16]`, `record bytes32` (sealed, as in operation 4), `at ms u64` |
+| 7 | replace an account's record (0.3) | `account [16]`, `record bytes32` (sealed, as in operation 4), `at ms u64` |
+| 8 | replace an account's record (0.4) | `account [16]`, `what u8` (1 standing, 2 password, 3 identifiers, 4 roles, 5 more than one), `record bytes32`, `at ms u64` |
+| 9 | set an identifier | `identifier digest [32]`, `present u8` (1: points at the account, 0: removed), `account [16]` (zeros when removed), `at ms u64` |
+| 10 | replace the realm's roles | `policy bytes32` (as stored, see `FILE_FORMATS.md`), `at ms u64` |
 
 A session is valid only while its epoch equals the account's current epoch
 (0 until the first raise), so operation 6 ends every older session of the
 account at once. An epoch never goes down. Operations 1 and 2 appear only in
-format 1 logs; operation 2 is read as epoch 0.
+format 1 logs; operation 2 is read as epoch 0. Operation 7 is read as
+operation 8 with `what` 1. A single operation of any kind still fills one
+512-byte bucket; only operation 10 (the whole role policy) can be larger.
 
 From 0.3 a new account is
 operation 4: its record, the password hash included, is sealed under the file

@@ -11,6 +11,7 @@
 //! or identifiers. The operations below are the whole surface.
 
 mod audit;
+pub(crate) mod roles;
 mod sessions;
 pub(crate) mod token;
 pub(crate) mod types;
@@ -20,7 +21,7 @@ use std::{
     fmt,
     path::{Path, PathBuf},
     sync::{
-        Mutex, OnceLock, PoisonError,
+        Arc, Mutex, OnceLock, PoisonError, RwLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::SystemTime,
@@ -31,6 +32,7 @@ use lsm_db::{Batch, Lsm};
 
 use self::{
     audit::{AuditChain, Tail},
+    roles::{Account, Policy, Role, RoleId},
     sessions::{EpochTable, SessionTable, Slot},
     token::Token,
     types::{
@@ -83,8 +85,29 @@ const OP_ISSUE_SESSION: u8 = 2;
 const OP_ISSUE_SESSION_AT_EPOCH: u8 = 5;
 /// Raise an account's epoch: every older session of the account ends.
 const OP_RAISE_EPOCH: u8 = 6;
-/// Replace an account's sealed record (a standing change).
+/// Replace an account's sealed record (a standing change; 0.3 logs).
 const OP_UPDATE_ACCOUNT: u8 = 7;
+/// Replace an account's sealed record, saying what changed.
+const OP_UPDATE_ACCOUNT_AS: u8 = 8;
+/// Point an identifier at an account, or remove it.
+const OP_SET_IDENTIFIER: u8 = 9;
+/// Replace the realm's role policy.
+const OP_SET_POLICY: u8 = 10;
+
+/// What an account update changed, for the audit chain.
+const UPDATE_STANDING: u8 = 1;
+const UPDATE_PASSWORD: u8 = 2;
+const UPDATE_IDENTIFIERS: u8 = 3;
+const UPDATE_ROLES: u8 = 4;
+/// More than one of the above, in one commit.
+const UPDATE_SEVERAL: u8 = 5;
+
+/// Most identifiers one account has (the first and four more). With
+/// [`MAX_ACCOUNT_ROLES`] it keeps the largest account record inside one
+/// sealed bucket.
+const MAX_IDENTIFIERS: usize = 5;
+/// Most roles one account holds.
+const MAX_ACCOUNT_ROLES: usize = 16;
 
 /// Failed sign-ins within [`LOCKOUT_WINDOW_MS`] that lock an account out.
 const LOCKOUT_FAILURES: u32 = 10;
@@ -160,8 +183,10 @@ const VALUE_SEALED: u8 = 2;
 /// the file key.
 const FILE_KEY_ID: u32 = 1;
 
-/// Format of the plaintext inside a sealed account record.
+/// Format of the plaintext inside a sealed account record (0.3).
 const ACCOUNT_FORMAT_SEALED: u8 = 2;
+/// The same with the account's further identifiers and its roles (0.4).
+const ACCOUNT_FORMAT_SEALED_ROLES: u8 = 3;
 
 fn store_key(collection: u32, tag: u8, id: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(5 + id.len());
@@ -182,6 +207,13 @@ fn identifier_key(collection: u32, digest: &[u8; 32]) -> Vec<u8> {
 fn credential_key(collection: u32, account: AccountId) -> Vec<u8> {
     store_key(collection, b'c', account.as_bytes())
 }
+
+fn policy_key(collection: u32) -> Vec<u8> {
+    store_key(collection, b'p', b"")
+}
+
+/// Conflict key of the role policy: two role definitions conflict.
+const POLICY_CONFLICT_KEY: &[u8] = b"P";
 
 /// Conflict-table key for a session digest.
 /// Conflict key of an account's epoch: two sign-outs everywhere of one
@@ -255,6 +287,8 @@ pub(crate) struct AuthEngine {
     max_hashing: usize,
     /// Most sessions and tombstones held at once.
     max_sessions: usize,
+    /// The realm's roles, replaced as a whole on each change.
+    policy: RwLock<Arc<Policy>>,
     /// A hash checked for unknown identifiers, so they cost what a wrong
     /// password costs.
     dummy: OnceLock<String>,
@@ -298,6 +332,10 @@ impl AuthEngine {
             None => 0,
         };
         let max_hashing = std::thread::available_parallelism().map_or(1, usize::from);
+        let policy = match accounts.get(policy_key(collection))? {
+            Some(bytes) => Policy::decode(&bytes, 0)?,
+            None => Policy::default(),
+        };
         let engine = AuthEngine {
             collection,
             dir: dir.to_path_buf(),
@@ -320,6 +358,7 @@ impl AuthEngine {
             hashing: AtomicUsize::new(0),
             max_hashing,
             max_sessions,
+            policy: RwLock::new(Arc::new(policy)),
             dummy: OnceLock::new(),
         };
         if let Some(checkpoint) = checkpoint {
@@ -396,6 +435,11 @@ impl AuthEngine {
         fs::write_atomic(&self.sessions_file, &file)?;
         self.sessions_through.store(through, Ordering::Release);
         Ok(())
+    }
+
+    /// The realm's roles as last applied.
+    fn policy(&self) -> Arc<Policy> {
+        Arc::clone(&self.policy.read().unwrap_or_else(PoisonError::into_inner))
     }
 
     fn token_digest(&self, random: &[u8; 32]) -> [u8; 32] {
@@ -483,6 +527,8 @@ impl AuthEngine {
             digest,
             standing,
             phc,
+            identifiers: Vec::new(),
+            roles: Vec::new(),
         })
     }
 
@@ -529,8 +575,27 @@ impl AuthEngine {
                 account: a, at_ms, ..
             } => (*at_ms, "account.signed_out_everywhere", account(*a)),
             Op::UpdateAccount {
+                account: a,
+                what,
+                at_ms,
+                ..
+            } => {
+                let action = match *what {
+                    UPDATE_PASSWORD => "account.password_changed",
+                    UPDATE_IDENTIFIERS => "account.identifiers_changed",
+                    UPDATE_ROLES => "account.roles_changed",
+                    UPDATE_SEVERAL => "account.changed",
+                    _ => "account.standing_changed",
+                };
+                (*at_ms, action, account(*a))
+            }
+            Op::SetIdentifier {
                 account: a, at_ms, ..
-            } => (*at_ms, "account.standing_changed", account(*a)),
+            } => match a {
+                Some(a) => (*at_ms, "identifier.added", account(*a)),
+                None => (*at_ms, "identifier.removed", "identifier".to_owned()),
+            },
+            Op::SetPolicy { at_ms, .. } => (*at_ms, "policy.changed", "roles".to_owned()),
         };
         self.audit.append(seq, n, at_ms, action, &target)
     }
@@ -690,6 +755,17 @@ enum Op<'a> {
     },
     UpdateAccount {
         account: AccountId,
+        what: u8,
+        value: &'a [u8],
+        at_ms: u64,
+    },
+    SetIdentifier {
+        digest: [u8; 32],
+        /// `None` removes the identifier.
+        account: Option<AccountId>,
+        at_ms: u64,
+    },
+    SetPolicy {
         value: &'a [u8],
         at_ms: u64,
     },
@@ -759,6 +835,31 @@ fn decode_ops(seq: Seq, body: &[u8]) -> Result<Vec<Op<'_>>> {
             },
             OP_UPDATE_ACCOUNT => Op::UpdateAccount {
                 account: AccountId::from_bytes(r.fixed()?),
+                what: UPDATE_STANDING,
+                value: r.bytes32()?,
+                at_ms: r.u64()?,
+            },
+            OP_UPDATE_ACCOUNT_AS => Op::UpdateAccount {
+                account: AccountId::from_bytes(r.fixed()?),
+                what: r.u8()?,
+                value: r.bytes32()?,
+                at_ms: r.u64()?,
+            },
+            OP_SET_IDENTIFIER => {
+                let digest = r.fixed()?;
+                let present = r.u8()?;
+                let account = AccountId::from_bytes(r.fixed()?);
+                Op::SetIdentifier {
+                    digest,
+                    account: match present {
+                        0 => None,
+                        1 => Some(account),
+                        _ => return Err(Error::corrupt("an identifier operation", seq)),
+                    },
+                    at_ms: r.u64()?,
+                }
+            }
+            OP_SET_POLICY => Op::SetPolicy {
                 value: r.bytes32()?,
                 at_ms: r.u64()?,
             },
@@ -828,7 +929,22 @@ impl Engine for AuthEngine {
         // store already holds this seq.
         if seq > self.applied.load(Ordering::Acquire) {
             let mut batch = Batch::new();
+            let mut policy = None;
             for op in &ops {
+                if let Op::SetIdentifier {
+                    digest, account, ..
+                } = op
+                {
+                    let key = identifier_key(self.collection, digest);
+                    match account {
+                        Some(account) => batch.put(key, account.as_bytes()),
+                        None => batch.delete(key),
+                    }
+                }
+                if let Op::SetPolicy { value, .. } = op {
+                    policy = Some(Policy::decode(value, seq)?);
+                    batch.put(policy_key(self.collection), *value);
+                }
                 if let Op::UpdateAccount { account, value, .. } = op {
                     let key = account_key(self.collection, *account);
                     self.versions
@@ -876,6 +992,9 @@ impl Engine for AuthEngine {
                 self.accounts.write(batch)?;
                 self.applied.store(seq, Ordering::Release);
             }
+            if let Some(policy) = policy {
+                *self.policy.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(policy);
+            }
         }
 
         // Sessions live in memory: the checkpoint holds them through its
@@ -910,7 +1029,9 @@ impl Engine for AuthEngine {
                 }
                 Op::CreateAccount { .. }
                 | Op::CreateSealedAccount { .. }
-                | Op::UpdateAccount { .. } => {}
+                | Op::UpdateAccount { .. }
+                | Op::SetIdentifier { .. }
+                | Op::SetPolicy { .. } => {}
             }
         }
         Ok(())
@@ -972,7 +1093,17 @@ enum StagedOp {
     },
     UpdateAccount {
         account: AccountId,
+        what: u8,
         /// The new record, sealed while staging.
+        value: Vec<u8>,
+        at_ms: u64,
+    },
+    SetIdentifier {
+        digest: [u8; 32],
+        account: Option<AccountId>,
+        at_ms: u64,
+    },
+    SetPolicy {
         value: Vec<u8>,
         at_ms: u64,
     },
@@ -991,6 +1122,10 @@ pub(crate) struct AuthStaged<'e> {
     raised: HashMap<AccountId, u32>,
     /// Account records this work replaced, by account.
     updated: HashMap<AccountId, AccountRecord>,
+    /// Identifiers this work removed.
+    removed: HashSet<[u8; 32]>,
+    /// The role policy as this work left it.
+    policy: Option<Policy>,
 }
 
 impl<'e> AuthStaged<'e> {
@@ -1004,6 +1139,8 @@ impl<'e> AuthStaged<'e> {
             issued: HashSet::new(),
             raised: HashMap::new(),
             updated: HashMap::new(),
+            removed: HashSet::new(),
+            policy: None,
         }
     }
 }
@@ -1116,11 +1253,29 @@ fn write_ops(ops: &[StagedOp], out: &mut Vec<u8>) -> Result<()> {
             }
             StagedOp::UpdateAccount {
                 account,
+                what,
                 value,
                 at_ms,
             } => {
-                w.u8(OP_UPDATE_ACCOUNT);
+                w.u8(OP_UPDATE_ACCOUNT_AS);
                 w.bytes(account.as_bytes());
+                w.u8(*what);
+                w.bytes32(value)?;
+                w.u64(*at_ms);
+            }
+            StagedOp::SetIdentifier {
+                digest,
+                account,
+                at_ms,
+            } => {
+                w.u8(OP_SET_IDENTIFIER);
+                w.bytes(digest);
+                w.u8(u8::from(account.is_some()));
+                w.bytes(account.unwrap_or(AccountId::from_bytes([0; 16])).as_bytes());
+                w.u64(*at_ms);
+            }
+            StagedOp::SetPolicy { value, at_ms } => {
+                w.u8(OP_SET_POLICY);
                 w.bytes32(value)?;
                 w.u64(*at_ms);
             }
@@ -1163,21 +1318,29 @@ fn open_value(key: &[u8; 32], store_key: &[u8], value: &[u8]) -> Result<Zeroizin
 }
 
 /// An account record: what the account store holds per account.
+#[derive(Clone)]
 struct AccountRecord {
     created_ms: u64,
+    /// The identifier the account was created with (or, after it was
+    /// removed, the oldest one left).
     digest: [u8; 32],
     standing: Standing,
     phc: Zeroizing<String>,
+    /// Further identifiers, oldest first.
+    identifiers: Vec<[u8; 32]>,
+    roles: Vec<RoleId>,
 }
 
 impl AccountRecord {
     /// The sealed plaintext: format, created time, identifier digest,
-    /// standing (code, until, reason), then the credential (kind and
-    /// Argon2id string).
+    /// standing (code, until, reason), the credential (kind and Argon2id
+    /// string), then the further identifiers and the role ids.
     fn encode(&self) -> Result<Zeroizing<Vec<u8>>> {
-        let mut plain = Zeroizing::new(Vec::with_capacity(60 + self.phc.len()));
+        let mut plain = Zeroizing::new(Vec::with_capacity(
+            64 + self.phc.len() + 32 * self.identifiers.len() + 4 * self.roles.len(),
+        ));
         let mut w = Writer::new(&mut plain);
-        w.u8(ACCOUNT_FORMAT_SEALED);
+        w.u8(ACCOUNT_FORMAT_SEALED_ROLES);
         w.u64(self.created_ms);
         w.bytes(&self.digest);
         let (code, until, reason) = encode_standing(self.standing);
@@ -1186,13 +1349,22 @@ impl AccountRecord {
         w.u32(reason);
         w.u8(CREDENTIAL_PASSWORD);
         w.str16(&self.phc)?;
+        w.u8(self.identifiers.len() as u8);
+        for digest in &self.identifiers {
+            w.bytes(digest);
+        }
+        w.u8(self.roles.len() as u8);
+        for role in &self.roles {
+            w.u32(role.get());
+        }
         Ok(plain)
     }
 
     fn decode(plain: &[u8]) -> Result<AccountRecord> {
         let corrupt = || Error::corrupt("a sealed account record", 0);
         let mut r = Reader::new(plain, "a sealed account record", 0);
-        if r.u8()? != ACCOUNT_FORMAT_SEALED {
+        let format = r.u8()?;
+        if format != ACCOUNT_FORMAT_SEALED && format != ACCOUNT_FORMAT_SEALED_ROLES {
             return Err(corrupt());
         }
         let created_ms = r.u64()?;
@@ -1205,13 +1377,30 @@ impl AccountRecord {
             return Err(corrupt());
         }
         let phc = Zeroizing::new(r.str16()?.to_owned());
+        let mut identifiers = Vec::new();
+        let mut roles = Vec::new();
+        if format == ACCOUNT_FORMAT_SEALED_ROLES {
+            for _ in 0..r.u8()? {
+                identifiers.push(r.fixed::<32>()?);
+            }
+            for _ in 0..r.u8()? {
+                roles.push(RoleId::from_u32(r.u32()?));
+            }
+        }
         r.finish()?;
         Ok(AccountRecord {
             created_ms,
             digest,
             standing,
             phc,
+            identifiers,
+            roles,
         })
+    }
+
+    /// Every identifier of the account, the first one first.
+    fn all_identifiers(&self) -> impl Iterator<Item = &[u8; 32]> {
+        std::iter::once(&self.digest).chain(&self.identifiers)
     }
 
     /// The record sealed for `account` under the engine's file key.
@@ -1473,6 +1662,8 @@ impl AuthTx<'_, '_> {
             digest,
             standing: Standing::Active,
             phc: Zeroizing::new(password.0.clone()),
+            identifiers: Vec::new(),
+            roles: Vec::new(),
         }
         .seal(engine, account)?;
         self.staged.ops.push(StagedOp::CreateAccount {
@@ -1631,23 +1822,11 @@ impl AuthTx<'_, '_> {
         if self.staged.accounts.contains(&account) {
             return Err(Error::invalid("account", "created in this transaction"));
         }
-        let Some(mut record) = self.record(account)? else {
-            return Err(Error::invalid("account", "no such account"));
-        };
-        record.standing = standing;
-        let value = record.seal(engine, account)?;
-        self.staged.ops.retain(
-            |op| !matches!(op, StagedOp::UpdateAccount { account: a, .. } if *a == account),
-        );
-        let _ = self.staged.updated.insert(account, record);
-        self.staged
-            .writes
-            .push(account_key(engine.collection, account));
-        self.staged.ops.push(StagedOp::UpdateAccount {
-            account,
-            value,
-            at_ms: now_ms(),
-        });
+        let _ = engine;
+        self.update_record(account, UPDATE_STANDING, |record| {
+            record.standing = standing;
+            Ok(())
+        })?;
         if standing.blocked_until(now_ms()).is_some() {
             let _ = self.revoke_all(account)?;
         }
@@ -1657,14 +1836,214 @@ impl AuthTx<'_, '_> {
     /// The account's record as this transaction sees it.
     fn record(&self, account: AccountId) -> Result<Option<AccountRecord>> {
         if let Some(record) = self.staged.updated.get(&account) {
-            return Ok(Some(AccountRecord {
-                created_ms: record.created_ms,
-                digest: record.digest,
-                standing: record.standing,
-                phc: record.phc.clone(),
-            }));
+            return Ok(Some(record.clone()));
         }
         self.staged.engine.load_account(account)
+    }
+
+    /// Replace the account's record with `change` applied, in this commit;
+    /// `what` says what changed, for the audit chain. One record per account
+    /// is written, the last.
+    fn update_record(
+        &mut self,
+        account: AccountId,
+        what: u8,
+        change: impl FnOnce(&mut AccountRecord) -> Result<()>,
+    ) -> Result<()> {
+        let engine = self.staged.engine;
+        if self.staged.accounts.contains(&account) {
+            return Err(Error::invalid("account", "created in this transaction"));
+        }
+        let Some(mut record) = self.record(account)? else {
+            return Err(Error::invalid("account", "no such account"));
+        };
+        change(&mut record)?;
+        let value = record.seal(engine, account)?;
+        let mut what = what;
+        self.staged.ops.retain(|op| match op {
+            StagedOp::UpdateAccount {
+                account: a,
+                what: earlier,
+                ..
+            } if *a == account => {
+                if *earlier != what {
+                    what = UPDATE_SEVERAL;
+                }
+                false
+            }
+            _ => true,
+        });
+        let _ = self.staged.updated.insert(account, record);
+        self.staged
+            .writes
+            .push(account_key(engine.collection, account));
+        self.staged.ops.push(StagedOp::UpdateAccount {
+            account,
+            what,
+            value,
+            at_ms: now_ms(),
+        });
+        Ok(())
+    }
+
+    /// The role policy as this transaction sees it.
+    fn policy(&self) -> Policy {
+        match &self.staged.policy {
+            Some(policy) => policy.clone(),
+            None => (*self.staged.engine.policy()).clone(),
+        }
+    }
+
+    /// Replace the account's password. Every session the account has ends,
+    /// in this commit; a session issued later in the same transaction
+    /// stays.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the account does not exist, or was created in
+    /// this same transaction.
+    pub fn set_password(&mut self, account: AccountId, password: &HashedPassword) -> Result<()> {
+        self.update_record(account, UPDATE_PASSWORD, |record| {
+            record.phc = Zeroizing::new(password.0.clone());
+            Ok(())
+        })?;
+        let _ = self.revoke_all(account)?;
+        Ok(())
+    }
+
+    /// Let the account also sign in with `identifier` (a second email
+    /// address, a username). An account has at most five identifiers.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::AlreadyExists`] (`what = "identifier"`) when an account
+    ///   already uses the identifier.
+    /// - [`Error::Invalid`] when the identifier is not valid (as for
+    ///   [`create_account`](Self::create_account)), the account has five,
+    ///   or the account does not exist or was created in this transaction.
+    pub fn add_identifier(&mut self, account: AccountId, identifier: &str) -> Result<()> {
+        let engine = self.staged.engine;
+        let normalized = normalize_identifier(identifier)?;
+        let digest = engine.identifier_digest(&normalized);
+        let taken = self.staged.identifiers.contains(&digest)
+            || (!self.staged.removed.contains(&digest) && engine.account_for(&digest)?.is_some());
+        if taken {
+            return Err(Error::AlreadyExists { what: "identifier" });
+        }
+        self.update_record(account, UPDATE_IDENTIFIERS, |record| {
+            if record.identifiers.len() + 1 >= MAX_IDENTIFIERS {
+                return Err(Error::invalid("account", "has five identifiers already"));
+            }
+            record.identifiers.push(digest);
+            Ok(())
+        })?;
+        let _ = self.staged.identifiers.insert(digest);
+        let _ = self.staged.removed.remove(&digest);
+        self.staged
+            .writes
+            .push(identifier_key(engine.collection, &digest));
+        self.staged.ops.push(StagedOp::SetIdentifier {
+            digest,
+            account: Some(account),
+            at_ms: now_ms(),
+        });
+        Ok(())
+    }
+
+    /// Stop the account signing in with `identifier`. Returns `false` when
+    /// the identifier is not one of the account's.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when it is the account's only identifier (an
+    /// account keeps at least one), or the account does not exist or was
+    /// created in this transaction.
+    pub fn remove_identifier(&mut self, account: AccountId, identifier: &str) -> Result<bool> {
+        let engine = self.staged.engine;
+        let Ok(normalized) = normalize_identifier(identifier) else {
+            return Ok(false);
+        };
+        let digest = engine.identifier_digest(&normalized);
+        let Some(record) = self.record(account)? else {
+            return Err(Error::invalid("account", "no such account"));
+        };
+        if !record.all_identifiers().any(|d| *d == digest) {
+            return Ok(false);
+        }
+        if record.identifiers.is_empty() {
+            return Err(Error::invalid("account", "keeps at least one identifier"));
+        }
+        self.update_record(account, UPDATE_IDENTIFIERS, |record| {
+            if record.digest == digest {
+                record.digest = record.identifiers.remove(0);
+            } else {
+                record.identifiers.retain(|d| *d != digest);
+            }
+            Ok(())
+        })?;
+        let _ = self.staged.identifiers.remove(&digest);
+        let _ = self.staged.removed.insert(digest);
+        self.staged
+            .writes
+            .push(identifier_key(engine.collection, &digest));
+        self.staged.ops.push(StagedOp::SetIdentifier {
+            digest,
+            account: None,
+            at_ms: now_ms(),
+        });
+        Ok(true)
+    }
+
+    /// Define a role in the realm and return its id. Roles are never
+    /// removed, so an id stays valid.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::AlreadyExists`] (`what = "role"`) when a role has the name.
+    /// - [`Error::Invalid`] when a name is empty or longer than 64 bytes,
+    ///   the role grants more than 64 permissions or inherits more than 64
+    ///   roles, inherits one that is not defined, or the realm has 256.
+    pub fn define_role(&mut self, role: Role) -> Result<RoleId> {
+        let (next, id) = self.policy().with(role)?;
+        let value = next.encode()?;
+        self.staged
+            .ops
+            .retain(|op| !matches!(op, StagedOp::SetPolicy { .. }));
+        self.staged.ops.push(StagedOp::SetPolicy {
+            value,
+            at_ms: now_ms(),
+        });
+        self.staged.writes.push(POLICY_CONFLICT_KEY.to_vec());
+        self.staged.policy = Some(next);
+        Ok(id)
+    }
+
+    /// Replace the account's roles with `roles` (at most 16; repeats count
+    /// once).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when a role is not defined, there are more than
+    /// 16, or the account does not exist or was created in this
+    /// transaction.
+    pub fn assign_roles(&mut self, account: AccountId, roles: &[RoleId]) -> Result<()> {
+        let policy = self.policy();
+        let mut list: Vec<RoleId> = Vec::with_capacity(roles.len());
+        for role in roles {
+            if policy.get(*role).is_none() {
+                return Err(Error::invalid("role", "not defined"));
+            }
+            if !list.contains(role) {
+                list.push(*role);
+            }
+        }
+        if list.len() > MAX_ACCOUNT_ROLES {
+            return Err(Error::invalid("roles", "an account holds at most 16"));
+        }
+        self.update_record(account, UPDATE_ROLES, |record| {
+            record.roles = list;
+            Ok(())
+        })
     }
 
     /// Lock the account out until `until`, unless its standing already keeps
@@ -1914,6 +2293,114 @@ impl Auth<'_> {
         self.db
             .commit(|tx| tx.auth().set_standing(account, standing, by))
     }
+
+    /// The account, or `None` when it does not exist: its standing (as
+    /// [`standing`](Self::standing) reads it), when it was created, and its
+    /// roles. Never a credential or an identifier.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] when the record fails its check, and storage
+    /// errors.
+    pub fn account(&self, account: AccountId) -> Result<Option<Account>> {
+        Ok(self.engine().load_account(account)?.map(|record| Account {
+            id: account,
+            created_at: time_of(record.created_ms),
+            standing: record.standing.at(now_ms()),
+            roles: record.roles,
+        }))
+    }
+
+    /// The account's roles; none when the account does not exist.
+    ///
+    /// # Errors
+    ///
+    /// As [`account`](Self::account).
+    pub fn roles(&self, account: AccountId) -> Result<Vec<RoleId>> {
+        Ok(self
+            .engine()
+            .load_account(account)?
+            .map(|record| record.roles)
+            .unwrap_or_default())
+    }
+
+    /// True when one of the account's roles, or a role they inherit, grants
+    /// `permission` under the current policy. Checks roles only: a session
+    /// check and the account's standing come first.
+    ///
+    /// # Errors
+    ///
+    /// As [`account`](Self::account).
+    pub fn allowed(&self, account: AccountId, permission: &str) -> Result<bool> {
+        let roles = self.roles(account)?;
+        Ok(self.engine().policy().allows(&roles, permission))
+    }
+
+    /// The role with id `role`, if defined.
+    #[must_use]
+    pub fn role(&self, role: RoleId) -> Option<Role> {
+        self.engine().policy().get(role).cloned()
+    }
+
+    /// The id of the role named `name`, if defined.
+    #[must_use]
+    pub fn role_named(&self, name: &str) -> Option<RoleId> {
+        self.engine().policy().named(name)
+    }
+
+    /// Define a role in its own commit. See [`AuthTx::define_role`].
+    ///
+    /// # Errors
+    ///
+    /// As [`AuthTx::define_role`], plus the errors of [`Database::commit`].
+    pub fn define_role(&self, role: Role) -> Result<RoleId> {
+        self.db.commit(|tx| tx.auth().define_role(role.clone()))
+    }
+
+    /// Replace an account's roles in its own commit. See
+    /// [`AuthTx::assign_roles`].
+    ///
+    /// # Errors
+    ///
+    /// As [`AuthTx::assign_roles`], plus the errors of [`Database::commit`].
+    pub fn assign_roles(&self, account: AccountId, roles: &[RoleId]) -> Result<()> {
+        self.db.commit(|tx| tx.auth().assign_roles(account, roles))
+    }
+
+    /// Replace an account's password in its own commit. See
+    /// [`AuthTx::set_password`].
+    ///
+    /// # Errors
+    ///
+    /// As [`AuthTx::set_password`], plus the errors of [`Database::commit`].
+    pub fn set_password(&self, account: AccountId, password: &HashedPassword) -> Result<()> {
+        self.db
+            .commit(|tx| tx.auth().set_password(account, password))
+    }
+
+    /// Add an identifier in its own commit. See
+    /// [`AuthTx::add_identifier`].
+    ///
+    /// # Errors
+    ///
+    /// As [`AuthTx::add_identifier`], plus the errors of
+    /// [`Database::commit`].
+    pub fn add_identifier(&self, account: AccountId, identifier: &str) -> Result<()> {
+        self.db
+            .commit(|tx| tx.auth().add_identifier(account, identifier))
+    }
+
+    /// Remove an identifier in its own commit. See
+    /// [`AuthTx::remove_identifier`].
+    ///
+    /// # Errors
+    ///
+    /// As [`AuthTx::remove_identifier`], plus the errors of
+    /// [`Database::commit`].
+    pub fn remove_identifier(&self, account: AccountId, identifier: &str) -> Result<bool> {
+        self.db
+            .commit(|tx| tx.auth().remove_identifier(account, identifier))
+    }
 }
 
 /// Auth reads at one snapshot, inside [`Database::read`](crate::Database::read).
@@ -1986,7 +2473,7 @@ mod tests {
     #[test]
     fn test_decode_ops_unknown_op_is_corrupt() {
         assert!(matches!(
-            decode_ops(1, &[9]),
+            decode_ops(1, &[0xEE]),
             Err(Error::Corrupt { at: 1, .. })
         ));
     }
@@ -2102,6 +2589,8 @@ mod tests {
                 reason: u32::MAX,
             },
             phc: Zeroizing::new(phc),
+            identifiers: vec![[3; 32]; MAX_IDENTIFIERS - 1],
+            roles: vec![RoleId::from_u32(u32::MAX); MAX_ACCOUNT_ROLES],
         };
         let value = seal_value(
             &[5; 32],
@@ -2111,7 +2600,13 @@ mod tests {
         .unwrap();
         let update = sealed_len(StagedOp::UpdateAccount {
             account,
+            what: UPDATE_SEVERAL,
             value: value.clone(),
+            at_ms: u64::MAX,
+        });
+        let identifier = sealed_len(StagedOp::SetIdentifier {
+            digest: [2; 32],
+            account: Some(account),
             at_ms: u64::MAX,
         });
         let create = sealed_len(StagedOp::CreateAccount {
@@ -2143,6 +2638,7 @@ mod tests {
             at_ms: u64::MAX,
         });
         assert_eq!(revoke, raise);
+        assert_eq!(revoke, identifier);
         assert_eq!(create, update);
         assert_eq!(create, issue);
         assert_eq!(issue, revoke);
@@ -2216,6 +2712,8 @@ mod tests {
                 digest: [1; 32],
                 standing,
                 phc: phc.clone(),
+                identifiers: vec![[4; 32]],
+                roles: vec![RoleId::from_u32(2)],
             };
             let back = AccountRecord::decode(&record.encode().unwrap()).unwrap();
             assert_eq!(back.standing, standing);

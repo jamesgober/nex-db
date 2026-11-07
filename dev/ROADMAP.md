@@ -53,12 +53,13 @@
   - [x] Fixed-key session table with lock-free reads (`PLAN.md` D-061) and the timer wheel (D-062); `Builder::max_sessions` (D-064).
   - [x] Benchmarks `auth/validate_hit` (1, 1 million; 10 million with `NEX_BENCH_LARGE`), `auth/issue_durable`, `auth/revoke_durable`, `core/commit_throughput`, and `table/get_hit`.
 - Moved (`PLAN.md` D-058, D-065): named realms, `commit_serializable`, and catalog locks to 0.4; the revocation journal to 0.5; incremental session-table checkpoints to 0.6.
-- **Exit:** James's site signs users in on nex-db. Released 2026-11-07 with this open: the site has no nex-db adapter yet (the WASP adapter arrives in 0.4), so `examples/site.rs` stands in for it (sign up, sign in, validate, reopen) and runs on Linux, macOS, and Windows in CI. James confirms on his site.
+- **Exit:** James's site signs users in on nex-db. Released 2026-11-07 with this open: the site's adapter to nex-db comes with 0.4, so `examples/site.rs` stands in for it (sign up, sign in, validate, reopen) and runs on Linux, macOS, and Windows in CI. James confirms on his site.
 
 ## 0.4.0 Content and adapters
 
 - Types, revisions, statuses, scheduling, locales, route index, redirects, references, reverse index, listings, change feed (FR-9, FR-10).
 - Auth extras (FR-8). Metrics and health hooks.
+  - [x] `account`, `add_identifier`, `remove_identifier` (from 0.3, `PLAN.md` D-066), roles (D-067), `set_password` (D-068).
 - **Exit:** James's site serves its pages from nex-db.
 
 ## 0.5.0 Feature complete

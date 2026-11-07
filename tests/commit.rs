@@ -741,3 +741,153 @@ fn test_many_sessions_across_table_levels_validate_after_reopen() {
         ));
     }
 }
+
+#[test]
+fn test_account_roles_and_allowed_follow_the_policy() {
+    use nex_db::Role;
+    let dir = TempDir::new("roles");
+    let db = Database::open(&dir.0).unwrap();
+    let password = db.auth().hash_password(PASSWORD).unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    let member = db
+        .auth()
+        .define_role(Role::new("member").permission("post.read"))
+        .unwrap();
+    let editor = db
+        .auth()
+        .define_role(
+            Role::new("editor")
+                .permission("post.publish")
+                .inherits(member),
+        )
+        .unwrap();
+    assert!(matches!(
+        db.auth().define_role(Role::new("member")),
+        Err(Error::AlreadyExists { what: "role" })
+    ));
+    assert_eq!(db.auth().role_named("editor"), Some(editor));
+    assert_eq!(db.auth().role(editor).unwrap().name(), "editor");
+
+    assert!(!db.auth().allowed(ann, "post.read").unwrap());
+    db.auth().assign_roles(ann, &[editor, editor]).unwrap();
+    assert!(db.auth().allowed(ann, "post.read").unwrap());
+    assert!(db.auth().allowed(ann, "post.publish").unwrap());
+    assert!(!db.auth().allowed(ann, "user.manage").unwrap());
+    let account = db.auth().account(ann).unwrap().unwrap();
+    assert_eq!(account.id(), ann);
+    assert_eq!(account.roles(), [editor]);
+    assert_eq!(account.standing(), Standing::Active);
+    assert!(
+        db.auth()
+            .assign_roles(ann, &[nex_db::RoleId::from_u32(99)])
+            .is_err()
+    );
+    drop(db);
+
+    // Roles, the policy, and assignments survive a reopen.
+    let db = Database::open(&dir.0).unwrap();
+    assert_eq!(db.auth().role_named("member"), Some(member));
+    assert_eq!(db.auth().roles(ann).unwrap(), [editor]);
+    assert!(db.auth().allowed(ann, "post.read").unwrap());
+    assert!(
+        db.auth()
+            .account(nex_db::AccountId::from_bytes([9; 16]))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn test_identifiers_can_be_added_and_removed_but_not_the_last() {
+    let dir = TempDir::new("identifiers");
+    let db = Database::open(&dir.0).unwrap();
+    let password = db.auth().hash_password(PASSWORD).unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    let bob = db
+        .auth()
+        .create_account("bob@example.com", &password)
+        .unwrap();
+    db.auth()
+        .add_identifier(ann, "Ann.Work@Example.com")
+        .unwrap();
+    assert!(matches!(
+        db.auth().add_identifier(bob, "ann.work@example.com"),
+        Err(Error::AlreadyExists { what: "identifier" })
+    ));
+    let signed_in = |id: &str| {
+        matches!(
+            db.auth().verify_password(id, PASSWORD).unwrap(),
+            Login::Verified(a) if a == ann
+        )
+    };
+    assert!(signed_in("ann.work@example.com"));
+    assert!(signed_in("ann@example.com"));
+
+    assert!(!db.auth().remove_identifier(ann, "bob@example.com").unwrap());
+    assert!(db.auth().remove_identifier(ann, "ann@example.com").unwrap());
+    assert!(!signed_in("ann@example.com"));
+    assert!(signed_in("ann.work@example.com"));
+    assert!(
+        db.auth()
+            .remove_identifier(ann, "ann.work@example.com")
+            .is_err()
+    );
+    // The freed identifier can go to another account.
+    db.auth().add_identifier(bob, "ann@example.com").unwrap();
+    drop(db);
+
+    let db = Database::open(&dir.0).unwrap();
+    assert!(matches!(
+        db.auth().verify_password("ann@example.com", PASSWORD).unwrap(),
+        Login::Verified(a) if a == bob
+    ));
+    assert!(matches!(
+        db.auth().verify_password("ann.work@example.com", PASSWORD).unwrap(),
+        Login::Verified(a) if a == ann
+    ));
+}
+
+#[test]
+fn test_set_password_ends_sessions_and_changes_the_password() {
+    let dir = TempDir::new("set-password");
+    let db = Database::open(&dir.0).unwrap();
+    let password = db.auth().hash_password(PASSWORD).unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    let old = db.auth().issue_session(ann, SessionSpec::web()).unwrap();
+    let new_password = db.auth().hash_password("a new long password").unwrap();
+    let kept = db
+        .commit(|tx| {
+            tx.auth().set_password(ann, &new_password)?;
+            tx.auth().issue_session(ann, SessionSpec::web())
+        })
+        .unwrap();
+    assert!(matches!(
+        db.auth().validate(&old).unwrap(),
+        Validation::Revoked { .. }
+    ));
+    assert!(matches!(
+        db.auth().validate(&kept).unwrap(),
+        Validation::Valid(_)
+    ));
+    assert_eq!(
+        db.auth()
+            .verify_password("ann@example.com", PASSWORD)
+            .unwrap(),
+        Login::Failed
+    );
+    assert!(matches!(
+        db.auth()
+            .verify_password("ann@example.com", "a new long password")
+            .unwrap(),
+        Login::Verified(_)
+    ));
+}

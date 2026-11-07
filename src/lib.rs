@@ -111,6 +111,7 @@ mod wheel;
 #[cfg_attr(docsrs, doc(cfg(feature = "auth")))]
 pub use crate::auth::{
     Auth, AuthRead, AuthTx,
+    roles::{Account, Role, RoleId},
     token::Token,
     types::{
         HashedPassword, Login, RevokeReason, Session, SessionSpec, SignIn, Standing, Validation,

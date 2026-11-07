@@ -6,6 +6,16 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 ## [Unreleased]
 
+### Added
+
+- `Auth::account` and `Account`; `add_identifier` and `remove_identifier` (up to five identifiers per account).
+- Roles: `Role`, `RoleId`, `define_role`, `assign_roles`, `roles`, `role`, `role_named`, and `allowed`.
+- `set_password`: replaces the password and ends the account's sessions in the same commit.
+
+### Changed
+
+- Account records are format 3 (further identifiers and roles); format 2 records still read.
+
 ## [0.3.0] - 2026-11-07
 
 ### Added

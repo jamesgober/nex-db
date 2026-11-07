@@ -409,11 +409,11 @@ it.
 | `create_account(identifier, &HashedPassword) -> Result<AccountId>` | 0.1 | P0 | unique by identifier |
 | `sign_in(identifier, password, spec) -> Result<SignIn>` | 0.1 | P0 | check and issue in one call |
 | `verify_password(identifier, password) -> Result<Login>` | 0.3 | P1 | check only; ten failures within fifteen minutes lock the account out for fifteen minutes (set per realm from `RealmPolicy`) |
-| `account(id) -> Result<Option<Account>>` | 0.3 | P0 | standing, created, roles; never the hash, never identifiers |
+| `account(id) -> Result<Option<Account>>` | 0.4 | P0 | standing, created, roles; never the hash, never identifiers |
 | `standing(account) -> Result<Option<Standing>>` | 0.3 | P0 | the read a request makes when a session's `recheck_at` has passed |
 | `set_standing(account, Standing, by: Option<AccountId>) -> Result<()>` | 0.3 | P0 | a ban or lock-out ends every session at once; `by` is `None` for an automatic lock-out |
 | `set_password(account, &HashedPassword) -> Result<()>` | 0.4 | P1 | ends the account's other sessions |
-| `add_identifier`, `remove_identifier` | 0.3 | P1 | a second email, a username |
+| `add_identifier(account, identifier)`, `remove_identifier(account, identifier) -> Result<bool>` | 0.4 | P1 | a second email, a username; at most five per account, and never fewer than one |
 | `erase_account(account) -> Result<()>` | 0.5 | P2 | destroys the account's key: its data in every copy and backup becomes unreadable |
 
 `SignIn` (non-exhaustive): `Success { account, token }` and `Failed` (0.1);
@@ -447,7 +447,7 @@ every session of the account in the same commit.
 | `redeem(token, purpose) -> Result<Option<AccountId>>` | P1 | works once |
 | `create_api_key(account, scopes, expiry) -> Result<ApiKey>` | P1 | the key text is shown once |
 | `validate_api_key(text) -> Result<ApiKeyCheck>`, `revoke_api_key(id)` | P1 | |
-| `define_role(Role)`, `assign_roles(account, &[RoleId])`, `roles(account)` | P1 | |
+| `define_role(Role) -> Result<RoleId>`, `assign_roles(account, &[RoleId])`, `roles(account)`, `role(id)`, `role_named(name)` | P1 | `Role::new(name).permission(p).inherits(id)`; a role inherits only roles already defined; roles are never removed; at most 256 per realm and 16 per account |
 | `allowed(account, permission) -> Result<bool>` | P1 | checks the account's roles against the current policy |
 | `link_external(account, provider, subject)`, `find_external(provider, subject)` | P2 | OAuth and OpenID Connect sign-in |
 | `devices(account)`, `bind_device_key(account, device, public_key)` | P2 | |
@@ -473,7 +473,7 @@ Inside `db.commit`, `tx.auth()` stages:
 | `issue_session(account, spec) -> Result<Token>` | 0.1 |
 | `revoke(token) -> Result<bool>` | 0.1 |
 | `revoke_all`, `set_standing`, `rotate` | 0.3 |
-| `add_identifier`, `remove_identifier` | 0.3 |
+| `add_identifier`, `remove_identifier`, `define_role` | 0.4 |
 | `set_password`, `assign_roles`, `new_recovery_codes` | 0.4 |
 
 A token staged with `tx.auth().issue_session` is valid only once the commit

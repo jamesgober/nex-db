@@ -70,7 +70,7 @@ cargo run --example site
 
 ## Status
 
-Version 0.2: the design lock. The API through 1.0 is in [`docs/API.md`](./docs/API.md); file formats and the API may still change before 1.0, each change recorded in the plan. The plan is in [`dev/PLAN.md`](./dev/PLAN.md) and the schedule in [`dev/ROADMAP.md`](./dev/ROADMAP.md).
+Version 0.3: the core and the auth engine. The API through 1.0 is in [`docs/API.md`](./docs/API.md); file formats and the API may still change before 1.0, each change recorded in the plan. The plan is in [`dev/PLAN.md`](./dev/PLAN.md) and the schedule in [`dev/ROADMAP.md`](./dev/ROADMAP.md).
 
 ## Documentation
 

@@ -98,6 +98,8 @@ pub struct Builder {
     dir: std::path::PathBuf,
     keys: Keys,
     checkpoint_every: u64,
+    #[cfg_attr(not(feature = "auth"), allow(dead_code))]
+    max_sessions: usize,
 }
 
 impl Builder {
@@ -118,6 +120,17 @@ impl Builder {
         self
     }
 
+    /// Most sessions (and revocation tombstones) the auth engine holds at
+    /// once (default 1,000,000; at most 4,294,967,295). Past it, issuing a
+    /// session fails with [`Error::Busy`] until expired ones are reclaimed.
+    /// Memory follows the sessions held, not this limit, so a high limit
+    /// costs nothing until it is used; the limit keeps a flood of sign-ins
+    /// from taking all of it.
+    pub fn max_sessions(mut self, n: usize) -> Self {
+        self.max_sessions = n.clamp(1, u32::MAX as usize);
+        self
+    }
+
     /// Open (or create) the database.
     ///
     /// # Errors
@@ -128,6 +141,12 @@ impl Builder {
         Database::open_with(self)
     }
 }
+
+/// Most sessions (and revocation tombstones) the auth engine holds at once,
+/// by default. Staging refuses a session past the limit; the session table
+/// has room for twice as many, so a commit that was staged in time always
+/// applies.
+const DEFAULT_MAX_SESSIONS: usize = 1_000_000;
 
 /// An open database.
 ///
@@ -167,6 +186,7 @@ impl Database {
             dir: path.as_ref().to_path_buf(),
             keys: Keys::default(),
             checkpoint_every: CHECKPOINT_EVERY,
+            max_sessions: DEFAULT_MAX_SESSIONS,
         }
     }
 
@@ -183,7 +203,12 @@ impl Database {
 
         let engines = Engines {
             #[cfg(feature = "auth")]
-            auth: AuthEngine::open(&auth_dir.join("accounts"), &root, DEFAULT_REALM.id)?,
+            auth: AuthEngine::open(
+                &auth_dir.join("accounts"),
+                &root,
+                DEFAULT_REALM.id,
+                builder.max_sessions,
+            )?,
             #[cfg(feature = "content")]
             content: ContentEngine::open(&dir.join("content").join("store"), DEFAULT_SPACE.id)?,
         };

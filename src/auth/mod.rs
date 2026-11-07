@@ -107,8 +107,13 @@ const MAX_IDENTIFIER: usize = 320;
 /// Longest password, in bytes. Bounds the work one sign-in can demand.
 const MAX_PASSWORD: usize = 1024;
 
-/// Most sessions (and revocation tombstones) held at once.
-const MAX_SESSIONS: usize = 1_000_000;
+/// The session table has no room: staging keeps it well below its size, so
+/// this halts writes rather than lose an acknowledged session.
+fn table_full() -> Error {
+    Error::Busy {
+        what: "the session table",
+    }
+}
 
 /// Key of the account store's applied-through mark.
 const META_APPLIED: &[u8] = b"\0meta/applied";
@@ -248,6 +253,8 @@ pub(crate) struct AuthEngine {
     /// Password hashes in progress, bounded by `max_hashing`.
     hashing: AtomicUsize,
     max_hashing: usize,
+    /// Most sessions and tombstones held at once.
+    max_sessions: usize,
     /// A hash checked for unknown identifiers, so they cost what a wrong
     /// password costs.
     dummy: OnceLock<String>,
@@ -264,7 +271,12 @@ impl fmt::Debug for AuthEngine {
 
 impl AuthEngine {
     /// Open the engine's store in `dir`.
-    pub(crate) fn open(dir: &Path, root: &RootKey, collection: u32) -> Result<Self> {
+    pub(crate) fn open(
+        dir: &Path,
+        root: &RootKey,
+        collection: u32,
+        max_sessions: usize,
+    ) -> Result<Self> {
         let accounts = Lsm::open(dir)?;
         let auth_dir = dir.parent().unwrap_or(dir).to_path_buf();
         let sessions_file = auth_dir.join(SESSIONS_FILE);
@@ -299,7 +311,7 @@ impl AuthEngine {
             accounts_durable: AtomicU64::new(applied),
             sessions_through: AtomicU64::new(0),
             writing: Mutex::new(()),
-            sessions: SessionTable::new(),
+            sessions: SessionTable::new(max_sessions, now_ms()),
             epochs: EpochTable::new(),
             audit,
             versions: Versions::new(),
@@ -307,14 +319,22 @@ impl AuthEngine {
             conflicts: ConflictTable::new(),
             hashing: AtomicUsize::new(0),
             max_hashing,
+            max_sessions,
             dummy: OnceLock::new(),
         };
         if let Some(checkpoint) = checkpoint {
             for (account, epoch) in checkpoint.epochs {
                 engine.epochs.raise(account, epoch);
             }
-            for (digest, slot, seen) in checkpoint.slots {
-                engine.sessions.restore(digest, slot, seen);
+            for (digest, slot, time) in checkpoint.slots {
+                let epoch = match slot {
+                    Slot::Live(session) => engine.epochs.get(session.account),
+                    Slot::Revoked(_) => 0,
+                };
+                engine
+                    .sessions
+                    .restore(digest, slot, time, epoch)
+                    .map_err(|_| table_full())?;
             }
             engine
                 .sessions_through
@@ -328,9 +348,8 @@ impl AuthEngine {
     /// tombstones, sealed under the file key.
     fn save_sessions(&self, through: Seq) -> Result<()> {
         let epochs = self.epochs.snapshot();
-        // Expired sessions and old tombstones go first: they are invalid
-        // either way, and the table is bounded.
-        let _ = self.sessions.prune(now_ms());
+        // Slots whose time has passed go first: they are invalid either way.
+        let _ = self.sessions.reclaim(now_ms());
         let slots = self.sessions.snapshot();
         let mut plain =
             Zeroizing::new(Vec::with_capacity(8 + epochs.len() * 20 + slots.len() * 70));
@@ -560,22 +579,19 @@ impl AuthEngine {
         };
         let digest = self.token_digest(&random);
         let now = now_ms();
+        // No epoch lookup: signing an account out everywhere turns its
+        // sessions into tombstones when the commit applies.
         match self.sessions.get_seen(&digest) {
             None => Validation::Unknown,
-            Some((Slot::Revoked(reason), _)) => Validation::Revoked { reason },
-            Some((Slot::Live(session), _)) if now >= session.expires_ms => Validation::Expired,
-            Some((Slot::Live(session), seen))
+            Some((Slot::Revoked(reason), ..)) => Validation::Revoked { reason },
+            Some((Slot::Live(session), ..)) if now >= session.expires_ms => Validation::Expired,
+            Some((Slot::Live(session), seen, _))
                 if session.idle_ms != 0 && now.saturating_sub(seen) >= session.idle_ms =>
             {
                 Validation::Expired
             }
-            Some((Slot::Live(session), _)) if session.epoch != self.epochs.get(session.account) => {
-                Validation::Revoked {
-                    reason: RevokeReason::SignedOutEverywhere,
-                }
-            }
-            Some((Slot::Live(session), _)) => {
-                self.sessions.touch(&digest, now);
+            Some((Slot::Live(session), _, place)) => {
+                self.sessions.touch(place, now);
                 Validation::Valid(session)
             }
         }
@@ -867,17 +883,31 @@ impl Engine for AuthEngine {
         if seq <= self.sessions_through.load(Ordering::Acquire) {
             return Ok(());
         }
+        // Slots whose time has passed make room first. Visits only due
+        // slots of the wheel; usually none.
+        let _ = self.sessions.reclaim(now_ms());
         for (n, op) in ops.into_iter().enumerate() {
             let n = u32::try_from(n).map_err(|_| Error::corrupt("an auth section", seq))?;
             self.audit_op(seq, n, &op)?;
             match op {
-                Op::IssueSession { digest, session } => self.sessions.insert(digest, session),
+                Op::IssueSession { digest, session } => {
+                    let epoch = self.epochs.get(session.account);
+                    self.sessions
+                        .insert(digest, session, epoch)
+                        .map_err(|_| table_full())?;
+                }
                 Op::RevokeSession {
                     digest,
                     reason,
                     at_ms,
-                } => self.sessions.revoke(digest, reason, at_ms),
-                Op::RaiseEpoch { account, epoch, .. } => self.epochs.raise(account, epoch),
+                } => self
+                    .sessions
+                    .revoke(digest, reason, at_ms)
+                    .map_err(|_| table_full())?,
+                Op::RaiseEpoch { account, epoch, .. } => {
+                    self.epochs.raise(account, epoch);
+                    self.sessions.raise(account, epoch);
+                }
                 Op::CreateAccount { .. }
                 | Op::CreateSealedAccount { .. }
                 | Op::UpdateAccount { .. } => {}
@@ -1465,7 +1495,7 @@ impl AuthTx<'_, '_> {
         if !self.staged.accounts.contains(&account) && !engine.account_exists(account)? {
             return Err(Error::invalid("account", "no such account"));
         }
-        if engine.sessions.len() + self.staged.issued.len() >= MAX_SESSIONS {
+        if engine.sessions.len() + self.staged.issued.len() >= engine.max_sessions {
             return Err(Error::Busy {
                 what: "the session table",
             });
@@ -2129,7 +2159,7 @@ mod tests {
         let path = dir.join(crate::core::keys::KEY_FILE);
         crate::core::keys::create_file_if_missing(&path).unwrap();
         let root = crate::core::keys::load_file(&path).unwrap();
-        let engine = AuthEngine::open(&dir.join("accounts"), &root, 1).unwrap();
+        let engine = AuthEngine::open(&dir.join("accounts"), &root, 1, 1_000_000).unwrap();
         // A format 1 body as 0.1 and 0.2 wrote it: issue session, no epoch.
         let mut body = Vec::new();
         let mut w = Writer::new(&mut body);

@@ -167,6 +167,17 @@ impl Payload {
     pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.bytes[..usize::from(self.len)]
     }
+
+    /// A payload of the first `len` bytes of `bytes`; the bytes after them
+    /// must be zero. `None` if `len` is too long.
+    pub(crate) fn from_array(len: usize, bytes: [u8; MAX_PAYLOAD]) -> Option<Payload> {
+        Some(Payload {
+            len: u16::try_from(len)
+                .ok()
+                .filter(|l| usize::from(*l) <= MAX_PAYLOAD)?,
+            bytes,
+        })
+    }
 }
 
 /// A valid session, as [`Validation::Valid`] returns it. A `Copy` value of

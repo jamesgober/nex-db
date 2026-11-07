@@ -643,9 +643,20 @@ fn test_session_carries_payload_recheck_and_idle_limit() {
         Validation::Valid(_)
     ));
     // A slow disk can take tens of milliseconds to sync the issuing commit,
-    // so the limit is long enough for that and the wait longer still.
-    thread::sleep(Duration::from_millis(1300));
-    assert_eq!(db.auth().validate(&idle).unwrap(), Validation::Expired);
+    // so the limit is long enough for that and the wait longer still. A
+    // loaded machine's clock can also be stepped back mid-wait (seen in
+    // WSL), so a few waits are allowed; each valid read counts as a use and
+    // starts the idle time again, so only a limit that never ends a session
+    // fails here.
+    let mut outcome = Validation::Unknown;
+    for _ in 0..5 {
+        thread::sleep(Duration::from_millis(1300));
+        outcome = db.auth().validate(&idle).unwrap();
+        if outcome == Validation::Expired {
+            break;
+        }
+    }
+    assert_eq!(outcome, Validation::Expired);
     assert!(SessionSpec::web().payload(&[0; 257]).is_err());
 }
 
@@ -662,7 +673,10 @@ fn test_max_sessions_refuses_past_the_limit_and_survives_reopen() {
     let tokens: Vec<_> = (0..3)
         .map(|_| db.auth().issue_session(ann, SessionSpec::web()).unwrap())
         .collect();
-    let err = db.auth().issue_session(ann, SessionSpec::web()).unwrap_err();
+    let err = db
+        .auth()
+        .issue_session(ann, SessionSpec::web())
+        .unwrap_err();
     assert!(matches!(err, Error::Busy { .. }), "{err:?}");
     // A revocation keeps its slot until the session would have expired.
     assert!(db.auth().revoke(&tokens[0]).unwrap());

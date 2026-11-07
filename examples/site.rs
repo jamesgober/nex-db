@@ -57,6 +57,8 @@ fn run() -> nex_db::Result<()> {
                 .site(SITE)
                 .path(profile_path.as_str()),
         )?;
+        // A new entity is a draft; publishing serves it at its path.
+        let _ = tx.content().publish(rid)?;
         Ok((account, rid))
     });
     match signed_up {

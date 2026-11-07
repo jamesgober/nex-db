@@ -152,12 +152,14 @@ fn content(c: &mut Criterion) {
     let db = t.db();
     for i in 0..1_000 {
         let _ = db
-            .content()
-            .create(
-                Entity::new("page")
-                    .field("title", "Hello")
-                    .path(format!("/p/{i}")),
-            )
+            .commit(|tx| {
+                let rid = tx.content().create(
+                    Entity::new("page")
+                        .field("title", "Hello")
+                        .path(format!("/p/{i}")),
+                )?;
+                tx.content().publish(rid)
+            })
             .unwrap();
     }
     let route = db
@@ -189,11 +191,12 @@ fn core(c: &mut Criterion) {
                 let account = tx
                     .auth()
                     .create_account(&format!("x{i}@example.com"), &password)?;
-                tx.content().create(
+                let rid = tx.content().create(
                     Entity::new("profile")
                         .field("account", account)
                         .path(format!("/u/{i}")),
-                )
+                )?;
+                tx.content().publish(rid)
             })
             .unwrap()
         });
@@ -213,8 +216,10 @@ fn core(c: &mut Criterion) {
                         s.spawn(|| {
                             let i = unique();
                             db.commit(|tx| {
-                                tx.content()
-                                    .create(Entity::new("note").path(format!("/n/{i}")))
+                                let rid = tx
+                                    .content()
+                                    .create(Entity::new("note").path(format!("/n/{i}")))?;
+                                tx.content().publish(rid)
                             })
                             .unwrap()
                         });

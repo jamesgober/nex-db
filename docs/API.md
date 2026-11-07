@@ -88,12 +88,13 @@ let db = nex_db::open(&dir)?; // creates the database on first use
 let password = db.auth().hash_password("correct horse battery staple")?;
 let account = db.commit(|tx| {
     let account = tx.auth().create_account("ann@example.com", &password)?;
-    tx.content().create(
+    let profile = tx.content().create(
         Entity::new("profile")
             .field("account", account)
             .site("example.com")
             .path("/u/ann"),
     )?;
+    tx.content().publish(profile)?; // a new entity is a draft until published
     Ok(account)
 })?;
 
@@ -240,7 +241,9 @@ use nex_db::{Entity, Error};
 let password = db.auth().hash_password("pw for bo")?;
 db.commit(|tx| {
     let account = tx.auth().create_account("bo@example.com", &password)?;
-    tx.content().create(Entity::new("profile").field("account", account).path("/u/bo"))?;
+    let profile =
+        tx.content().create(Entity::new("profile").field("account", account).path("/u/bo"))?;
+    tx.content().publish(profile)?;
     Ok(())
 })?;
 
@@ -504,7 +507,9 @@ let rid = db.content().create(
         .site("example.com")
         .path("/blog/hello"),
 )?;
-let entry = db.content().get(rid)?.expect("created");
+assert!(db.content().get(rid)?.is_none()); // a draft until published
+db.content().publish(rid)?;
+let entry = db.content().get(rid)?.expect("published");
 assert_eq!(entry.kind(), "post");
 assert_eq!(entry.revision(), 1);
 assert_eq!(entry.field("title"), Some(&Value::Text("Hello".into())));
@@ -551,13 +556,35 @@ revision with who, when, and a message. Readers of the public site see only
 the published revision: `get` and `resolve` read only that, and `draft`
 reads the working draft.
 
+```rust
+use nex_db::{Entity, Patch};
+
+# let dir = std::env::temp_dir().join(format!("nex-db-api-drafts-{}", std::process::id()));
+# let _ = std::fs::remove_dir_all(&dir);
+# let db = nex_db::open(&dir)?;
+let rid = db.content().create(Entity::new("post").field("title", "First").path("/p/first"))?;
+assert_eq!(db.content().publish(rid)?, 1);
+
+// Edit the draft: readers still see revision 1.
+db.content().save_draft(rid, Patch::new().set("title", "Second"))?;
+assert_eq!(db.content().get(rid)?.unwrap().field("title").unwrap().as_text(), Some("First"));
+assert_eq!(db.content().draft(rid)?.unwrap().field("title").unwrap().as_text(), Some("Second"));
+
+assert_eq!(db.content().publish(rid)?, 2);
+assert_eq!(db.content().get(rid)?.unwrap().field("title").unwrap().as_text(), Some("Second"));
+assert_eq!(db.content().revisions(rid)?.len(), 2);
+# drop(db);
+# std::fs::remove_dir_all(&dir).unwrap();
+# Ok::<(), nex_db::Error>(())
+```
+
 | Operation (in `tx.content()` unless noted) | Grade | Notes |
 |---|---|---|
 | `create(Entity) -> Result<Rid>` | P0 | 0.1; starts as a draft from 0.4 |
 | `save_draft(rid, Patch) -> Result<()>` | P0 | no revision |
 | `save_revision(rid, message) -> Result<u32>` | P0 | |
-| `publish(rid, locales) -> Result<u32>` | P0 | publishes the draft; returns the revision |
-| `unpublish(rid, locales)` | P0 | |
+| `publish(rid) -> Result<u32>` | P0 | publishes the draft; returns the revision (a new one only when the draft changed); per locale (`publish(rid, locales)`) once locales arrive |
+| `unpublish(rid) -> Result<bool>` | P0 | the path stops resolving; draft and revisions stay |
 | `schedule(rid, Action::Publish \| Action::Unpublish, at)` | P1 | fired by the database at `at` |
 | `set_status(rid, Status)`, `set_visibility(rid, Visibility)` | P1 | |
 | `trash(rid)`, `restore(rid)`, `delete(rid)` | P1 | `delete` applies the reference rules |
@@ -603,8 +630,16 @@ use nex_db::{Entity, RouteKind};
 # let _ = std::fs::remove_dir_all(&dir);
 # let db = nex_db::open(&dir)?;
 let rid = db.content().create(Entity::new("page").site("example.com").path("/about"))?;
+assert!(db.content().resolve("example.com", "/about")?.is_none()); // drafts are not routed
+db.content().publish(rid)?;
 let route = db.content().resolve("example.com", "/about")?.expect("routed");
 assert_eq!((route.entity(), route.kind(), route.revision()), (rid, RouteKind::Page, 1));
+
+// Moving a published page leaves a 301 at the old path.
+db.content().set_path(rid, "/about-us")?;
+let old = db.content().resolve("example.com", "/about")?.expect("redirect");
+assert_eq!(old.kind(), RouteKind::Redirect { to: rid, status: 301 });
+assert_eq!(db.content().get(rid)?.expect("published").route(), Some(("example.com", "/about-us")));
 assert!(db.content().resolve("example.com", "/missing")?.is_none());
 assert!(db.content().resolve("other.example", "/about")?.is_none());
 # drop(db);
@@ -618,7 +653,7 @@ assert!(db.content().resolve("other.example", "/about")?.is_none());
 | Kind | Since | Answer |
 |---|---|---|
 | `Page` | 0.1 | serve the entity |
-| `Redirect { to, status }` | 0.4 | 301, 302, 307, or 308 to another route or to a URL |
+| `Redirect { to, status }` | 0.4 | 301, 302, 307, or 308 to the entity `to` (its current path is `get(to)?.route()`); to a URL with `add_redirect` |
 | `Gone` | 0.4 | 410 |
 | `Alias { canonical }` | 0.4 | serve the entity; link to the canonical path |
 | `Term` | 0.4 | a taxonomy archive page |
@@ -630,7 +665,7 @@ redirects again is shortened, so a chain is never followed.
 | Operation | Grade | Notes |
 |---|---|---|
 | `resolve(site, path) -> Result<Option<RouteEntry>>` | P0 | 0.1 |
-| `set_path(rid, locale, path)` (tx) | P0 | the old path redirects |
+| `set_path(rid, path)` (tx) | P0 | the old path redirects with 301; per locale once locales arrive |
 | `add_redirect(site, from, to, status)` (tx), `remove_route(site, path)` (tx) | P1 | |
 | `routes(rid) -> Result<Vec<(String, String)>>` | P2 | every path of an entity |
 | `resolve_draft(site, path) -> Result<Option<RouteEntry>>` | P2 | 0.6; drafts at their real paths, for previews |

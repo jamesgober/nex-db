@@ -121,7 +121,10 @@ pub use crate::auth::{
 #[cfg_attr(docsrs, doc(cfg(feature = "content")))]
 pub use crate::content::{
     Content, ContentRead, ContentTx,
-    entity::{DEFAULT_SITE, Entity, Entry, RouteEntry, RouteKind, Value},
+    entity::{
+        DEFAULT_SITE, Entity, Entry, Patch, RevisionInfo, RouteEntry, RouteKind, Status, Value,
+        Visibility,
+    },
 };
 pub use crate::{
     core::keys::Keys,

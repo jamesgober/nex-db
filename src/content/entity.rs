@@ -17,8 +17,17 @@ const MAX_PATH: usize = 2048;
 const MAX_FIELDS: usize = 256;
 const MAX_TEXT: usize = 1024 * 1024;
 
-/// Stored entity record format.
+/// Stored entity record format of 0.1 to 0.3: one published revision.
 const RECORD_FORMAT: u8 = 1;
+/// Stored entity record format from 0.4: the working draft and what is
+/// published.
+const HEAD_FORMAT: u8 = 2;
+/// Format of a stored revision.
+const REVISION_FORMAT: u8 = 1;
+/// Format of a stored route.
+const ROUTE_FORMAT: u8 = 1;
+/// Longest revision message, in bytes.
+const MAX_MESSAGE: usize = 1024;
 
 const TAG_TEXT: u8 = 1;
 const TAG_INT: u8 = 2;
@@ -198,14 +207,11 @@ impl Entity {
         self.site.as_deref().unwrap_or(DEFAULT_SITE)
     }
 
-    pub(crate) fn route_path(&self) -> Option<&str> {
-        self.path.as_deref()
-    }
-
-    /// Check every rule and return the stored record for `rid`.
-    pub(crate) fn encode(&self, rid: Rid, created_ms: u64) -> Result<Vec<u8>> {
+    /// Check every rule and return the new entity's head: a draft with
+    /// nothing published.
+    pub(crate) fn into_head(self, rid: Rid, created_ms: u64) -> Result<Head> {
         check_name("type", &self.kind)?;
-        let site = self.site_name();
+        let site = self.site_name().to_owned();
         if site.is_empty()
             || site.len() > MAX_SITE
             || site.chars().any(|c| c.is_control() || c.is_whitespace())
@@ -215,16 +221,187 @@ impl Entity {
                 "must be 1 to 253 bytes without spaces",
             ));
         }
-        if let Some(path) = &self.path {
-            if !path.starts_with('/')
-                || path.len() > MAX_PATH
-                || path.chars().any(|c| c.is_control() || c.is_whitespace())
-            {
-                return Err(Error::invalid(
-                    "path",
-                    "must start with '/', be at most 2048 bytes, and hold no spaces",
-                ));
+        let body = Body {
+            path: self.path,
+            fields: self.fields,
+        };
+        body.check()?;
+        Ok(Head {
+            rid,
+            kind: self.kind,
+            site,
+            created_ms,
+            updated_ms: created_ms,
+            status: Status::Draft,
+            visibility: Visibility::Public,
+            last_revision: 0,
+            published: None,
+            first_published_ms: 0,
+            draft: body,
+        })
+    }
+
+    /// The record 0.1 to 0.3 stored for `rid` (tests read it back).
+    #[cfg(test)]
+    pub(crate) fn encode_v1(&self, rid: Rid, created_ms: u64) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut w = Writer::new(&mut out);
+        w.u8(RECORD_FORMAT);
+        w.bytes(rid.as_bytes());
+        w.u64(created_ms);
+        w.u32(1);
+        w.str16(&self.kind)?;
+        w.str16(self.site_name())?;
+        w.str16(self.path.as_deref().unwrap_or(""))?;
+        write_fields(&mut w, &self.fields)?;
+        Ok(out)
+    }
+}
+
+fn check_path(path: &str) -> Result<()> {
+    if !path.starts_with('/')
+        || path.len() > MAX_PATH
+        || path.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(Error::invalid(
+            "path",
+            "must start with '/', be at most 2048 bytes, and hold no spaces",
+        ));
+    }
+    Ok(())
+}
+
+fn write_fields(w: &mut Writer<'_>, fields: &[(String, Value)]) -> Result<()> {
+    w.u16(fields.len() as u16);
+    for (name, value) in fields {
+        w.str16(name)?;
+        match value {
+            Value::Text(text) => {
+                w.u8(TAG_TEXT);
+                w.bytes32(text.as_bytes())?;
             }
+            Value::Int(v) => {
+                w.u8(TAG_INT);
+                w.i64(*v);
+            }
+            Value::Bool(v) => {
+                w.u8(TAG_BOOL);
+                w.u8(u8::from(*v));
+            }
+            Value::Account(v) => {
+                w.u8(TAG_ACCOUNT);
+                w.bytes(v.as_bytes());
+            }
+            Value::Entity(v) => {
+                w.u8(TAG_ENTITY);
+                w.bytes(v.as_bytes());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_fields(r: &mut Reader<'_>, at: u64) -> Result<Vec<(String, Value)>> {
+    let count = r.u16()?;
+    let mut fields = Vec::with_capacity(usize::from(count));
+    for _ in 0..count {
+        let name = r.str16()?.to_owned();
+        let value = match r.u8()? {
+            TAG_TEXT => {
+                let bytes = r.bytes32()?;
+                let text = std::str::from_utf8(bytes)
+                    .map_err(|_| Error::corrupt("an entity text field", at))?;
+                Value::Text(text.to_owned())
+            }
+            TAG_INT => Value::Int(r.i64()?),
+            TAG_BOOL => match r.u8()? {
+                0 => Value::Bool(false),
+                1 => Value::Bool(true),
+                _ => return Err(Error::corrupt("an entity bool field", at)),
+            },
+            TAG_ACCOUNT => Value::Account(AccountId::from_bytes(r.fixed()?)),
+            TAG_ENTITY => Value::Entity(Rid::from_bytes(r.fixed()?)),
+            _ => return Err(Error::corrupt("an entity field type", at)),
+        };
+        fields.push((name, value));
+    }
+    Ok(fields)
+}
+
+/// Changes to an entity's working draft, for
+/// [`save_draft`](crate::ContentTx::save_draft).
+///
+/// ```
+/// use nex_db::Patch;
+/// let patch = Patch::new().set("title", "Hello again").remove("subtitle");
+/// # let _ = patch;
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[must_use]
+pub struct Patch {
+    set: Vec<(String, Value)>,
+    remove: Vec<String>,
+    path: Option<Option<String>>,
+}
+
+impl Patch {
+    /// No changes yet.
+    pub fn new() -> Patch {
+        Patch::default()
+    }
+
+    /// Set field `name` to `value`.
+    pub fn set(mut self, name: impl Into<String>, value: impl Into<Value>) -> Patch {
+        self.set.push((name.into(), value.into()));
+        self
+    }
+
+    /// Remove field `name`.
+    pub fn remove(mut self, name: impl Into<String>) -> Patch {
+        self.remove.push(name.into());
+        self
+    }
+
+    /// Serve the draft at `path` once it is published.
+    pub fn path(mut self, path: impl Into<String>) -> Patch {
+        self.path = Some(Some(path.into()));
+        self
+    }
+
+    /// Serve the draft at no path once it is published.
+    pub fn no_path(mut self) -> Patch {
+        self.path = Some(None);
+        self
+    }
+
+    pub(crate) fn apply(self, body: &mut Body) -> Result<()> {
+        for name in &self.remove {
+            body.fields.retain(|(n, _)| n != name);
+        }
+        for (name, value) in self.set {
+            match body.fields.iter_mut().find(|(n, _)| *n == name) {
+                Some(slot) => slot.1 = value,
+                None => body.fields.push((name, value)),
+            }
+        }
+        if let Some(path) = self.path {
+            body.path = path;
+        }
+        body.check()
+    }
+}
+
+/// An entity's editable part: its path and fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Body {
+    pub(crate) path: Option<String>,
+    pub(crate) fields: Vec<(String, Value)>,
+}
+
+impl Body {
+    fn check(&self) -> Result<()> {
+        if let Some(path) = &self.path {
+            check_path(path)?;
         }
         if self.fields.len() > MAX_FIELDS {
             return Err(Error::invalid("fields", "at most 256 per entity"));
@@ -241,44 +418,366 @@ impl Entity {
                 }
             }
         }
+        Ok(())
+    }
+}
 
+/// Where an entity is in its life.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Status {
+    /// Being written; not published.
+    Draft,
+    /// Waiting for review; not published.
+    Review,
+    /// Published.
+    Published,
+    /// Taken down and kept.
+    Archived,
+    /// In the trash.
+    Trashed,
+}
+
+impl Status {
+    fn code(self) -> u8 {
+        match self {
+            Status::Draft => 1,
+            Status::Review => 2,
+            Status::Published => 3,
+            Status::Archived => 4,
+            Status::Trashed => 5,
+        }
+    }
+
+    fn of(code: u8, at: u64) -> Result<Status> {
+        Ok(match code {
+            1 => Status::Draft,
+            2 => Status::Review,
+            3 => Status::Published,
+            4 => Status::Archived,
+            5 => Status::Trashed,
+            _ => return Err(Error::corrupt("an entity status", at)),
+        })
+    }
+}
+
+/// Who may see a published entity. The application decides who counts as a
+/// member and whom a private page is for; nex-db only stores the mark.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Visibility {
+    /// Everyone.
+    Public,
+    /// Signed-in members.
+    Members,
+    /// Only the people the application allows.
+    Private,
+}
+
+impl Visibility {
+    fn code(self) -> u8 {
+        match self {
+            Visibility::Public => 1,
+            Visibility::Members => 2,
+            Visibility::Private => 3,
+        }
+    }
+
+    fn of(code: u8, at: u64) -> Result<Visibility> {
+        Ok(match code {
+            1 => Visibility::Public,
+            2 => Visibility::Members,
+            3 => Visibility::Private,
+            _ => return Err(Error::corrupt("an entity visibility", at)),
+        })
+    }
+}
+
+/// What is published of an entity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Published {
+    pub(crate) revision: u32,
+    pub(crate) at_ms: u64,
+    pub(crate) path: Option<String>,
+}
+
+/// What the store keeps per entity: its identity, its working draft, and
+/// what is published (the published body is a stored revision).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Head {
+    pub(crate) rid: Rid,
+    pub(crate) kind: String,
+    pub(crate) site: String,
+    pub(crate) created_ms: u64,
+    pub(crate) updated_ms: u64,
+    pub(crate) status: Status,
+    pub(crate) visibility: Visibility,
+    /// The newest revision number; 0 before the first.
+    pub(crate) last_revision: u32,
+    pub(crate) published: Option<Published>,
+    pub(crate) first_published_ms: u64,
+    pub(crate) draft: Body,
+}
+
+impl Head {
+    pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         let mut w = Writer::new(&mut out);
-        w.u8(RECORD_FORMAT);
-        w.bytes(rid.as_bytes());
-        w.u64(created_ms);
-        w.u32(1);
+        w.u8(HEAD_FORMAT);
+        w.bytes(self.rid.as_bytes());
+        w.u64(self.created_ms);
+        w.u64(self.updated_ms);
         w.str16(&self.kind)?;
-        w.str16(site)?;
-        w.str16(self.path.as_deref().unwrap_or(""))?;
-        w.u16(self.fields.len() as u16);
-        for (name, value) in &self.fields {
-            w.str16(name)?;
-            match value {
-                Value::Text(text) => {
-                    w.u8(TAG_TEXT);
-                    w.bytes32(text.as_bytes())?;
-                }
-                Value::Int(v) => {
-                    w.u8(TAG_INT);
-                    w.i64(*v);
-                }
-                Value::Bool(v) => {
-                    w.u8(TAG_BOOL);
-                    w.u8(u8::from(*v));
-                }
-                Value::Account(v) => {
-                    w.u8(TAG_ACCOUNT);
-                    w.bytes(v.as_bytes());
-                }
-                Value::Entity(v) => {
-                    w.u8(TAG_ENTITY);
-                    w.bytes(v.as_bytes());
-                }
+        w.str16(&self.site)?;
+        w.u8(self.status.code());
+        w.u8(self.visibility.code());
+        w.u32(self.last_revision);
+        match &self.published {
+            Some(p) => {
+                w.u32(p.revision);
+                w.u64(p.at_ms);
+                w.str16(p.path.as_deref().unwrap_or(""))?;
+            }
+            None => {
+                w.u32(0);
+                w.u64(0);
+                w.str16("")?;
             }
         }
+        w.u64(self.first_published_ms);
+        w.str16(self.draft.path.as_deref().unwrap_or(""))?;
+        write_fields(&mut w, &self.draft.fields)?;
         Ok(out)
     }
+
+    /// Decode a stored head. A record from 0.1 to 0.3 reads as an entity
+    /// published at revision 1, its draft the same; its body is the
+    /// record's own (see [`legacy_body`]).
+    pub(crate) fn decode(bytes: &[u8], at: u64) -> Result<Head> {
+        let mut r = Reader::new(bytes, "an entity record", at);
+        match r.u8()? {
+            RECORD_FORMAT => {
+                let rid = Rid::from_bytes(r.fixed()?);
+                let created_ms = r.u64()?;
+                let revision = r.u32()?;
+                let kind = r.str16()?.to_owned();
+                let site = r.str16()?.to_owned();
+                let path = Some(r.str16()?.to_owned()).filter(|p| !p.is_empty());
+                let fields = read_fields(&mut r, at)?;
+                r.finish()?;
+                Ok(Head {
+                    rid,
+                    kind,
+                    site,
+                    created_ms,
+                    updated_ms: created_ms,
+                    status: Status::Published,
+                    visibility: Visibility::Public,
+                    last_revision: revision,
+                    published: Some(Published {
+                        revision,
+                        at_ms: created_ms,
+                        path: path.clone(),
+                    }),
+                    first_published_ms: created_ms,
+                    draft: Body { path, fields },
+                })
+            }
+            HEAD_FORMAT => {
+                let rid = Rid::from_bytes(r.fixed()?);
+                let created_ms = r.u64()?;
+                let updated_ms = r.u64()?;
+                let kind = r.str16()?.to_owned();
+                let site = r.str16()?.to_owned();
+                let status = Status::of(r.u8()?, at)?;
+                let visibility = Visibility::of(r.u8()?, at)?;
+                let last_revision = r.u32()?;
+                let revision = r.u32()?;
+                let published_ms = r.u64()?;
+                let published_path = Some(r.str16()?.to_owned()).filter(|p| !p.is_empty());
+                let first_published_ms = r.u64()?;
+                let draft_path = Some(r.str16()?.to_owned()).filter(|p| !p.is_empty());
+                let fields = read_fields(&mut r, at)?;
+                r.finish()?;
+                Ok(Head {
+                    rid,
+                    kind,
+                    site,
+                    created_ms,
+                    updated_ms,
+                    status,
+                    visibility,
+                    last_revision,
+                    published: (revision != 0).then_some(Published {
+                        revision,
+                        at_ms: published_ms,
+                        path: published_path,
+                    }),
+                    first_published_ms,
+                    draft: Body {
+                        path: draft_path,
+                        fields,
+                    },
+                })
+            }
+            _ => Err(Error::corrupt("an entity record format", at)),
+        }
+    }
+
+    /// True for a record stored by 0.1 to 0.3, whose published body is its
+    /// draft (there is no stored revision).
+    pub(crate) fn is_legacy(bytes: &[u8]) -> bool {
+        bytes.first() == Some(&RECORD_FORMAT)
+    }
+
+    /// The entry a reader sees for `body` at `revision`.
+    pub(crate) fn entry(&self, revision: u32, body: Body) -> Entry {
+        Entry {
+            rid: self.rid,
+            kind: self.kind.clone(),
+            created_ms: self.created_ms,
+            updated_ms: self.updated_ms,
+            revision,
+            site: self.site.clone(),
+            path: body.path,
+            fields: body.fields,
+            status: self.status,
+            visibility: self.visibility,
+            published_ms: self.published.as_ref().map_or(0, |p| p.at_ms),
+            first_published_ms: self.first_published_ms,
+        }
+    }
+}
+
+/// A fixed revision: the body as it was, when, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Revision {
+    pub(crate) at_ms: u64,
+    pub(crate) message: String,
+    pub(crate) body: Body,
+}
+
+impl Revision {
+    pub(crate) fn new(at_ms: u64, message: &str, body: Body) -> Result<Revision> {
+        if message.len() > MAX_MESSAGE {
+            return Err(Error::invalid("revision message", "at most 1024 bytes"));
+        }
+        Ok(Revision {
+            at_ms,
+            message: message.to_owned(),
+            body,
+        })
+    }
+
+    pub(crate) fn encode(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut w = Writer::new(&mut out);
+        w.u8(REVISION_FORMAT);
+        w.u64(self.at_ms);
+        w.str16(&self.message)?;
+        w.str16(self.body.path.as_deref().unwrap_or(""))?;
+        write_fields(&mut w, &self.body.fields)?;
+        Ok(out)
+    }
+
+    pub(crate) fn decode(bytes: &[u8], at: u64) -> Result<Revision> {
+        let mut r = Reader::new(bytes, "an entity revision", at);
+        if r.u8()? != REVISION_FORMAT {
+            return Err(Error::corrupt("an entity revision format", at));
+        }
+        let at_ms = r.u64()?;
+        let message = r.str16()?.to_owned();
+        let path = Some(r.str16()?.to_owned()).filter(|p| !p.is_empty());
+        let fields = read_fields(&mut r, at)?;
+        r.finish()?;
+        Ok(Revision {
+            at_ms,
+            message,
+            body: Body { path, fields },
+        })
+    }
+}
+
+/// A revision as [`revisions`](crate::Content::revisions) lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionInfo {
+    pub(crate) number: u32,
+    pub(crate) at_ms: u64,
+    pub(crate) message: String,
+}
+
+impl RevisionInfo {
+    /// The revision number, from 1.
+    #[must_use]
+    pub const fn number(&self) -> u32 {
+        self.number
+    }
+
+    /// When it was recorded.
+    #[must_use]
+    pub fn at(&self) -> SystemTime {
+        crate::core::time_of(self.at_ms)
+    }
+
+    /// The message it was recorded with.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+/// Encode a route as stored.
+pub(crate) fn encode_route(entry: &RouteEntry) -> Vec<u8> {
+    let mut out = Vec::with_capacity(26);
+    let mut w = Writer::new(&mut out);
+    w.u8(ROUTE_FORMAT);
+    match entry.kind {
+        RouteKind::Page => {
+            w.u8(1);
+            w.u16(0);
+            w.bytes(entry.entity.as_bytes());
+        }
+        RouteKind::Redirect { to, status } => {
+            w.u8(2);
+            w.u16(status);
+            w.bytes(to.as_bytes());
+        }
+        RouteKind::Gone => {
+            w.u8(3);
+            w.u16(0);
+            w.bytes(entry.entity.as_bytes());
+        }
+    }
+    w.bytes(entry.entity.as_bytes());
+    w.u32(entry.revision);
+    w.u8(entry.visibility.code());
+    out
+}
+
+pub(crate) fn decode_route(bytes: &[u8], at: u64) -> Result<RouteEntry> {
+    let mut r = Reader::new(bytes, "a route record", at);
+    if r.u8()? != ROUTE_FORMAT {
+        return Err(Error::corrupt("a route record format", at));
+    }
+    let kind = r.u8()?;
+    let status = r.u16()?;
+    let target = Rid::from_bytes(r.fixed()?);
+    let entity = Rid::from_bytes(r.fixed()?);
+    let revision = r.u32()?;
+    let visibility = Visibility::of(r.u8()?, at)?;
+    r.finish()?;
+    let kind = match kind {
+        1 => RouteKind::Page,
+        2 => RouteKind::Redirect { to: target, status },
+        3 => RouteKind::Gone,
+        _ => return Err(Error::corrupt("a route kind", at)),
+    };
+    Ok(RouteEntry {
+        entity,
+        revision,
+        kind,
+        visibility,
+    })
 }
 
 fn check_name(what: &'static str, name: &str) -> Result<()> {
@@ -297,66 +796,26 @@ fn check_name(what: &'static str, name: &str) -> Result<()> {
     }
 }
 
-/// A stored entity, as [`Content::get`](crate::Content::get) returns it.
+/// An entity as a reader sees it: the published revision from
+/// [`Content::get`](crate::Content::get), or the working draft from
+/// [`Content::draft`](crate::Content::draft).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     rid: Rid,
     kind: String,
     created_ms: u64,
+    updated_ms: u64,
     revision: u32,
     site: String,
     path: Option<String>,
     fields: Vec<(String, Value)>,
+    status: Status,
+    visibility: Visibility,
+    published_ms: u64,
+    first_published_ms: u64,
 }
 
 impl Entry {
-    /// Decode a stored record. `at` locates it in errors.
-    pub(crate) fn decode(bytes: &[u8], at: u64) -> Result<Entry> {
-        let mut r = Reader::new(bytes, "an entity record", at);
-        if r.u8()? != RECORD_FORMAT {
-            return Err(Error::corrupt("an entity record format", at));
-        }
-        let rid = Rid::from_bytes(r.fixed()?);
-        let created_ms = r.u64()?;
-        let revision = r.u32()?;
-        let kind = r.str16()?.to_owned();
-        let site = r.str16()?.to_owned();
-        let path = Some(r.str16()?.to_owned()).filter(|p| !p.is_empty());
-        let count = r.u16()?;
-        let mut fields = Vec::with_capacity(usize::from(count));
-        for _ in 0..count {
-            let name = r.str16()?.to_owned();
-            let value = match r.u8()? {
-                TAG_TEXT => {
-                    let bytes = r.bytes32()?;
-                    let text = std::str::from_utf8(bytes)
-                        .map_err(|_| Error::corrupt("an entity text field", at))?;
-                    Value::Text(text.to_owned())
-                }
-                TAG_INT => Value::Int(r.i64()?),
-                TAG_BOOL => match r.u8()? {
-                    0 => Value::Bool(false),
-                    1 => Value::Bool(true),
-                    _ => return Err(Error::corrupt("an entity bool field", at)),
-                },
-                TAG_ACCOUNT => Value::Account(AccountId::from_bytes(r.fixed()?)),
-                TAG_ENTITY => Value::Entity(Rid::from_bytes(r.fixed()?)),
-                _ => return Err(Error::corrupt("an entity field type", at)),
-            };
-            fields.push((name, value));
-        }
-        r.finish()?;
-        Ok(Entry {
-            rid,
-            kind,
-            created_ms,
-            revision,
-            site,
-            path,
-            fields,
-        })
-    }
-
     /// The entity's record id.
     #[must_use]
     pub const fn rid(&self) -> Rid {
@@ -369,10 +828,41 @@ impl Entry {
         &self.kind
     }
 
-    /// The revision number; 1 for a new entity.
+    /// The revision number: the one published, or for a draft the newest
+    /// recorded (0 before the first).
     #[must_use]
     pub const fn revision(&self) -> u32 {
         self.revision
+    }
+
+    /// Where the entity is in its life.
+    #[must_use]
+    pub const fn status(&self) -> Status {
+        self.status
+    }
+
+    /// Who may see it when published.
+    #[must_use]
+    pub const fn visibility(&self) -> Visibility {
+        self.visibility
+    }
+
+    /// When the entity last changed.
+    #[must_use]
+    pub fn updated_at(&self) -> SystemTime {
+        crate::core::time_of(self.updated_ms)
+    }
+
+    /// When the published revision was published, if one is.
+    #[must_use]
+    pub fn published_at(&self) -> Option<SystemTime> {
+        (self.published_ms != 0).then(|| crate::core::time_of(self.published_ms))
+    }
+
+    /// When the entity was first published, if ever.
+    #[must_use]
+    pub fn first_published_at(&self) -> Option<SystemTime> {
+        (self.first_published_ms != 0).then(|| crate::core::time_of(self.first_published_ms))
     }
 
     /// When the entity was created.
@@ -405,6 +895,17 @@ impl Entry {
 pub enum RouteKind {
     /// The path serves the entity.
     Page,
+    /// The path moved: answer `status` (301 when an entity's path changed)
+    /// with the current path of the entity `to`, which
+    /// [`Entry::route`] gives.
+    Redirect {
+        /// The entity the path now belongs to.
+        to: Rid,
+        /// The HTTP status: 301, 302, 307, or 308.
+        status: u16,
+    },
+    /// The entity is gone for good: answer 410.
+    Gone,
 }
 
 /// A resolved route, as [`Content::resolve`](crate::Content::resolve) returns
@@ -414,6 +915,7 @@ pub struct RouteEntry {
     pub(crate) entity: Rid,
     pub(crate) revision: u32,
     pub(crate) kind: RouteKind,
+    pub(crate) visibility: Visibility,
 }
 
 impl RouteEntry {
@@ -434,6 +936,13 @@ impl RouteEntry {
     pub const fn kind(&self) -> RouteKind {
         self.kind
     }
+
+    /// Who may see the page. For anything but [`Visibility::Public`] the
+    /// application checks the session before serving it.
+    #[must_use]
+    pub const fn visibility(&self) -> Visibility {
+        self.visibility
+    }
 }
 
 #[cfg(test)]
@@ -445,7 +954,7 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_decode_round_trips_every_value_kind() {
+    fn test_head_round_trips_every_value_kind() {
         let account = AccountId::from_bytes([1; 16]);
         let entity = Entity::new("profile")
             .field("name", "Ann")
@@ -455,11 +964,20 @@ mod tests {
             .field("parent", rid())
             .site("example.com")
             .path("/u/ann");
-        let bytes = entity.encode(rid(), 5).unwrap();
-        let entry = Entry::decode(&bytes, 0).unwrap();
+        let mut head = entity.into_head(rid(), 5).unwrap();
+        head.published = Some(Published {
+            revision: 2,
+            at_ms: 6,
+            path: Some("/u/ann".into()),
+        });
+        head.last_revision = 3;
+        head.first_published_ms = 4;
+        let back = Head::decode(&head.encode().unwrap(), 0).unwrap();
+        assert_eq!(back, head);
+        let entry = back.entry(2, back.draft.clone());
         assert_eq!(entry.rid(), rid());
         assert_eq!(entry.kind(), "profile");
-        assert_eq!(entry.revision(), 1);
+        assert_eq!(entry.revision(), 2);
         assert_eq!(entry.route(), Some(("example.com", "/u/ann")));
         assert_eq!(entry.field("name").and_then(Value::as_text), Some("Ann"));
         assert_eq!(entry.field("age").and_then(Value::as_int), Some(40));
@@ -474,18 +992,26 @@ mod tests {
         );
         assert_eq!(entry.fields().count(), 5);
         assert_eq!(entry.created_at(), crate::core::time_of(5));
+        assert_eq!(entry.published_at(), Some(crate::core::time_of(6)));
     }
 
     #[test]
-    fn test_encode_without_path_has_no_route_and_default_site() {
-        let bytes = Entity::new("note").encode(rid(), 0).unwrap();
-        let entry = Entry::decode(&bytes, 0).unwrap();
-        assert_eq!(entry.route(), None);
-        assert_eq!(entry.site, DEFAULT_SITE);
+    fn test_old_record_reads_as_published_revision_one() {
+        let bytes = Entity::new("note")
+            .field("a", "b")
+            .path("/n")
+            .encode_v1(rid(), 7)
+            .unwrap();
+        assert!(Head::is_legacy(&bytes));
+        let head = Head::decode(&bytes, 0).unwrap();
+        assert_eq!(head.status, Status::Published);
+        assert_eq!(head.published.as_ref().map(|p| p.revision), Some(1));
+        assert_eq!(head.draft.path.as_deref(), Some("/n"));
+        assert_eq!(head.site, DEFAULT_SITE);
     }
 
     #[test]
-    fn test_encode_rejects_bad_input() {
+    fn test_into_head_rejects_bad_input() {
         let bad = [
             Entity::new(""),
             Entity::new("has space"),
@@ -497,22 +1023,74 @@ mod tests {
             Entity::new("p").field("big", "x".repeat(MAX_TEXT + 1)),
         ];
         for entity in bad {
+            let shown = format!("{entity:?}");
             assert!(
-                matches!(entity.encode(rid(), 0), Err(Error::Invalid { .. })),
-                "{entity:?}"
+                matches!(entity.into_head(rid(), 0), Err(Error::Invalid { .. })),
+                "{shown}"
             );
         }
     }
 
     #[test]
-    fn test_decode_every_truncation_is_corrupt() {
-        let bytes = Entity::new("p")
-            .field("a", "b")
-            .path("/x")
-            .encode(rid(), 0)
+    fn test_patch_sets_removes_and_moves() {
+        let mut body = Body {
+            path: Some("/a".into()),
+            fields: vec![("x".into(), Value::Int(1)), ("y".into(), Value::Int(2))],
+        };
+        Patch::new()
+            .set("x", 5_i64)
+            .set("z", "new")
+            .remove("y")
+            .path("/b")
+            .apply(&mut body)
             .unwrap();
+        assert_eq!(body.path.as_deref(), Some("/b"));
+        assert_eq!(
+            body.fields,
+            vec![
+                ("x".into(), Value::Int(5)),
+                ("z".into(), Value::Text("new".into()))
+            ]
+        );
+        assert!(Patch::new().path("bad").apply(&mut body).is_err());
+    }
+
+    #[test]
+    fn test_revision_and_route_round_trip_and_truncations_are_corrupt() {
+        let rev = Revision::new(
+            9,
+            "first",
+            Body {
+                path: Some("/x".into()),
+                fields: vec![("a".into(), Value::Bool(true))],
+            },
+        )
+        .unwrap();
+        let bytes = rev.encode().unwrap();
+        assert_eq!(Revision::decode(&bytes, 0).unwrap(), rev);
         for len in 0..bytes.len() {
-            assert!(Entry::decode(&bytes[..len], 0).is_err(), "prefix {len}");
+            assert!(Revision::decode(&bytes[..len], 0).is_err(), "prefix {len}");
+        }
+        for kind in [
+            RouteKind::Page,
+            RouteKind::Redirect {
+                to: Rid::from_bytes([3; 16]),
+                status: 301,
+            },
+            RouteKind::Gone,
+        ] {
+            let entry = RouteEntry {
+                entity: rid(),
+                revision: 4,
+                kind,
+                visibility: Visibility::Members,
+            };
+            assert_eq!(decode_route(&encode_route(&entry), 0).unwrap(), entry);
+        }
+        let head = Entity::new("p").path("/x").into_head(rid(), 0).unwrap();
+        let bytes = head.encode().unwrap();
+        for len in 0..bytes.len() {
+            assert!(Head::decode(&bytes[..len], 0).is_err(), "prefix {len}");
         }
     }
 }

@@ -30,6 +30,15 @@ impl Drop for TempDir {
 
 const PASSWORD: &str = "correct horse battery staple";
 
+/// Create `entity` and publish it in one commit.
+fn publish(db: &Database, entity: Entity) -> nex_db::Result<nex_db::Rid> {
+    db.commit(|tx| {
+        let rid = tx.content().create(entity.clone())?;
+        let _ = tx.content().publish(rid)?;
+        Ok(rid)
+    })
+}
+
 #[test]
 fn test_commit_account_and_profile_lands_in_both_engines() {
     let dir = TempDir::new("both");
@@ -45,6 +54,7 @@ fn test_commit_account_and_profile_lands_in_both_engines() {
                     .site("example.com")
                     .path("/u/ann"),
             )?;
+            let _ = tx.content().publish(rid)?;
             Ok((account, rid))
         })
         .unwrap();
@@ -134,16 +144,21 @@ fn test_create_account_taken_identifier_already_exists() {
 fn test_create_taken_path_already_exists() {
     let dir = TempDir::new("dup-path");
     let db = Database::open(&dir.0).unwrap();
-    let _ = db.content().create(Entity::new("page").path("/a")).unwrap();
+    let _ = publish(&db, Entity::new("page").path("/a")).unwrap();
     assert!(matches!(
         db.content().create(Entity::new("page").path("/a")),
         Err(Error::AlreadyExists { what: "path" })
     ));
+    // A draft at a free path cannot be published once another entity
+    // takes the path.
+    let draft = db.content().create(Entity::new("page").path("/b")).unwrap();
+    let _ = publish(&db, Entity::new("page").path("/b")).unwrap();
+    assert!(matches!(
+        db.content().publish(draft),
+        Err(Error::AlreadyExists { what: "path" })
+    ));
     // The same path on another site is free.
-    let _ = db
-        .content()
-        .create(Entity::new("page").site("other.example").path("/a"))
-        .unwrap();
+    let _ = publish(&db, Entity::new("page").site("other.example").path("/a")).unwrap();
 }
 
 #[test]
@@ -154,7 +169,8 @@ fn test_concurrent_creates_of_one_path_exactly_one_wins() {
         .map(|i| {
             let db = Arc::clone(&db);
             thread::spawn(move || {
-                db.content().create(
+                publish(
+                    &db,
                     Entity::new("page")
                         .field("writer", i64::from(i))
                         .path("/race"),
@@ -556,10 +572,7 @@ fn test_read_sees_one_snapshot_while_others_commit() {
         .auth()
         .create_account("ann@example.com", &password)
         .unwrap();
-    let first = db
-        .content()
-        .create(Entity::new("page").path("/first"))
-        .unwrap();
+    let first = publish(&db, Entity::new("page").path("/first")).unwrap();
 
     let (late, seen) = db
         .read(|r| {
@@ -570,9 +583,7 @@ fn test_read_sees_one_snapshot_while_others_commit() {
                     db.auth()
                         .set_standing(ann, Standing::Banned { reason: 1 }, None)
                         .unwrap();
-                    db.content()
-                        .create(Entity::new("page").path("/late"))
-                        .unwrap()
+                    publish(&db, Entity::new("page").path("/late")).unwrap()
                 })
                 .join()
                 .unwrap()

@@ -198,14 +198,27 @@ staged, so a replay reaches the same state. Digests are keyed BLAKE3 values;
 the token itself and the identifier itself never appear. The password hash is
 an Argon2id string in the PHC format.
 
-### Content (engine 2), format 1
+### Content (engine 2), format 2 (from 0.4)
 
 | Code | Operation | Fields |
 |---|---|---|
-| 1 | create entity | `entity record bytes32` |
+| 2 | store an entity head | `rid [16]`, `head bytes32` |
+| 3 | store a revision | `rid [16]`, `number u32`, `revision bytes32` |
+| 4 | set a route | `site str16`, `path str16`, `route bytes16` |
+| 5 | remove a route | `site str16`, `path str16` |
 
-The entity record is the one stored in the content store; see
-[FILE_FORMATS.md](./FILE_FORMATS.md#entity-record).
+Heads, revisions, and routes are the records stored in the content store; see
+[FILE_FORMATS.md](./FILE_FORMATS.md#content-store-contentstore). Staging
+computes them; applying a commit stores them as they are.
+
+### Content (engine 2), format 1 (0.1 to 0.3; read, never written)
+
+| Code | Operation | Fields |
+|---|---|---|
+| 1 | create entity | `entity record bytes32` (format 1, below in FILE_FORMATS.md) |
+
+Applying it stores the record and, when it has a path, a page route at
+revision 1.
 
 ## Checkpoints and truncation
 

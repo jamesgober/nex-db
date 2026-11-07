@@ -103,6 +103,10 @@ name = "recovery"
 required-features = ["auth", "content"]
 
 [[test]]
+name = "content"
+required-features = ["content"]
+
+[[test]]
 name = "kill"
 required-features = ["auth", "content"]
 

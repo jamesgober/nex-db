@@ -50,6 +50,7 @@ use super::{
 use crate::{
     engine::{Engine, EngineId, Registry, Staged},
     error::{Error, Result},
+    feed::{Change, FeedLog},
 };
 
 /// Times a commit closure runs before [`Error::Conflict`].
@@ -119,6 +120,8 @@ pub(crate) struct Core {
     /// Log bytes that start a checkpoint.
     checkpoint_every: AtomicU64,
     catalog: Catalog,
+    /// Recent changes for the change feed.
+    feed: FeedLog,
     _lock: DirLock,
 }
 
@@ -149,6 +152,7 @@ impl Core {
             since_checkpoint: AtomicU64::new(0),
             checkpoint_every: AtomicU64::new(CHECKPOINT_EVERY),
             catalog,
+            feed: FeedLog::default(),
             _lock: lock,
         };
         Ok((core, new_database))
@@ -173,6 +177,7 @@ impl Core {
             .unwrap_or_else(PoisonError::into_inner)
             .last = last;
         self.order.start_at(last);
+        self.feed.reset(last);
         if new_database && !defaults.is_empty() {
             let staged = CatalogStaged::define(defaults.to_vec());
             self.write_or_fail(engines, Kind::Catalog, 0, &[&staged])?;
@@ -188,6 +193,11 @@ impl Core {
     /// The catalog.
     pub(crate) fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    /// The change feed's window.
+    pub(crate) fn feed(&self) -> &FeedLog {
+        &self.feed
     }
 
     /// The highest sequence number visible to readers.
@@ -464,7 +474,12 @@ impl Core {
             .map_err(stopped)?;
         self.order
             .complete(seq, || {
-                record::decode(bytes, 0).and_then(|view| self.apply_record(engines, &view))
+                let mut changes = Vec::new();
+                record::decode(bytes, 0)
+                    .and_then(|view| self.apply_record(engines, &view, &mut changes))?;
+                // In commit order, before the commit is visible.
+                self.feed.push(seq, changes);
+                Ok(())
             })
             .map_err(stopped)
     }
@@ -500,7 +515,9 @@ impl Core {
             if view.seq <= floor {
                 return Ok(());
             }
-            self.apply_record(engines, &view)
+            // Changes replayed at open are not fed: a feed starts after
+            // the last recovered commit.
+            self.apply_record(engines, &view, &mut Vec::new())
         })?;
         let last = last.unwrap_or(0);
         // An engine holding a commit the log does not have means the log
@@ -512,7 +529,12 @@ impl Core {
     }
 
     /// Hand each section of a decoded record to its engine.
-    fn apply_record(&self, engines: &dyn Registry, view: &RecordView<'_>) -> Result<()> {
+    fn apply_record(
+        &self,
+        engines: &dyn Registry,
+        view: &RecordView<'_>,
+        changes: &mut Vec<Change>,
+    ) -> Result<()> {
         for section in &view.sections {
             let catalog_section = section.engine == EngineId::CATALOG;
             if catalog_section != (view.kind == Kind::Catalog) {
@@ -526,7 +548,7 @@ impl Core {
             }
             let engine = self.engine(engines, section.engine)?;
             debug_assert_eq!(engine.id(), section.engine);
-            engine.apply(view.seq, section)?;
+            engine.apply(view.seq, section, changes)?;
         }
         Ok(())
     }

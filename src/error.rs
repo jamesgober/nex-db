@@ -73,6 +73,13 @@ pub enum Error {
     /// A [`Database::read`](crate::Database::read) ran longer than the
     /// snapshot age limit (60 seconds). Read again.
     SnapshotTooOld,
+    /// A change feed was asked for changes older than it keeps (or than the
+    /// last open). Drop what was built from the feed and start again from
+    /// [`Database::position`](crate::Database::position).
+    FeedBehind {
+        /// The oldest position the feed can resume after.
+        oldest: u64,
+    },
 }
 
 impl Error {
@@ -93,6 +100,7 @@ impl Error {
             Error::Corrupt { .. } => "NEX-1007",
             Error::Storage { .. } => "NEX-1008",
             Error::SnapshotTooOld => "NEX-1009",
+            Error::FeedBehind { .. } => "NEX-1012",
         }
     }
 
@@ -153,6 +161,11 @@ impl fmt::Display for Error {
             Error::SnapshotTooOld => write!(
                 f,
                 "{code}: the read ran past the snapshot age limit; read again"
+            ),
+            Error::FeedBehind { oldest } => write!(
+                f,
+                "{code}: the change feed no longer holds changes before position {oldest}; drop \
+                 what was built from it and start again from the current position"
             ),
         }
     }

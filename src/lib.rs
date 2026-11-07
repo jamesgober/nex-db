@@ -101,6 +101,7 @@ mod core;
 mod db;
 mod engine;
 mod error;
+mod feed;
 mod ids;
 #[cfg(feature = "auth")]
 mod table;
@@ -130,6 +131,7 @@ pub use crate::{
     core::keys::Keys,
     db::{Builder, Database, Read, Transaction, open},
     error::{Error, Result},
+    feed::{Change, Feed, Position},
     ids::{AccountId, Rid},
 };
 

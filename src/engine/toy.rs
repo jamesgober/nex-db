@@ -27,6 +27,7 @@ use crate::{
         record::{self, Class, Section, Seq},
     },
     error::{Error, Result},
+    feed::Change,
 };
 
 const FORMAT: u16 = 1;
@@ -99,7 +100,7 @@ impl Engine for ToyEngine {
         }
     }
 
-    fn apply(&self, seq: Seq, section: &Section<'_>) -> Result<()> {
+    fn apply(&self, seq: Seq, section: &Section<'_>, _changes: &mut Vec<Change>) -> Result<()> {
         if section.format != FORMAT || section.flags != 0 {
             return Err(Error::corrupt("a toy section format", seq));
         }

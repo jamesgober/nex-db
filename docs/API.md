@@ -707,13 +707,46 @@ Every listing is answered from an index, never by scanning.
 ## The change feed
 
 `db.feed(from: Position) -> Result<Feed>` (0.4, P1) reads committed changes in
-order: `EntityChanged { rid, locales, revision, paths }`, `RouteChanged`,
-`AccountCreated { account }`, `SessionRevoked { account }`,
-`StandingChanged { account }`. Auth events carry ids and kinds only. A feed is
-an iterator that blocks for the next change; a consumer that falls behind its
-bound is cut off and resumes from its last `Position`. `db.position()` (0.4)
-returns the position of the last visible commit, to start a feed from now.
-Typical use: drop cached pages when an entity they were built from changes.
+order, each with the `Position` of its commit. `Change` (non-exhaustive):
+`EntityChanged { rid, revision }` (the published revision after the commit, 0
+for none), `RouteChanged { site, path }`, `AccountCreated { account }`,
+`SessionRevoked { account: Option<AccountId> }` (one session, or every
+session of the account), `StandingChanged { account }`, and
+`AccountChanged { account }` (roles, identifiers, or password). Auth changes
+carry ids and kinds only.
+
+A `Feed` is an iterator that blocks for the next change; `next_timeout(d)` and
+`try_next()` return `None` when nothing came. `db.position()` returns the
+position of the last visible commit, to start a feed from now. The feed keeps
+the changes of the last 65,536 commits that changed something, since the
+database opened; resuming from an older position fails with
+`Error::FeedBehind`, and the consumer drops what it built and starts again from
+`db.position()`. Typical use: drop cached pages when an entity they were built
+from changes. Locales and the paths of an entity join `EntityChanged` with
+locales.
+
+```rust
+use std::time::Duration;
+use nex_db::{Change, Entity};
+
+# let dir = std::env::temp_dir().join(format!("nex-db-api-feed-{}", std::process::id()));
+# let _ = std::fs::remove_dir_all(&dir);
+# let db = nex_db::open(&dir)?;
+let mut feed = db.feed(db.position())?;
+let rid = db.content().create(Entity::new("page").path("/hello"))?;
+db.content().publish(rid)?;
+let mut changed = Vec::new();
+while let Some((_, change)) = feed.next_timeout(Duration::from_millis(10))? {
+    if let Change::EntityChanged { rid, revision } = change {
+        changed.push((rid, revision));
+    }
+}
+assert_eq!(changed, [(rid, 0), (rid, 1)]);
+# drop(feed);
+# drop(db);
+# std::fs::remove_dir_all(&dir).unwrap();
+# Ok::<(), nex_db::Error>(())
+```
 
 ## Health and observers
 
@@ -764,6 +797,7 @@ ever contains a token, password, hash, or key.
 | `SnapshotTooOld` | NEX-1009 | 0.3 | a `db.read` outlived its limit | read again |
 | `Restricted { what }` | NEX-1010 | 0.4 | a reference rule refuses a delete | remove the references first |
 | `AuthHalted` | NEX-1011 | 0.7 | the auth engine refuses every call after a security event | an operator resumes it |
+| `FeedBehind { oldest }` | NEX-1012 | 0.4 | a change feed was asked for changes older than it keeps | drop what was built from the feed; start again from `db.position()` |
 
 `error.code()` returns the code. `Display` gives the message; `source()` gives
 the operating-system error for `Storage`.

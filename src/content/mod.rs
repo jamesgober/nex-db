@@ -44,6 +44,7 @@ use crate::{
     },
     engine::{Conflict, Engine, EngineId, Staged},
     error::{Error, Result},
+    feed::Change,
     ids::Rid,
 };
 
@@ -345,7 +346,7 @@ impl Engine for ContentEngine {
         }
     }
 
-    fn apply(&self, seq: Seq, section: &Section<'_>) -> Result<()> {
+    fn apply(&self, seq: Seq, section: &Section<'_>, changes: &mut Vec<Change>) -> Result<()> {
         let known = section.format == FORMAT || section.format == FORMAT_CREATE_ONLY;
         if !known || section.flags != 0 || section.collection != self.collection {
             return Err(Error::corrupt("a content section header", seq));
@@ -364,6 +365,10 @@ impl Engine for ContentEngine {
                     self.versions
                         .record(&key, seq, Some(record), || Ok(self.store.get(&key)?))?;
                     batch.put(key, record);
+                    changes.push(Change::EntityChanged {
+                        rid: head.rid,
+                        revision: 1,
+                    });
                     if let Some(path) = head.draft.path.as_deref() {
                         let entry = page(&head, 1);
                         let stored = stored_route_key(self.collection, &head.site, path);
@@ -376,6 +381,11 @@ impl Engine for ContentEngine {
                     self.versions
                         .record(&key, seq, Some(value), || Ok(self.store.get(&key)?))?;
                     batch.put(key, *value);
+                    let head = Head::decode(value, seq)?;
+                    changes.push(Change::EntityChanged {
+                        rid: *rid,
+                        revision: head.published.map_or(0, |p| p.revision),
+                    });
                 }
                 Op::PutRevision(rid, n, value) => {
                     batch.put(revision_key(self.collection, *rid, *n), *value);
@@ -399,6 +409,7 @@ impl Engine for ContentEngine {
         }
         for (site, path, entry) in routes {
             self.routes.set(&site, &path, seq, entry);
+            changes.push(Change::RouteChanged { site, path });
         }
         Ok(())
     }
@@ -1099,6 +1110,7 @@ mod tests {
                         collection: 2,
                         body: &body,
                     },
+                    &mut Vec::new(),
                 )
                 .unwrap();
             let route = engine.routes.get(crate::DEFAULT_SITE, "/old").unwrap();

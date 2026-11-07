@@ -693,16 +693,20 @@ the content engine never checks auth data itself.
 
 | Operation | Since | Grade |
 |---|---|---|
-| `list(Listing) -> Result<Page<Entry>>`, `next_page(cursor)` | 0.4 | P0 |
-| `Listing::latest(kind)`, `.term(t)`, `.by_author(a)`, `.updated()`, `.sticky_first()`, `.site(s)`, `.limit(n)` | 0.4 | P0 |
+| `list(&Listing) -> Result<Page<Entry>>`, `next_page(&Cursor)` | 0.4 | P0 |
+| `Listing::latest(kind)`, `.updated()`, `.site(s)`, `.limit(n)` | 0.4 | P0 |
+| `.term(t)`, `.by_author(a)`, `.sticky_first()` | 0.4 (with terms and authors) | P0 |
 | `children(rid)`, `ancestors(rid)` | 0.4 | P1 |
 | `referenced_by(rid)` | 0.4 | P1 |
 | `stream(Listing)` for sitemaps and feeds | 0.4 | P1 |
 | `search(locale, query) -> Result<Page<Hit>>` | 0.5 | P1 |
 | `related(rid, limit)` | 0.5 | P2 |
 
-Listings return pages of at most 1,000 (default 100) with an opaque cursor.
-Every listing is answered from an index, never by scanning.
+Listings return pages of at most 1,000 (default 100) with an opaque `Cursor`;
+its text form (`to_string()`, `Cursor::parse`) can travel in a URL. Every
+listing is answered from an index, never by scanning. `latest` orders by
+first publication, newest first; `updated()` by the last publish. Only
+published entities are listed.
 
 ## The change feed
 

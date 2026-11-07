@@ -2,7 +2,10 @@
 
 use std::path::PathBuf;
 
-use nex_db::{DEFAULT_SITE, Database, Entity, Error, Patch, RouteKind, Status, Value, Visibility};
+use nex_db::{
+    Cursor, DEFAULT_SITE, Database, Entity, Error, Listing, Patch, RouteKind, Status, Value,
+    Visibility,
+};
 
 struct TempDir(PathBuf);
 
@@ -258,4 +261,87 @@ fn test_a_snapshot_keeps_the_routes_of_its_time() {
         .unwrap();
     assert_eq!(seen, (true, true, true));
     assert!(db.content().resolve(DEFAULT_SITE, "/s").unwrap().is_none());
+}
+
+fn titles(page: &nex_db::Page<nex_db::Entry>) -> Vec<String> {
+    page.items()
+        .iter()
+        .filter_map(|e| e.field("title").and_then(Value::as_text).map(str::to_owned))
+        .collect()
+}
+
+#[test]
+fn test_listings_page_newest_first_and_follow_publishing() {
+    let dir = TempDir::new("listings");
+    let posts = {
+        let db = Database::open(&dir.0).unwrap();
+        let mut posts = Vec::new();
+        for n in 1..=5 {
+            let rid = db
+                .content()
+                .create(Entity::new("post").field("title", format!("p{n}")))
+                .unwrap();
+            let _ = db.content().publish(rid).unwrap();
+            posts.push(rid);
+            // Publication times one millisecond apart at least.
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+        // A draft and a page of another type are not listed.
+        let _ = db
+            .content()
+            .create(Entity::new("post").field("title", "draft"))
+            .unwrap();
+        let page = db
+            .content()
+            .create(Entity::new("page").field("title", "about"))
+            .unwrap();
+        let _ = db.content().publish(page).unwrap();
+
+        let first = db
+            .content()
+            .list(&Listing::latest("post").limit(2))
+            .unwrap();
+        assert_eq!(titles(&first), ["p5", "p4"]);
+        let cursor = first.next().unwrap().clone();
+        // The cursor travels as text.
+        let cursor = Cursor::parse(&cursor.to_string()).unwrap();
+        let second = db.content().next_page(&cursor).unwrap();
+        assert_eq!(titles(&second), ["p3", "p2"]);
+        let third = db.content().next_page(second.next().unwrap()).unwrap();
+        assert_eq!(titles(&third), ["p1"]);
+        assert!(third.next().is_none());
+
+        // Republishing an edit moves it to the front of `updated`, not of
+        // `latest`.
+        db.content()
+            .save_draft(posts[0], Patch::new().set("title", "p1 again"))
+            .unwrap();
+        let _ = db.content().publish(posts[0]).unwrap();
+        let updated = db
+            .content()
+            .list(&Listing::latest("post").updated().limit(1))
+            .unwrap();
+        assert_eq!(titles(&updated), ["p1 again"]);
+        let latest = db
+            .content()
+            .list(&Listing::latest("post").limit(1))
+            .unwrap();
+        assert_eq!(titles(&latest), ["p5"]);
+        let _ = db.content().unpublish(posts[4]).unwrap();
+        posts
+    };
+    // Rebuilt at open.
+    let db = Database::open(&dir.0).unwrap();
+    let all = db.content().list(&Listing::latest("post")).unwrap();
+    assert_eq!(titles(&all), ["p4", "p3", "p2", "p1 again"]);
+    assert_eq!(all.items()[0].rid(), posts[3]);
+    assert!(
+        db.content()
+            .list(&Listing::latest("post").site("other.example"))
+            .unwrap()
+            .items()
+            .is_empty()
+    );
+    assert!(Cursor::parse("not a cursor").is_err());
+    let _ = DEFAULT_SITE;
 }

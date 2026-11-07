@@ -11,6 +11,7 @@
 //! `apply` stores them as they are, so a replay writes the same bytes.
 
 pub(crate) mod entity;
+pub(crate) mod lists;
 mod routes;
 
 use std::{
@@ -30,6 +31,7 @@ use self::{
         Body, Entity, Entry, Head, Patch, Published, Revision, RevisionInfo, RouteEntry, RouteKind,
         Status, Visibility, decode_route, encode_route,
     },
+    lists::{Cursor, ListIndex, Listing, Page},
     routes::RouteTable,
 };
 use crate::{
@@ -146,6 +148,8 @@ pub(crate) struct ContentEngine {
     /// Keeps a checkpoint's mark from interleaving with an apply's batch.
     writing: Mutex<()>,
     routes: RouteTable,
+    /// Published entities by site and type.
+    lists: ListIndex,
     /// Entity head versions kept for running snapshots.
     versions: Versions,
     conflicts: ConflictTable,
@@ -175,12 +179,14 @@ impl ContentEngine {
             None => 0,
         };
         let routes = RouteTable::new();
-        // Entities stored by 0.1 to 0.3 have no route records: their routes
-        // come from the entities themselves.
+        let lists = ListIndex::new();
+        // Every head goes into the listing index. Entities stored by 0.1 to
+        // 0.3 have no route records: their routes come from the entities.
         let start = entity_prefix(collection);
         for (_, value) in store.scan(start.clone()..after(&start))? {
+            let head = Head::decode(&value, applied)?;
+            lists.update(&head);
             if Head::is_legacy(&value) {
-                let head = Head::decode(&value, applied)?;
                 if let Some(path) = head.draft.path.as_deref() {
                     routes.set(&head.site, path, 0, Some(page(&head, 1)));
                 }
@@ -200,6 +206,7 @@ impl ContentEngine {
             durable: AtomicU64::new(applied),
             writing: Mutex::new(()),
             routes,
+            lists,
             versions: Versions::new(),
             conflicts: ConflictTable::new(),
         })
@@ -357,6 +364,7 @@ impl Engine for ContentEngine {
         let ops = decode_ops(seq, section.format, section.body)?;
         let mut batch = Batch::new();
         let mut routes: Vec<(String, String, Option<RouteEntry>)> = Vec::new();
+        let mut heads = Vec::new();
         for op in &ops {
             match op {
                 Op::Create(record) => {
@@ -375,6 +383,7 @@ impl Engine for ContentEngine {
                         batch.put(stored, encode_route(&entry));
                         routes.push((head.site.clone(), path.to_owned(), Some(entry)));
                     }
+                    heads.push(head);
                 }
                 Op::PutHead(rid, value) => {
                     let key = entity_key(self.collection, *rid);
@@ -384,8 +393,9 @@ impl Engine for ContentEngine {
                     let head = Head::decode(value, seq)?;
                     changes.push(Change::EntityChanged {
                         rid: *rid,
-                        revision: head.published.map_or(0, |p| p.revision),
+                        revision: head.published.as_ref().map_or(0, |p| p.revision),
                     });
+                    heads.push(head);
                 }
                 Op::PutRevision(rid, n, value) => {
                     batch.put(revision_key(self.collection, *rid, *n), *value);
@@ -410,6 +420,9 @@ impl Engine for ContentEngine {
         for (site, path, entry) in routes {
             self.routes.set(&site, &path, seq, entry);
             changes.push(Change::RouteChanged { site, path });
+        }
+        for head in &heads {
+            self.lists.update(head);
         }
         Ok(())
     }
@@ -940,6 +953,60 @@ impl Content<'_> {
     /// not held in memory.
     pub fn resolve(&self, site: &str, path: &str) -> Result<Option<RouteEntry>> {
         Ok(self.engine().routes.get(site, path))
+    }
+
+    /// The first page of `listing`: published entities only, read from an
+    /// index, never by scanning.
+    ///
+    /// ```no_run
+    /// # fn main() -> nex_db::Result<()> {
+    /// use nex_db::Listing;
+    /// let db = nex_db::open("data/site")?;
+    /// let page = db.content().list(&Listing::latest("post").site("example.com").limit(10))?;
+    /// for post in page.items() {
+    ///     # let _ = post;
+    /// }
+    /// if let Some(more) = page.next() {
+    ///     let older = db.content().next_page(more)?;
+    ///     # let _ = older;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`get`](Self::get).
+    pub fn list(&self, listing: &Listing) -> Result<Page<Entry>> {
+        self.page(listing, None)
+    }
+
+    /// The page after `cursor`.
+    ///
+    /// # Errors
+    ///
+    /// As [`get`](Self::get).
+    pub fn next_page(&self, cursor: &Cursor) -> Result<Page<Entry>> {
+        self.page(&cursor.listing, Some(cursor.after))
+    }
+
+    fn page(&self, listing: &Listing, after: Option<(u64, [u8; 16])>) -> Result<Page<Entry>> {
+        let engine = self.engine();
+        let (ids, last) = engine.lists.page(listing, after);
+        let mut items = Vec::with_capacity(ids.len());
+        for rid in ids {
+            // Unpublished since the index was read: left out.
+            if let Some(entry) = engine.published_at(rid, Seq::MAX)? {
+                items.push(entry);
+            }
+        }
+        Ok(Page {
+            items,
+            next: last.map(|after| Cursor {
+                listing: listing.clone(),
+                after,
+            }),
+        })
     }
 
     /// Create an entity in its own commit. See [`ContentTx::create`].

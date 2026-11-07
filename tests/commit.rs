@@ -2,7 +2,9 @@
 
 use std::{path::PathBuf, sync::Arc, thread, time::Duration};
 
-use nex_db::{Database, Entity, Error, RevokeReason, SessionSpec, SignIn, Validation, Value};
+use nex_db::{
+    Database, Entity, Error, Login, RevokeReason, SessionSpec, SignIn, Standing, Validation, Value,
+};
 
 struct TempDir(PathBuf);
 
@@ -291,4 +293,358 @@ fn test_secrets_never_in_debug_output() {
     let shown = format!("{password:?} {token:?} {db:?}");
     assert!(!shown.contains(token.as_str()));
     assert!(!shown.contains("argon2"));
+}
+
+#[test]
+fn test_revoke_all_ends_every_session_of_the_account_only() {
+    let dir = TempDir::new("revoke-all");
+    let db = Database::open(&dir.0).unwrap();
+    let password = db.auth().hash_password("pw").unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    let bo = db
+        .auth()
+        .create_account("bo@example.com", &password)
+        .unwrap();
+    let a1 = db.auth().issue_session(ann, SessionSpec::web()).unwrap();
+    let a2 = db.auth().issue_session(ann, SessionSpec::web()).unwrap();
+    let b1 = db.auth().issue_session(bo, SessionSpec::web()).unwrap();
+
+    assert_eq!(db.auth().revoke_all(ann).unwrap(), 2);
+    for token in [&a1, &a2] {
+        assert_eq!(
+            db.auth().validate(token).unwrap(),
+            Validation::Revoked {
+                reason: RevokeReason::SignedOutEverywhere
+            }
+        );
+    }
+    assert!(matches!(
+        db.auth().validate(&b1).unwrap(),
+        Validation::Valid(_)
+    ));
+    // A session issued afterwards is valid; signing out again ends it.
+    let a3 = db.auth().issue_session(ann, SessionSpec::web()).unwrap();
+    assert!(matches!(
+        db.auth().validate(&a3).unwrap(),
+        Validation::Valid(_)
+    ));
+    assert_eq!(db.auth().revoke_all(ann).unwrap(), 1);
+    assert!(!matches!(
+        db.auth().validate(&a3).unwrap(),
+        Validation::Valid(_)
+    ));
+    drop(db);
+
+    // The epochs come back with the log.
+    let db = Database::open(&dir.0).unwrap();
+    assert!(!matches!(
+        db.auth().validate(&a1).unwrap(),
+        Validation::Valid(_)
+    ));
+    assert!(!matches!(
+        db.auth().validate(&a3).unwrap(),
+        Validation::Valid(_)
+    ));
+    assert!(matches!(
+        db.auth().validate(&b1).unwrap(),
+        Validation::Valid(_)
+    ));
+}
+
+#[test]
+fn test_revoke_all_in_one_commit_with_a_new_session_keeps_only_the_new_one() {
+    let dir = TempDir::new("revoke-all-tx");
+    let db = Database::open(&dir.0).unwrap();
+    let password = db.auth().hash_password("pw").unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    let old = db.auth().issue_session(ann, SessionSpec::web()).unwrap();
+    let new = db
+        .commit(|tx| {
+            let _ = tx.auth().revoke_all(ann)?;
+            tx.auth().issue_session(ann, SessionSpec::web())
+        })
+        .unwrap();
+    assert!(!matches!(
+        db.auth().validate(&old).unwrap(),
+        Validation::Valid(_)
+    ));
+    assert!(matches!(
+        db.auth().validate(&new).unwrap(),
+        Validation::Valid(_)
+    ));
+}
+
+#[test]
+fn test_rotate_replaces_the_token_and_keeps_the_expiry() {
+    let dir = TempDir::new("rotate");
+    let db = Database::open(&dir.0).unwrap();
+    let password = db.auth().hash_password("pw").unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    let old = db.auth().issue_session(ann, SessionSpec::web()).unwrap();
+    let Validation::Valid(before) = db.auth().validate(&old).unwrap() else {
+        panic!("valid");
+    };
+    let new = db.auth().rotate(&old).unwrap();
+    assert_eq!(
+        db.auth().validate(&old).unwrap(),
+        Validation::Revoked {
+            reason: RevokeReason::Rotated
+        }
+    );
+    let Validation::Valid(after) = db.auth().validate(&new).unwrap() else {
+        panic!("valid");
+    };
+    assert_eq!(
+        (after.account(), after.expires_at()),
+        (ann, before.expires_at())
+    );
+    assert!(matches!(db.auth().rotate(&old), Err(Error::Invalid { .. })));
+    assert!(matches!(
+        db.auth().rotate("not a token"),
+        Err(Error::Invalid { .. })
+    ));
+}
+
+#[test]
+fn test_ban_ends_sessions_and_blocks_sign_in_only_with_the_right_password() {
+    let dir = TempDir::new("ban");
+    let db = Database::open(&dir.0).unwrap();
+    let password = db.auth().hash_password("right pw").unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    let token = db.auth().issue_session(ann, SessionSpec::web()).unwrap();
+
+    db.auth()
+        .set_standing(ann, Standing::Banned { reason: 3 }, None)
+        .unwrap();
+    assert!(!matches!(
+        db.auth().validate(&token).unwrap(),
+        Validation::Valid(_)
+    ));
+    assert_eq!(
+        db.auth().standing(ann).unwrap(),
+        Some(Standing::Banned { reason: 3 })
+    );
+    assert!(matches!(
+        db.auth()
+            .sign_in("ann@example.com", "right pw", SessionSpec::web())
+            .unwrap(),
+        SignIn::LockedOut { until: None }
+    ));
+    // A wrong password says nothing about the ban.
+    assert_eq!(
+        db.auth()
+            .verify_password("ann@example.com", "wrong")
+            .unwrap(),
+        Login::Failed
+    );
+    drop(db);
+
+    // The standing survives a reopen; lifting it lets the account in.
+    let db = Database::open(&dir.0).unwrap();
+    assert_eq!(
+        db.auth().standing(ann).unwrap(),
+        Some(Standing::Banned { reason: 3 })
+    );
+    db.auth().set_standing(ann, Standing::Active, None).unwrap();
+    assert_eq!(
+        db.auth()
+            .verify_password("ann@example.com", "right pw")
+            .unwrap(),
+        Login::Verified(ann)
+    );
+    assert_eq!(
+        db.auth()
+            .standing(nex_db::AccountId::from_bytes([9; 16]))
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn test_ten_failures_lock_the_account_out() {
+    let dir = TempDir::new("lockout");
+    let db = Database::open(&dir.0).unwrap();
+    let password = db.auth().hash_password("right pw").unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    let token = db.auth().issue_session(ann, SessionSpec::web()).unwrap();
+    for _ in 0..9 {
+        assert_eq!(
+            db.auth()
+                .verify_password("ann@example.com", "wrong")
+                .unwrap(),
+            Login::Failed
+        );
+    }
+    // Nine failures: still open.
+    assert!(matches!(
+        db.auth().validate(&token).unwrap(),
+        Validation::Valid(_)
+    ));
+    assert_eq!(db.auth().standing(ann).unwrap(), Some(Standing::Active));
+    assert_eq!(
+        db.auth()
+            .verify_password("ann@example.com", "wrong")
+            .unwrap(),
+        Login::Failed
+    );
+    assert!(matches!(
+        db.auth().standing(ann).unwrap(),
+        Some(Standing::LockedOut { .. })
+    ));
+    assert!(!matches!(
+        db.auth().validate(&token).unwrap(),
+        Validation::Valid(_)
+    ));
+    assert!(matches!(
+        db.auth()
+            .verify_password("ann@example.com", "right pw")
+            .unwrap(),
+        Login::LockedOut { until: Some(_) }
+    ));
+}
+
+#[test]
+fn test_suspension_that_ran_out_reads_as_active() {
+    let dir = TempDir::new("suspension");
+    let db = Database::open(&dir.0).unwrap();
+    let password = db.auth().hash_password("right pw").unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    let past = std::time::SystemTime::now() - Duration::from_secs(60);
+    db.auth()
+        .set_standing(
+            ann,
+            Standing::Suspended {
+                until: Some(past),
+                reason: 1,
+            },
+            None,
+        )
+        .unwrap();
+    assert_eq!(db.auth().standing(ann).unwrap(), Some(Standing::Active));
+    assert!(matches!(
+        db.auth()
+            .sign_in("ann@example.com", "right pw", SessionSpec::web())
+            .unwrap(),
+        SignIn::Success { .. }
+    ));
+}
+
+#[test]
+fn test_read_sees_one_snapshot_while_others_commit() {
+    let dir = TempDir::new("read-snapshot");
+    let db = Database::open(&dir.0).unwrap();
+    let password = db.auth().hash_password("pw").unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    let first = db
+        .content()
+        .create(Entity::new("page").path("/first"))
+        .unwrap();
+
+    let (late, seen) = db
+        .read(|r| {
+            assert_eq!(r.auth().standing(ann)?, Some(Standing::Active));
+            // Another thread commits while the snapshot runs.
+            let late = std::thread::scope(|s| {
+                s.spawn(|| {
+                    db.auth()
+                        .set_standing(ann, Standing::Banned { reason: 1 }, None)
+                        .unwrap();
+                    db.content()
+                        .create(Entity::new("page").path("/late"))
+                        .unwrap()
+                })
+                .join()
+                .unwrap()
+            });
+            let seen = (
+                r.auth().standing(ann)?,
+                r.content().get(first)?.is_some(),
+                r.content().get(late)?.is_some(),
+                r.content()
+                    .resolve(nex_db::DEFAULT_SITE, "/late")?
+                    .is_some(),
+            );
+            Ok((late, seen))
+        })
+        .unwrap();
+    assert_eq!(seen, (Some(Standing::Active), true, false, false));
+
+    // A new snapshot sees the commits.
+    let now = db
+        .read(|r| {
+            Ok((
+                r.auth().standing(ann)?,
+                r.content().get(late)?.is_some(),
+                r.content()
+                    .resolve(nex_db::DEFAULT_SITE, "/late")?
+                    .is_some(),
+            ))
+        })
+        .unwrap();
+    assert_eq!(now, (Some(Standing::Banned { reason: 1 }), true, true));
+}
+
+#[test]
+fn test_session_carries_payload_recheck_and_idle_limit() {
+    let dir = TempDir::new("session-spec");
+    let db = Database::open(&dir.0).unwrap();
+    let password = db.auth().hash_password("pw").unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    let spec = SessionSpec::web()
+        .recheck_after(Duration::from_secs(300))
+        .payload(b"perm=editor")
+        .unwrap();
+    let token = db.auth().issue_session(ann, spec).unwrap();
+    let Validation::Valid(session) = db.auth().validate(&token).unwrap() else {
+        panic!("valid");
+    };
+    assert_eq!(session.payload(), b"perm=editor");
+    assert!(session.recheck_at().is_some());
+    assert_eq!(session.idle_limit(), None);
+
+    // Rotation keeps the payload.
+    let rotated = db.auth().rotate(&token).unwrap();
+    let Validation::Valid(after) = db.auth().validate(&rotated).unwrap() else {
+        panic!("valid");
+    };
+    assert_eq!(after.payload(), b"perm=editor");
+
+    // An idle limit ends a session left unused.
+    let idle = db
+        .auth()
+        .issue_session(ann, SessionSpec::web().idle(Duration::from_secs(1)))
+        .unwrap();
+    assert!(matches!(
+        db.auth().validate(&idle).unwrap(),
+        Validation::Valid(_)
+    ));
+    // A slow disk can take tens of milliseconds to sync the issuing commit,
+    // so the limit is long enough for that and the wait longer still.
+    thread::sleep(Duration::from_millis(1300));
+    assert_eq!(db.auth().validate(&idle).unwrap(), Validation::Expired);
+    assert!(SessionSpec::web().payload(&[0; 257]).is_err());
 }

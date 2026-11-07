@@ -37,8 +37,19 @@
 ## 0.3.0 Core and auth
 
 - Full commit pipeline (snapshot isolation, serializable option, group commit, bounded queue, fsync halt), write classes, snapshots and versioned overlays, checkpoints, log truncation, catalog locks.
+  - [x] Group commit with a bounded queue; a failed write, sync, or apply halts writes (`PLAN.md` D-045).
+  - [x] Snapshots: `db.read` with versions kept for running snapshots (`PLAN.md` D-052).
+  - [x] Checkpoints and log truncation (`PLAN.md` D-056).
+  - [x] Audit chain (`PLAN.md` D-057).
+  - [x] Session payload, idle limit, and recheck time (`PLAN.md` D-059).
 - Key hierarchy through key-vault and crypt-io; sealed auth sections.
+  - [x] Sealed and padded auth sections in the log (`PLAN.md` D-047).
+  - [x] Sealed account records in the account store (`PLAN.md` D-048).
+  - [x] Key sources outside the directory and a key check (`PLAN.md` D-053); the OS keychain source in 0.4.
 - Hot table, timer wheel, epoch table, tombstones, checkpoints; standing, counters, lockout, audit chain, revocation journal (FR-6, FR-7).
+  - [x] Epoch table, `revoke_all`, `rotate` (`PLAN.md` D-049).
+  - [x] Standing, failure counters, and lock-out (`PLAN.md` D-050).
+- Moved (`PLAN.md` D-058): named realms and `commit_serializable` to 0.4; the revocation journal to 0.5.
 - **Exit:** James's site signs users in on nex-db.
 
 ## 0.4.0 Content and adapters

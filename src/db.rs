@@ -7,14 +7,15 @@
 use std::{fmt, path::Path};
 
 #[cfg(feature = "auth")]
-use crate::auth::{Auth, AuthEngine, AuthStaged, AuthTx};
+use crate::auth::{Auth, AuthEngine, AuthRead, AuthStaged, AuthTx};
 #[cfg(feature = "content")]
-use crate::content::{Content, ContentEngine, ContentStaged, ContentTx};
+use crate::content::{Content, ContentEngine, ContentRead, ContentStaged, ContentTx};
 use crate::{
     core::{
         catalog::{DEFAULT_REALM, DEFAULT_SPACE},
-        fs, keys,
-        pipeline::{ATTEMPTS, Attempt, Core},
+        fs,
+        keys::{self, Keys},
+        pipeline::{ATTEMPTS, Attempt, CHECKPOINT_EVERY, Core, SnapshotGuard},
         record::Seq,
     },
     engine::{Engine, EngineId, Registry, Staged},
@@ -79,6 +80,55 @@ impl Registry for Engines {
     }
 }
 
+/// Opens a database with settings other than the defaults. Made by
+/// [`Database::builder`].
+///
+/// ```no_run
+/// # fn main() -> nex_db::Result<()> {
+/// let db = nex_db::Database::builder("data/site")
+///     .keys(nex_db::Keys::env("SITE_DB_KEY"))
+///     .open()?;
+/// # let _ = db;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct Builder {
+    dir: std::path::PathBuf,
+    keys: Keys,
+    checkpoint_every: u64,
+}
+
+impl Builder {
+    /// Where the root key comes from. The default is a key file inside the
+    /// database directory; see [`Keys`].
+    pub fn keys(mut self, keys: Keys) -> Self {
+        self.keys = keys;
+        self
+    }
+
+    /// How much log to write between checkpoints, in bytes (default 64
+    /// MiB). A checkpoint writes every engine's own files and drops the log
+    /// records they hold, so the log, and the time an open takes, stay
+    /// bounded. It runs on the thread of the commit that crosses the mark,
+    /// after that commit is visible, and at close.
+    pub fn checkpoint_every(mut self, bytes: u64) -> Self {
+        self.checkpoint_every = bytes;
+        self
+    }
+
+    /// Open (or create) the database.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`](crate::open). [`Error::KeyUnavailable`] also when the key
+    /// is not the one the database was created with.
+    pub fn open(self) -> Result<Database> {
+        Database::open_with(self)
+    }
+}
+
 /// An open database.
 ///
 /// `Database` is `Send` and `Sync`: share it between threads by reference or
@@ -107,20 +157,33 @@ impl Database {
     ///
     /// See [`open`](crate::open).
     pub fn open(path: impl AsRef<Path>) -> Result<Database> {
-        let (core, new_database) = Core::open(path.as_ref())?;
+        Database::builder(path).open()
+    }
+
+    /// A builder for opening the database in `path` with settings other than
+    /// the defaults.
+    pub fn builder(path: impl AsRef<Path>) -> Builder {
+        Builder {
+            dir: path.as_ref().to_path_buf(),
+            keys: Keys::default(),
+            checkpoint_every: CHECKPOINT_EVERY,
+        }
+    }
+
+    fn open_with(builder: Builder) -> Result<Database> {
+        let (core, new_database) = Core::open(&builder.dir)?;
+        core.set_checkpoint_every(builder.checkpoint_every);
         let dir = core.dir().to_path_buf();
         let auth_dir = dir.join("auth");
         fs::create_dir(&auth_dir)?;
-        if new_database {
-            keys::create_if_missing(&auth_dir)?;
-        }
+        // A build without the auth engine still checks the key, so the
+        // database never opens under the wrong one.
+        #[cfg_attr(not(feature = "auth"), allow(unused_variables))]
+        let root = keys::root_key(&builder.keys, &auth_dir, new_database)?;
 
         let engines = Engines {
             #[cfg(feature = "auth")]
-            auth: {
-                let root = keys::load(&auth_dir)?;
-                AuthEngine::open(&auth_dir.join("accounts"), &root, DEFAULT_REALM.id)?
-            },
+            auth: AuthEngine::open(&auth_dir.join("accounts"), &root, DEFAULT_REALM.id)?,
             #[cfg(feature = "content")]
             content: ContentEngine::open(&dir.join("content").join("store"), DEFAULT_SPACE.id)?,
         };
@@ -215,10 +278,7 @@ impl Database {
             let snapshot = self.core.snapshot();
             let mut tx = Transaction::new(self, snapshot.seq());
             let value = f(&mut tx)?;
-            match self
-                .core
-                .commit(&self.engines, snapshot.seq(), &tx.staged())
-            {
+            match self.core.commit(&self.engines, &snapshot, &tx.staged()) {
                 Ok(()) => return Ok(value),
                 Err(Attempt::Conflict) => {}
                 Err(Attempt::Failed(err)) => return Err(err),
@@ -228,11 +288,93 @@ impl Database {
     }
 }
 
+impl Database {
+    /// Run `f` with reads that all see one snapshot: every engine as of the
+    /// same commit, whatever commits while `f` runs.
+    ///
+    /// ```
+    /// # #[cfg(all(feature = "auth", feature = "content"))]
+    /// # fn main() -> nex_db::Result<()> {
+    /// # let dir = std::env::temp_dir().join(format!("nex-db-read-doc-{}", std::process::id()));
+    /// # let _ = std::fs::remove_dir_all(&dir);
+    /// let db = nex_db::open(&dir)?;
+    /// let rid = db.content().create(nex_db::Entity::new("page").path("/a"))?;
+    /// let (route, page) = db.read(|r| {
+    ///     let route = r.content().resolve(nex_db::DEFAULT_SITE, "/a")?;
+    ///     Ok((route, r.content().get(rid)?))
+    /// })?;
+    /// assert_eq!(route.map(|r| r.entity()), page.map(|p| p.rid()));
+    /// # drop(db);
+    /// # std::fs::remove_dir_all(&dir).unwrap();
+    /// # Ok(())
+    /// # }
+    /// # #[cfg(not(all(feature = "auth", feature = "content")))]
+    /// # fn main() {}
+    /// ```
+    ///
+    /// A snapshot may run for 60 seconds; reads after that fail with
+    /// [`Error::SnapshotTooOld`]. Sessions are the exception to the
+    /// snapshot: a revoked session is revoked for every reader at once.
+    ///
+    /// # Errors
+    ///
+    /// Any error `f` returns, unchanged.
+    pub fn read<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Read<'_>) -> Result<T>,
+    {
+        let read = Read {
+            db: self,
+            snapshot: self.core.snapshot(),
+        };
+        f(&read)
+    }
+}
+
+/// Reads at one snapshot, handed to the closure of [`Database::read`].
+pub struct Read<'db> {
+    #[cfg_attr(not(any(feature = "auth", feature = "content")), allow(dead_code))]
+    db: &'db Database,
+    snapshot: SnapshotGuard<'db>,
+}
+
+impl fmt::Debug for Read<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Read")
+            .field("snapshot", &self.snapshot.seq())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Read<'_> {
+    /// Auth reads at this snapshot.
+    #[cfg(feature = "auth")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "auth")))]
+    #[must_use]
+    pub fn auth(&self) -> AuthRead<'_> {
+        AuthRead {
+            engine: self.db.auth_engine(),
+            snapshot: &self.snapshot,
+        }
+    }
+
+    /// Content reads at this snapshot.
+    #[cfg(feature = "content")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "content")))]
+    #[must_use]
+    pub fn content(&self) -> ContentRead<'_> {
+        ContentRead {
+            engine: self.db.content_engine(),
+            snapshot: &self.snapshot,
+        }
+    }
+}
+
 impl Drop for Database {
     fn drop(&mut self) {
         // Best effort: the log holds every commit, so a failure here only
         // means a longer replay at the next open.
-        self.core.checkpoint(&self.engines);
+        let _ = self.core.checkpoint(&self.engines, false);
     }
 }
 

@@ -37,7 +37,10 @@ length, then the bytes).
 │   ├─ log/              the commit log (wal-db segments)
 │   └─ catalog.ckpt      the catalog
 ├─ auth/
-│   ├─ keys              the root key
+│   ├─ keys              the root key (default key source only)
+│   ├─ key.check         a check of the root key
+│   ├─ sessions.ckpt     sessions and epochs, as of the last checkpoint
+│   ├─ audit.chain       the audit chain
 │   └─ accounts/         the account store (lsm-db)
 └─ content/
     └─ store/            the content store (lsm-db)
@@ -84,7 +87,11 @@ also keeps it closed.
 
 ## auth/keys
 
-The root key from which the auth engine derives its keys.
+The root key from which the auth engine derives its keys, when the database
+uses the default key source (`Keys::in_directory()`). With `Keys::file(path)`
+the same file lives at `path`, outside the directory; with `Keys::env(var)`
+the key is 64 hexadecimal characters in an environment variable and no file
+holds it.
 
 ```text
 format u16       1
@@ -94,9 +101,15 @@ checksum [32]    BLAKE3 of format and key
 
 Created once, with the database. A database whose key file is missing or
 damaged stays closed (`Error::KeyUnavailable`): a new key would make every
-stored digest useless. On Unix the file is readable by its owner only. From
-0.3 the root key comes from a key source (a key vault, the OS keychain, a
-file named in configuration) and this file is no longer written.
+stored digest and sealed record useless. On Unix the file is readable by its
+owner only.
+
+## auth/key.check
+
+`keyed BLAKE3(root key, "nex-db 2026 root key check")`, 32 bytes, written
+with the database (or at the first open of a 0.1 or 0.2 database). Opening
+with a root key whose check differs fails with `Error::KeyUnavailable` before
+anything is decrypted. It reveals nothing about the key.
 
 Derived keys are `keyed BLAKE3(root key, label)`:
 
@@ -104,6 +117,8 @@ Derived keys are `keyed BLAKE3(root key, label)`:
 |---|---|
 | `nex-db 2026 auth token digest` | session token digests |
 | `nex-db 2026 auth identifier digest` | identifier digests |
+| `nex-db 2026 auth log seal` | sealed auth sections in the log (0.3) |
+| `nex-db 2026 auth file` | sealed account records (0.3) |
 
 ## The engine stores
 
@@ -117,7 +132,9 @@ changes reach a store as one batch that also writes the store's mark:
 | `\0meta/applied` | `u64`: the last commit sequence number the store holds |
 
 On open, recovery replays the commit log from the lowest mark of all engines;
-a store skips the commits it already holds. A store whose mark is above the
+a store skips the commits it already holds. A checkpoint writes `upto` (every
+commit visible when it started) as the mark, flushes the store, and syncs its
+directory, so a store no recent commit touched does not hold the log back. A store whose mark is above the
 end of the log means the log lost records, and the database stays closed.
 
 Keys start with the collection id (`u32`, **big endian**, so a collection's
@@ -127,31 +144,103 @@ keys sort together), then a one-byte tag.
 
 | Key | Value |
 |---|---|
-| `collection, 'a', account [16]` | account record |
+| `collection, 'a', account [16]` | account record, sealed (from 0.3) or plain |
 | `collection, 'i', identifier digest [32]` | `account [16]` |
-| `collection, 'c', account [16]` | credential record |
+| `collection, 'c', account [16]` | credential record, plain accounts only |
 
-Account record:
+A sealed account record (written from 0.3) is
 
 ```text
-format u8                 1
-created ms u64
-identifier digest [32]
-standing u8               1 = active
-epoch u32                 0
+marker u8                 2
+key id u32                1: XChaCha20-Poly1305 under the file key
+nonce [24]
+ciphertext
+tag [16]
 ```
 
-Credential record:
+with the store key as associated data, so a record copied to another key
+fails to open. The file key is `keyed BLAKE3(root key, "nex-db 2026 auth
+file")`. Inside, the credential travels with the account:
 
 ```text
-kind u8                   1 = password
+format u8                 2
+created ms u64
+identifier digest [32]
+standing u8               1 active, 2 pending verification, 3 locked out,
+                          4 suspended, 5 banned
+until ms u64              when a lock-out or suspension ends; 0 for none
+reason u32                application-defined; 0 for none
+credential kind u8        1 = password
 password hash str16       Argon2id, PHC format
 ```
 
-From 0.3 the values are encrypted with the auth engine's file key.
+A standing change writes the whole record again, sealed with a new nonce.
+Account epochs are not in the record: they live in the log.
 
-Sessions are not stored here: in this version they live in memory and are
-rebuilt from the commit log at open.
+Records are sealed when the commit is staged, not when it is applied, and the
+sealed bytes travel inside the sealed log section; applying a commit stores
+them as they are, so every replay writes the same bytes.
+
+Accounts created by 0.1 and 0.2 keep their plain records, still read:
+
+```text
+account record            format u8 (1), created ms u64, identifier digest [32],
+                          standing u8, epoch u32
+credential record         kind u8 (1 = password), password hash str16
+```
+
+Sessions are not stored here; see [auth/sessions.ckpt](#authsessionsckpt).
+
+## auth/sessions.ckpt
+
+Sessions and account epochs live in memory. A checkpoint writes them here,
+whole, with the sequence number they hold through; at open they are loaded
+and the log after that number is replayed.
+
+```text
+format u16                1
+through u64               the checkpoint holds every commit up to this one
+sealed bytes32            as a sealed account record (marker, key id, nonce,
+                          ciphertext, tag) under the file key, with
+                          "sessions.ckpt" and `through` as associated data
+```
+
+The plaintext:
+
+```text
+audit chain tail          file length u64, next record id u64, last hash [32],
+                          last time ns u64 (see auth/audit.chain)
+epoch count u32
+epoch count times:        account [16], epoch u32
+slot count u32
+slot count times:         token digest [32], kind u8, then by kind:
+    1 live session        account [16], created ms u64, expires ms u64, epoch u32,
+                          idle ms u64, recheck ms u64, payload bytes16,
+                          last used ms u64
+    2 revoked             kept until ms u64, reason u8 (1 revoked, 2 rotated,
+                          3 signed out everywhere)
+```
+
+Each checkpoint first drops sessions that have expired and tombstones whose
+session would have expired (a tombstone of a session whose expiry is unknown
+is kept a day), so the table stays bounded.
+
+## auth/audit.chain
+
+The realm's audit chain, in the [audit-trail](https://github.com/jamesgober/audit-trail)
+file format: a 16-byte header, then one length-prefixed record per security
+write (account created, session issued, revoked, or rotated, signed out
+everywhere, standing changed). Each record's hash covers the previous one's,
+with keyed BLAKE3 under `keyed BLAKE3(root key, "nex-db 2026 auth audit")`.
+The actor of a record is `commit <seq>.<n>`, the n-th operation of commit
+`seq`; its time is the one the operation carries.
+
+Records are appended as commits apply and synced by each checkpoint, which
+stores the chain's tail. At open the file is cut back to that length and
+replay appends the rest again, the same bytes. A file shorter than its
+checkpoint keeps the database closed. A damaged file keeps the database
+closed: the log below its mark may be gone, so nothing else holds those
+sessions.
 
 ### Content store (`content/store/`)
 

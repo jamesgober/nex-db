@@ -229,3 +229,178 @@ fn test_reopen_missing_catalog_is_rebuilt_from_log() {
         Validation::Valid(_)
     ));
 }
+
+/// Every file under `dir`, read whole.
+fn all_bytes(dir: &Path) -> Vec<u8> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            out.extend(all_bytes(&path));
+        } else {
+            out.extend(fs::read(&path).unwrap());
+        }
+    }
+    out
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+#[test]
+fn test_files_hold_no_password_hash_or_identifier() {
+    let dir = TempDir::new("sealed");
+    let db = Database::open(&dir.0).unwrap();
+    let _ = populate(&db, 0, 3);
+    // Dropping writes the account store to its own files.
+    drop(db);
+    let log = all_bytes(&dir.0.join("core").join("log"));
+    let accounts = all_bytes(&dir.0.join("auth").join("accounts"));
+    assert!(!log.is_empty() && !accounts.is_empty());
+    for bytes in [&log, &accounts] {
+        assert!(!contains(bytes, b"$argon2id$"));
+        assert!(!contains(bytes, b"u1@example.com"));
+    }
+    // Sign-in still reads the sealed record.
+    let db = Database::open(&dir.0).unwrap();
+    assert!(matches!(
+        db.auth()
+            .sign_in("u1@example.com", PASSWORD, SessionSpec::web())
+            .unwrap(),
+        SignIn::Success { .. }
+    ));
+}
+
+#[test]
+fn test_key_outside_the_directory_is_needed_to_open() {
+    let dir = TempDir::new("key-file");
+    let key_dir = TempDir::new("key-file-key");
+    fs::create_dir_all(&key_dir.0).unwrap();
+    let key = key_dir.0.join("site.key");
+    {
+        let db = Database::builder(&dir.0)
+            .keys(nex_db::Keys::file(&key))
+            .open()
+            .unwrap();
+        let _ = populate(&db, 0, 1);
+    }
+    assert!(key.exists());
+    assert!(!dir.0.join("auth").join("keys").exists());
+    // The directory alone does not open, and neither does another key.
+    assert!(matches!(Database::open(&dir.0), Err(Error::KeyUnavailable)));
+    let other = key_dir.0.join("other.key");
+    assert!(matches!(
+        Database::builder(&dir.0)
+            .keys(nex_db::Keys::file(&other))
+            .open(),
+        Err(Error::KeyUnavailable)
+    ));
+    // The right key opens it with everything in place.
+    let db = Database::builder(&dir.0)
+        .keys(nex_db::Keys::file(&key))
+        .open()
+        .unwrap();
+    assert!(matches!(
+        db.auth()
+            .sign_in("u0@example.com", PASSWORD, SessionSpec::web())
+            .unwrap(),
+        SignIn::Success { .. }
+    ));
+}
+
+fn checkpointing(dir: &Path) -> Database {
+    // A checkpoint, with truncation, after every commit.
+    Database::builder(dir).checkpoint_every(1).open().unwrap()
+}
+
+#[test]
+fn test_truncated_log_reopens_with_everything() {
+    let dir = TempDir::new("truncated");
+    let tokens = {
+        let db = checkpointing(&dir.0);
+        let tokens = populate(&db, 0, 6);
+        assert!(db.auth().revoke(&tokens[1]).unwrap());
+        let account = match db.auth().validate(&tokens[2]).unwrap() {
+            Validation::Valid(s) => s.account(),
+            other => panic!("{other:?}"),
+        };
+        let _ = db.auth().revoke_all(account).unwrap();
+        tokens
+    };
+    let db = Database::open(&dir.0).unwrap();
+    assert!(matches!(
+        db.auth().validate(&tokens[0]).unwrap(),
+        Validation::Valid(_)
+    ));
+    assert_eq!(
+        db.auth().validate(&tokens[1]).unwrap(),
+        Validation::Revoked {
+            reason: RevokeReason::Revoked
+        }
+    );
+    assert_eq!(
+        db.auth().validate(&tokens[2]).unwrap(),
+        Validation::Revoked {
+            reason: RevokeReason::SignedOutEverywhere
+        }
+    );
+    assert!(matches!(
+        db.auth()
+            .sign_in("u5@example.com", PASSWORD, SessionSpec::web())
+            .unwrap(),
+        SignIn::Success { .. }
+    ));
+    assert!(
+        db.content()
+            .resolve(nex_db::DEFAULT_SITE, "/u/5")
+            .unwrap()
+            .is_some()
+    );
+    drop(db);
+
+    // The log no longer starts at the first commit: without its file, the
+    // catalog cannot be rebuilt, and the database stays closed.
+    fs::remove_file(dir.0.join("core").join("catalog.ckpt")).unwrap();
+    assert!(matches!(Database::open(&dir.0), Err(Error::Corrupt { .. })));
+}
+
+#[test]
+fn test_truncated_log_without_its_session_checkpoint_stays_closed() {
+    let dir = TempDir::new("no-sessions");
+    {
+        let db = checkpointing(&dir.0);
+        let _ = populate(&db, 0, 3);
+    }
+    let file = dir.0.join("auth").join("sessions.ckpt");
+    let mut bytes = fs::read(&file).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    fs::write(&file, &bytes).unwrap();
+    assert!(matches!(Database::open(&dir.0), Err(Error::Corrupt { .. })));
+    fs::remove_file(&file).unwrap();
+    assert!(matches!(Database::open(&dir.0), Err(Error::Corrupt { .. })));
+}
+
+#[test]
+fn test_session_payload_survives_a_checkpoint() {
+    let dir = TempDir::new("payload-ckpt");
+    let token = {
+        let db = checkpointing(&dir.0);
+        let password = db.auth().hash_password(PASSWORD).unwrap();
+        let ann = db
+            .auth()
+            .create_account("ann@example.com", &password)
+            .unwrap();
+        let spec = SessionSpec::web().payload(b"perm=admin").unwrap();
+        let token = db.auth().issue_session(ann, spec).unwrap();
+        // One more commit, so the checkpoint after it holds the session.
+        let _ = populate(&db, 0, 1);
+        token
+    };
+    let db = Database::open(&dir.0).unwrap();
+    match db.auth().validate(&token).unwrap() {
+        Validation::Valid(session) => assert_eq!(session.payload(), b"perm=admin"),
+        other => panic!("{other:?}"),
+    }
+}

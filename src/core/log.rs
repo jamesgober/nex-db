@@ -44,9 +44,43 @@ impl CommitLog {
         self.wal.is_empty()
     }
 
-    /// Append `record` and return once it is on stable storage.
-    pub(crate) fn append_durable(&self, record: &[u8]) -> Result<()> {
-        let _lsn = self.wal.append_and_sync(record)?;
+    /// Append `record` to the log. It is in the operating system's cache
+    /// when this returns, not yet on stable storage: call
+    /// [`sync`](Self::sync) before treating it as committed.
+    pub(crate) fn append(&self, record: &[u8]) -> Result<()> {
+        let _lsn = self.wal.append(record)?;
+        Ok(())
+    }
+
+    /// Make every record appended before this call durable. Concurrent calls
+    /// share one sync.
+    pub(crate) fn sync(&self) -> Result<()> {
+        self.wal.sync()?;
+        Ok(())
+    }
+
+    /// Drop every record below the first one whose sequence number is at
+    /// least `seq`; that record and the ones after it stay. Does nothing when
+    /// no record reaches `seq`, so the log is never emptied.
+    pub(crate) fn truncate_below(&self, seq: u64) -> Result<()> {
+        let mut keep = None;
+        for entry in self.wal.iter()? {
+            let record = entry.map_err(Error::from)?;
+            // The sequence number follows the two-byte record format.
+            let at = record
+                .data()
+                .get(2..10)
+                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                .map(u64::from_le_bytes)
+                .ok_or(Error::corrupt("a log record", record.lsn().get()))?;
+            if at >= seq {
+                keep = Some(record.lsn());
+                break;
+            }
+        }
+        if let Some(lsn) = keep {
+            let _ = self.wal.truncate_before(lsn)?;
+        }
         Ok(())
     }
 
@@ -73,8 +107,9 @@ mod tests {
         ));
         let log = CommitLog::open(&dir).unwrap();
         assert!(log.is_empty());
-        log.append_durable(b"one").unwrap();
-        log.append_durable(b"two").unwrap();
+        log.append(b"one").unwrap();
+        log.append(b"two").unwrap();
+        log.sync().unwrap();
         drop(log);
 
         let log = CommitLog::open(&dir).unwrap();

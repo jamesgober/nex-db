@@ -59,6 +59,14 @@ impl<'a> Writer<'a> {
         Ok(())
     }
 
+    /// A byte string with a `u16` length prefix.
+    pub(crate) fn bytes16(&mut self, v: &[u8]) -> Result<()> {
+        let len = u16::try_from(v.len()).map_err(|_| Error::invalid("value", "too long"))?;
+        self.u16(len);
+        self.bytes(v);
+        Ok(())
+    }
+
     /// A byte string with a `u32` length prefix.
     pub(crate) fn bytes32(&mut self, v: &[u8]) -> Result<()> {
         let len = u32::try_from(v.len()).map_err(|_| Error::invalid("value", "too long"))?;
@@ -155,6 +163,11 @@ impl<'a> Reader<'a> {
         std::str::from_utf8(bytes).map_err(|_| self.corrupt())
     }
 
+    pub(crate) fn bytes16(&mut self) -> Result<&'a [u8]> {
+        let len = usize::from(self.u16()?);
+        self.take(len)
+    }
+
     pub(crate) fn bytes32(&mut self) -> Result<&'a [u8]> {
         let len = usize::try_from(self.u32()?).map_err(|_| self.corrupt())?;
         self.take(len)
@@ -191,6 +204,7 @@ mod tests {
         w.i64(-6);
         w.str16("seven").unwrap();
         w.bytes32(b"eight").unwrap();
+        w.bytes16(b"nine").unwrap();
         w.bytes(&[9; 4]);
 
         let mut r = Reader::new(&buf, "test", 0);
@@ -202,6 +216,7 @@ mod tests {
         assert_eq!(r.i64().unwrap(), -6);
         assert_eq!(r.str16().unwrap(), "seven");
         assert_eq!(r.bytes32().unwrap(), b"eight");
+        assert_eq!(r.bytes16().unwrap(), b"nine");
         assert_eq!(r.fixed::<4>().unwrap(), [9; 4]);
         r.finish().unwrap();
     }

@@ -56,6 +56,7 @@ use crate::{
     error::{Error, Result},
     feed::Change,
     ids::AccountId,
+    observe::SecurityEvent,
 };
 
 /// Section format 1: the operations in plain form (0.1 and 0.2 logs). Read,
@@ -2153,7 +2154,13 @@ impl Auth<'_> {
     /// None in this version; the `Result` leaves room for split-process
     /// auth, where validation crosses a channel.
     pub fn validate(&self, token: impl AsRef<str>) -> Result<Validation> {
-        Ok(self.engine().validate(token.as_ref()))
+        let validation = self.engine().validate(token.as_ref());
+        if matches!(validation, Validation::Revoked { .. }) {
+            self.db
+                .observers()
+                .security(SecurityEvent::RevokedSessionPresented);
+        }
+        Ok(validation)
     }
 
     /// Hash a password with Argon2id (19 MiB, 2 passes, 1 lane, random
@@ -2282,17 +2289,30 @@ impl Auth<'_> {
                 engine.clear_failures(account);
                 Ok(Login::Verified(account))
             }
-            Checked::Blocked(until) => Ok(Login::LockedOut { until }),
+            Checked::Blocked(until) => {
+                self.db.observers().security(SecurityEvent::SignInBlocked);
+                Ok(Login::LockedOut { until })
+            }
             Checked::Wrong(Some(account)) => {
+                let observers = self.db.observers();
+                observers.security(SecurityEvent::SignInFailed {
+                    account: Some(account),
+                });
                 let now = now_ms();
                 if engine.count_failure(account, now) >= LOCKOUT_FAILURES {
                     let until = time_of(now.saturating_add(LOCKOUT_MS));
                     self.db.commit(|tx| tx.auth().lock_out(account, until))?;
                     engine.clear_failures(account);
+                    observers.security(SecurityEvent::LockedOut { account });
                 }
                 Ok(Login::Failed)
             }
-            Checked::Wrong(None) => Ok(Login::Failed),
+            Checked::Wrong(None) => {
+                self.db
+                    .observers()
+                    .security(SecurityEvent::SignInFailed { account: None });
+                Ok(Login::Failed)
+            }
         }
     }
 

@@ -63,6 +63,7 @@
   - [x] Listings by site and type, two orders, cursors (`PLAN.md` D-072).
   - Blocker recorded: lsm-db 1.1 scans materialize the whole range, so derived indexes stay in memory and are rebuilt at open; a lazy, bounded scan is requested from lsm-db.
 - Auth extras (FR-8). Metrics and health hooks.
+  - [x] Health and observers (`PLAN.md` D-073); `metrics` still to come.
   - [x] `account`, `add_identifier`, `remove_identifier` (from 0.3, `PLAN.md` D-066), roles (D-067), `set_password` (D-068).
 - **Exit:** James's site serves its pages from nex-db.
 

@@ -21,6 +21,7 @@ use crate::{
     engine::{Engine, EngineId, Registry, Staged},
     error::{Error, Result},
     feed::{Feed, FeedLog, Position},
+    observe::{CommitInfo, Health, Observer, Observers},
 };
 
 /// Open (or create) the database in the directory `path`.
@@ -101,6 +102,7 @@ pub struct Builder {
     checkpoint_every: u64,
     #[cfg_attr(not(feature = "auth"), allow(dead_code))]
     max_sessions: usize,
+    observers: Observers,
 }
 
 impl Builder {
@@ -132,6 +134,13 @@ impl Builder {
         self
     }
 
+    /// Report commits, errors, and security events to `observer`. See
+    /// [`Observer`].
+    pub fn observer(mut self, observer: impl Observer) -> Self {
+        self.observers = Observers(Some(std::sync::Arc::new(observer)));
+        self
+    }
+
     /// Open (or create) the database.
     ///
     /// # Errors
@@ -158,6 +167,7 @@ const DEFAULT_MAX_SESSIONS: usize = 1_000_000;
 pub struct Database {
     engines: Engines,
     core: Core,
+    observers: Observers,
 }
 
 impl fmt::Debug for Database {
@@ -188,6 +198,7 @@ impl Database {
             keys: Keys::default(),
             checkpoint_every: CHECKPOINT_EVERY,
             max_sessions: DEFAULT_MAX_SESSIONS,
+            observers: Observers::default(),
         }
     }
 
@@ -220,13 +231,35 @@ impl Database {
                 return Err(Error::corrupt("the catalog (default collections)", 0));
             }
         }
-        Ok(Database { engines, core })
+        Ok(Database {
+            engines,
+            core,
+            observers: builder.observers,
+        })
     }
 
     /// The directory the database lives in.
     #[must_use]
     pub fn path(&self) -> &Path {
         self.core.dir()
+    }
+
+    /// Whether the database serves writes: [`Health::ReadOnly`] after a
+    /// failed write, until the process restarts.
+    #[must_use]
+    pub fn health(&self) -> Health {
+        if self.core.halted() {
+            Health::ReadOnly {
+                reason: "a write could not be made durable; restart to recover",
+            }
+        } else {
+            Health::Ready
+        }
+    }
+
+    #[cfg_attr(not(feature = "auth"), allow(dead_code))]
+    pub(crate) fn observers(&self) -> &Observers {
+        &self.observers
     }
 
     /// The position of the last visible commit, to start a change feed
@@ -322,12 +355,33 @@ impl Database {
     where
         F: FnMut(&mut Transaction<'_>) -> Result<T>,
     {
-        for _ in 0..ATTEMPTS {
+        let started = std::time::Instant::now();
+        let result = self.commit_attempts(&mut f, started);
+        if let Err(err) = &result {
+            self.observers.error(err);
+        }
+        result
+    }
+
+    fn commit_attempts<T, F>(&self, f: &mut F, started: std::time::Instant) -> Result<T>
+    where
+        F: FnMut(&mut Transaction<'_>) -> Result<T>,
+    {
+        for attempt in 1..=ATTEMPTS {
             let snapshot = self.core.snapshot();
             let mut tx = Transaction::new(self, snapshot.seq());
             let value = f(&mut tx)?;
             match self.core.commit(&self.engines, &snapshot, &tx.staged()) {
-                Ok(()) => return Ok(value),
+                Ok(seq) => {
+                    if let Some(seq) = seq {
+                        self.observers.commit(&CommitInfo {
+                            position: Position(seq),
+                            attempts: attempt as u32,
+                            took: started.elapsed(),
+                        });
+                    }
+                    return Ok(value);
+                }
                 Err(Attempt::Conflict) => {}
                 Err(Attempt::Failed(err)) => return Err(err),
             }

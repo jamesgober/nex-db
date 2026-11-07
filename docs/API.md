@@ -757,12 +757,17 @@ assert_eq!(changed, [(rid, 0), (rid, 1)]);
 | Call | Since | Grade |
 |---|---|---|
 | `db.health() -> Health` (`Ready`, `Recovering`, `ReadOnly { reason }`) | 0.4 | P1 |
-| `Observer` trait: `on_commit`, `on_error`, `on_security_event`; not called when none is set | 0.4 | P1 |
+| `Observer` trait: `on_commit(&CommitInfo)` (position, attempts, time taken), `on_error(&Error)`, `on_security_event(&SecurityEvent)`; every method has an empty default; set with `Builder::observer`; not called when none is set | 0.4 | P1 |
 | `nex_db::metrics::Recorder` (feature `metrics`) | 0.4 | P2 |
 
 Security events (repeated failures, a lock-out, a revoked session presented
 again) always reach the observer, with ids and kinds only, never an
-identifier; nex-db never keeps one to itself.
+identifier; nex-db never keeps one to itself. `SecurityEvent`
+(non-exhaustive): `SignInFailed { account: Option<AccountId> }` (`None` for an
+identifier no account has), `LockedOut { account }`, `SignInBlocked`, and
+`RevokedSessionPresented`. Observers run on the calling thread, so they hand
+slow work to another thread. `Recovering` is not seen through this API in
+0.4, since `open` returns once recovery is done; it is for split auth.
 
 ## Backup and restore
 

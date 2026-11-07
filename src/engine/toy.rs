@@ -269,7 +269,7 @@ impl Db {
 
     fn commit(&self, staged: &[&dyn Staged]) -> std::result::Result<(), Attempt> {
         let snapshot = self.core.snapshot();
-        self.core.commit(&self.toys, &snapshot, staged)
+        self.core.commit(&self.toys, &snapshot, staged).map(|_| ())
     }
 }
 

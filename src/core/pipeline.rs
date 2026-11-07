@@ -234,10 +234,10 @@ impl Core {
         engines: &dyn Registry,
         snapshot: &SnapshotGuard<'_>,
         staged: &[&dyn Staged],
-    ) -> std::result::Result<(), Attempt> {
+    ) -> std::result::Result<Option<Seq>, Attempt> {
         let parts: Vec<&dyn Staged> = staged.iter().copied().filter(|w| !w.is_empty()).collect();
         if parts.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         // Conflict entries older than the watermark are gone, and an expired
         // snapshot is not in the watermark: run the closure again.
@@ -245,6 +245,7 @@ impl Core {
             return Err(Attempt::Conflict);
         }
         self.write(engines, Kind::Commit, snapshot.seq(), &parts)
+            .map(Some)
     }
 
     /// Create a collection of `engine` named `name`, after the engine has
@@ -370,7 +371,7 @@ impl Core {
         staged: &[&dyn Staged],
     ) -> Result<()> {
         match self.write(engines, kind, snapshot, staged) {
-            Ok(()) => Ok(()),
+            Ok(_) => Ok(()),
             Err(Attempt::Failed(err)) => Err(err),
             Err(Attempt::Conflict) => Err(Error::Conflict),
         }
@@ -384,7 +385,7 @@ impl Core {
         kind: Kind,
         snapshot: Seq,
         staged: &[&dyn Staged],
-    ) -> std::result::Result<(), Attempt> {
+    ) -> std::result::Result<Seq, Attempt> {
         let (seq, bytes) = self.sequence(engines, kind, snapshot, staged)?;
         let result = self.complete(engines, seq, &bytes);
         let mut state = self.commit.lock().unwrap_or_else(PoisonError::into_inner);
@@ -394,7 +395,7 @@ impl Core {
             self.reclaim(engines);
             self.maybe_checkpoint(engines);
         }
-        result.map_err(Attempt::Failed)
+        result.map(|()| seq).map_err(Attempt::Failed)
     }
 
     /// Part 1, under the sequencer lock: validate, number, encode, reserve,

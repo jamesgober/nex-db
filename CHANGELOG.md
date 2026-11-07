@@ -15,6 +15,7 @@ All notable changes to `nex-db` are documented in this file. The format is based
 - `RouteKind::Redirect` (a moved entity's old path, 301) and `RouteKind::Gone`; `RouteEntry::visibility`.
 - The change feed: `Database::feed`, `Database::position`, `Feed`, `Position`, `Change`, and `Error::FeedBehind` (NEX-1012).
 - Listings: `Content::list`, `next_page`, `Listing` (`latest`, `updated`, `site`, `limit`), `Page`, and `Cursor`.
+- `Database::health` and `Health`; `Builder::observer`, `Observer`, `CommitInfo`, and `SecurityEvent`.
 
 ### Changed
 

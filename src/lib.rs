@@ -103,6 +103,7 @@ mod engine;
 mod error;
 mod feed;
 mod ids;
+mod observe;
 #[cfg(feature = "auth")]
 mod table;
 #[cfg(feature = "auth")]
@@ -134,6 +135,7 @@ pub use crate::{
     error::{Error, Result},
     feed::{Change, Feed, Position},
     ids::{AccountId, Rid},
+    observe::{CommitInfo, Health, Observer, SecurityEvent},
 };
 
 // Every Rust example in docs/API.md runs as a doctest.

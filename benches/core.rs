@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! cargo bench --bench core
+//! NEX_BENCH_LARGE=1 cargo bench --bench core   # also 10 million sessions
 //! ```
 
 use std::{
@@ -20,6 +21,10 @@ struct TempDb {
 
 impl TempDb {
     fn new(name: &str) -> Self {
+        Self::with(name, |b| b)
+    }
+
+    fn with(name: &str, f: impl FnOnce(nex_db::Builder) -> nex_db::Builder) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "nex-db-bench-{name}-{}-{}",
             std::process::id(),
@@ -29,7 +34,7 @@ impl TempDb {
                 .as_nanos()
         ));
         TempDb {
-            db: Some(Database::open(&dir).unwrap()),
+            db: Some(f(Database::builder(&dir)).open().unwrap()),
             dir,
         }
     }
@@ -65,9 +70,12 @@ fn auth(c: &mut Criterion) {
         .issue_session(account, SessionSpec::web())
         .unwrap();
 
-    c.bench_function("auth/validate_hit", |b| {
+    let mut group = c.benchmark_group("auth/validate_hit");
+    let _ = group.bench_function("1", |b| {
         b.iter(|| db.auth().validate(black_box(token.as_str())).unwrap());
     });
+    group.finish();
+    validate_many(c);
     c.bench_function("auth/issue_durable", |b| {
         b.iter(|| {
             db.auth()
@@ -96,6 +104,47 @@ fn auth(c: &mut Criterion) {
         });
     });
     group.finish();
+}
+
+/// `auth/validate_hit` over a table of one and ten million sessions, each
+/// iteration a different token in a scattered order, so most reads miss the
+/// CPU cache as they would on a busy site.
+fn validate_many(c: &mut Criterion) {
+    let mut sizes = vec![1_000_000usize];
+    if std::env::var_os("NEX_BENCH_LARGE").is_some() {
+        sizes.push(10_000_000);
+    }
+    for n in sizes {
+        let t = TempDb::with("validate", |b| b.max_sessions(n + 1));
+        let db = t.db();
+        let password = db.auth().hash_password("bench password").unwrap();
+        let account = db
+            .auth()
+            .create_account("many@example.com", &password)
+            .unwrap();
+        let mut tokens = Vec::with_capacity(n);
+        while tokens.len() < n {
+            let batch = (n - tokens.len()).min(4_000);
+            let issued = db
+                .commit(|tx| {
+                    (0..batch)
+                        .map(|_| tx.auth().issue_session(account, SessionSpec::web()))
+                        .collect::<nex_db::Result<Vec<_>>>()
+                })
+                .unwrap();
+            tokens.extend(issued);
+        }
+        let mut group = c.benchmark_group("auth/validate_hit");
+        let mut i = 0usize;
+        let _ = group.bench_function(format!("{n}"), |b| {
+            b.iter(|| {
+                // A step coprime with n visits every token once per n reads.
+                i = (i + 7_919) % n;
+                db.auth().validate(black_box(tokens[i].as_str())).unwrap()
+            });
+        });
+        group.finish();
+    }
 }
 
 fn content(c: &mut Criterion) {

@@ -51,9 +51,9 @@ nex-db is not published. Depend on it from its repository:
 
 ```toml
 [dependencies]
-nex-db = { git = "https://github.com/jamesgober/nex-db", tag = "v0.2.0" }
+nex-db = { git = "https://github.com/jamesgober/nex-db", tag = "v0.3.0" }
 # or pick engines:
-# nex-db = { git = "...", tag = "v0.2.0", default-features = false, features = ["auth"] }
+# nex-db = { git = "...", tag = "v0.3.0", default-features = false, features = ["auth"] }
 ```
 
 | Feature | Default | Adds |
@@ -170,6 +170,7 @@ From 0.3 the builder configures what `open` takes by default:
 | `.auth(AuthMode::embedded())`, `AuthMode::separate_process()` | 0.3 / 0.5 | embedded |
 | `.max_snapshot_age(Duration)` | 0.3 | 60 s |
 | `.checkpoint_every(bytes)`: log written between checkpoints, which bound the log and the time an open takes | 0.3 | 64 MiB |
+| `.max_sessions(n)`: sessions and revocations held at once; past it `issue_session` fails with `Busy` | 0.3 | 1,000,000 |
 | `.commit_queue(n)`, `.hashing_slots(n)` | 0.3 | 4,096; one per CPU |
 | `.idempotency_window(Duration)` | 0.3 | 24 hours |
 | `.cache(bytes)` | 0.4 | 256 MiB |

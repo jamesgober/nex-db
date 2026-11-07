@@ -6,6 +6,8 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-07
+
 ### Added
 
 - Group commit: one writer appends and syncs each batch of commits; at most 4,096 commits wait at once (`Error::Busy` beyond).
@@ -17,10 +19,12 @@ All notable changes to `nex-db` are documented in this file. The format is based
 - An audit chain per realm (`auth/audit.chain`, audit-trail format, keyed BLAKE3): every security write, kept after the log is truncated.
 - Checkpoints and log truncation: the log stays bounded and an open replays only what came after the last checkpoint. `Builder::checkpoint_every` (64 MiB by default). Sessions and epochs are kept in a sealed `auth/sessions.ckpt`.
 - `Database::read`, `Read`, `AuthRead`, and `ContentRead`: reads across engines at one snapshot. `Error::SnapshotTooOld` (NEX-1009) after 60 seconds.
+- `Builder::max_sessions` (1,000,000 by default).
 
 ### Changed
 
 - Auth sections in the log are sealed and padded (format 2); account records in the account store are sealed. Logs and stores written by 0.1 and 0.2 still read.
+- Sessions live in a fixed-slot table read without locks; expired sessions and old revocations are reclaimed about a second after their time instead of at checkpoints.
 - `Engine::apply` (internal) takes the decoded section; `Engine::checkpoint` takes the mark to reach.
 - wal-db 1.1.1.
 
@@ -64,6 +68,7 @@ The walking skeleton.
 - Repository scaffold: `Cargo.toml` (edition 2024, MSRV 1.85), `src/lib.rs` with `VERSION`, CI on Linux, macOS, and Windows (stable and 1.85), `cargo deny` configuration.
 - `dev/PLAN.md`, `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/nex-db/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jamesgober/nex-db/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jamesgober/nex-db/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/nex-db/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/nex-db/releases/tag/v0.1.0

@@ -71,8 +71,8 @@
 //!
 //! ## Status
 //!
-//! Version 0.2: the design lock. The API through 1.0 is in `docs/API.md`; the
-//! file formats and the API may still change before 1.0.
+//! Version 0.3: the core and the auth engine. The API through 1.0 is in
+//! `docs/API.md`; the file formats and the API may still change before 1.0.
 
 #![doc(html_root_url = "https://docs.rs/nex-db")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -102,6 +102,10 @@ mod db;
 mod engine;
 mod error;
 mod ids;
+#[cfg(feature = "auth")]
+mod table;
+#[cfg(feature = "auth")]
+mod wheel;
 
 #[cfg(feature = "auth")]
 #[cfg_attr(docsrs, doc(cfg(feature = "auth")))]

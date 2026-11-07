@@ -2,7 +2,7 @@
 
 > One milestone at a time, each ending with something that runs. Work only on the current milestone. Requirements (FR, NFR) are in [`PLAN.md`](./PLAN.md).
 
-**Current milestone: 0.3.0 (core and auth). 0.2.0 is done: James approved `docs/API.md` on 2026-11-05. 0.1.0 is merged and waits for James to run the example before it is tagged.**
+**Current milestone: 0.4.0 (content and adapters). 0.1.0, 0.2.0, and 0.3.0 are released (GitHub pre-releases).**
 
 ---
 
@@ -42,6 +42,7 @@
   - [x] Checkpoints and log truncation (`PLAN.md` D-056).
   - [x] Audit chain (`PLAN.md` D-057).
   - [x] Session payload, idle limit, and recheck time (`PLAN.md` D-059).
+  - [x] Loom models of the table's slots and the commit pipeline's ordering (`PLAN.md` D-063).
 - Key hierarchy through key-vault and crypt-io; sealed auth sections.
   - [x] Sealed and padded auth sections in the log (`PLAN.md` D-047).
   - [x] Sealed account records in the account store (`PLAN.md` D-048).
@@ -49,8 +50,10 @@
 - Hot table, timer wheel, epoch table, tombstones, checkpoints; standing, counters, lockout, audit chain, revocation journal (FR-6, FR-7).
   - [x] Epoch table, `revoke_all`, `rotate` (`PLAN.md` D-049).
   - [x] Standing, failure counters, and lock-out (`PLAN.md` D-050).
-- Moved (`PLAN.md` D-058): named realms and `commit_serializable` to 0.4; the revocation journal to 0.5.
-- **Exit:** James's site signs users in on nex-db.
+  - [x] Fixed-key session table with lock-free reads (`PLAN.md` D-061) and the timer wheel (D-062); `Builder::max_sessions` (D-064).
+  - [x] Benchmarks `auth/validate_hit` (1, 1 million; 10 million with `NEX_BENCH_LARGE`), `auth/issue_durable`, `auth/revoke_durable`, `core/commit_throughput`, and `table/get_hit`.
+- Moved (`PLAN.md` D-058, D-065): named realms, `commit_serializable`, and catalog locks to 0.4; the revocation journal to 0.5; incremental session-table checkpoints to 0.6.
+- **Exit:** James's site signs users in on nex-db. Released 2026-11-07 with this open: the site has no nex-db adapter yet (the WASP adapter arrives in 0.4), so `examples/site.rs` stands in for it (sign up, sign in, validate, reopen) and runs on Linux, macOS, and Windows in CI. James confirms on his site.
 
 ## 0.4.0 Content and adapters
 

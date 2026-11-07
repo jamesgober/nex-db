@@ -648,3 +648,82 @@ fn test_session_carries_payload_recheck_and_idle_limit() {
     assert_eq!(db.auth().validate(&idle).unwrap(), Validation::Expired);
     assert!(SessionSpec::web().payload(&[0; 257]).is_err());
 }
+
+#[test]
+fn test_max_sessions_refuses_past_the_limit_and_survives_reopen() {
+    let dir = TempDir::new("max-sessions");
+    let open = || Database::builder(&dir.0).max_sessions(3).open().unwrap();
+    let db = open();
+    let password = db.auth().hash_password(PASSWORD).unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    let tokens: Vec<_> = (0..3)
+        .map(|_| db.auth().issue_session(ann, SessionSpec::web()).unwrap())
+        .collect();
+    let err = db.auth().issue_session(ann, SessionSpec::web()).unwrap_err();
+    assert!(matches!(err, Error::Busy { .. }), "{err:?}");
+    // A revocation keeps its slot until the session would have expired.
+    assert!(db.auth().revoke(&tokens[0]).unwrap());
+    assert!(db.auth().issue_session(ann, SessionSpec::web()).is_err());
+    drop(db);
+
+    let db = open();
+    assert!(matches!(
+        db.auth().validate(&tokens[0]).unwrap(),
+        Validation::Revoked { .. }
+    ));
+    for token in &tokens[1..] {
+        assert!(matches!(
+            db.auth().validate(token).unwrap(),
+            Validation::Valid(_)
+        ));
+    }
+    assert!(db.auth().issue_session(ann, SessionSpec::web()).is_err());
+}
+
+#[test]
+fn test_many_sessions_across_table_levels_validate_after_reopen() {
+    let dir = TempDir::new("many-sessions");
+    let db = Database::open(&dir.0).unwrap();
+    let password = db.auth().hash_password(PASSWORD).unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    // More than the table's first levels hold, so it grows.
+    let tokens: Vec<_> = (0..20)
+        .flat_map(|_| {
+            db.commit(|tx| {
+                (0..1_000)
+                    .map(|_| tx.auth().issue_session(ann, SessionSpec::web()))
+                    .collect::<nex_db::Result<Vec<_>>>()
+            })
+            .unwrap()
+        })
+        .collect();
+    for token in tokens.iter().step_by(97) {
+        assert!(db.auth().revoke(token).unwrap());
+    }
+    let check = |db: &Database| {
+        for (i, token) in tokens.iter().enumerate() {
+            let outcome = db.auth().validate(token).unwrap();
+            if i % 97 == 0 {
+                assert!(matches!(outcome, Validation::Revoked { .. }), "{i}");
+            } else {
+                assert!(matches!(outcome, Validation::Valid(_)), "{i}");
+            }
+        }
+    };
+    check(&db);
+    assert_eq!(db.auth().revoke_all(ann).unwrap(), 20_000 - 207);
+    drop(db);
+    let db = Database::open(&dir.0).unwrap();
+    for token in &tokens {
+        assert!(matches!(
+            db.auth().validate(token).unwrap(),
+            Validation::Revoked { .. }
+        ));
+    }
+}

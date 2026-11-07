@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "nex-db"
-version = "0.2.0"
+version = "0.3.0"
 
 # Minimum Supported Rust Version (MSRV)
 # 1.85: the baseline of the db-collection crates nex-db builds on.
@@ -82,6 +82,11 @@ audit-trail = { version = "1.1", default-features = false, features = ["std"], o
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
+# Concurrency models of the lock-free table and the commit turnstile, built
+# only with `RUSTFLAGS="--cfg nex_loom" cargo test --release --lib loom`.
+[target.'cfg(nex_loom)'.dev-dependencies]
+loom = "0.7"
+
 
 # TARGETS
 # #################################
@@ -105,6 +110,10 @@ required-features = ["auth", "content"]
 name = "core"
 harness = false
 required-features = ["auth", "content"]
+
+[[bench]]
+name = "table"
+harness = false
 
 
 # DEV PROFILE

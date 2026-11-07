@@ -51,6 +51,15 @@ jobs:
         run: cargo test --no-default-features
       - name: Build examples
         run: cargo build --examples
+      # Sign up, sign in, validate; the second run stops without closing the
+      # database, and the third finds everything from before.
+      - name: Run the site example
+        shell: bash
+        run: |
+          dir="$RUNNER_TEMP/nex-db-site"
+          cargo run --example site -- "$dir"
+          cargo run --example site -- --crash "$dir"
+          cargo run --example site -- "$dir"
       # Both modes: a doc link to a feature-gated item breaks only when that
       # feature is off.
       - name: Doc (default features)
@@ -61,6 +70,19 @@ jobs:
         run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
+
+  loom:
+    name: Loom models
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Loom models (session table slots, commit ordering)
+        run: cargo test --release --lib loom
+        env:
+          RUSTFLAGS: "-D warnings --cfg nex_loom"
+          LOOM_MAX_PREEMPTIONS: "3"
 
   package:
     name: Package

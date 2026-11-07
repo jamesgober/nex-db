@@ -54,6 +54,7 @@ use crate::{
     },
     engine::{Conflict, Engine, EngineId, Staged},
     error::{Error, Result},
+    feed::Change,
     ids::AccountId,
 };
 
@@ -600,6 +601,35 @@ impl AuthEngine {
         self.audit.append(seq, n, at_ms, action, &target)
     }
 
+    /// What the change feed reports for `op`: ids and kinds only. Called
+    /// before the operation changes the session table, so a revocation can
+    /// still name the session's account.
+    fn change_of(&self, op: &Op<'_>) -> Option<Change> {
+        Some(match op {
+            Op::CreateAccount { account, .. } | Op::CreateSealedAccount { account, .. } => {
+                Change::AccountCreated { account: *account }
+            }
+            Op::RevokeSession { digest, .. } => Change::SessionRevoked {
+                account: match self.sessions.get(digest) {
+                    Some(Slot::Live(session)) => Some(session.account),
+                    _ => None,
+                },
+            },
+            Op::RaiseEpoch { account, .. } => Change::SessionRevoked {
+                account: Some(*account),
+            },
+            Op::UpdateAccount {
+                account,
+                what: UPDATE_STANDING,
+                ..
+            } => Change::StandingChanged { account: *account },
+            Op::UpdateAccount { account, .. } => Change::AccountChanged { account: *account },
+            Op::IssueSession { .. } | Op::SetIdentifier { .. } | Op::SetPolicy { .. } => {
+                return None;
+            }
+        })
+    }
+
     /// Count a failed sign-in of `account` at `now`. Returns the failures in
     /// the current window.
     fn count_failure(&self, account: AccountId, now: u64) -> u32 {
@@ -910,7 +940,7 @@ impl Engine for AuthEngine {
         }
     }
 
-    fn apply(&self, seq: Seq, section: &Section<'_>) -> Result<()> {
+    fn apply(&self, seq: Seq, section: &Section<'_>, changes: &mut Vec<Change>) -> Result<()> {
         if section.collection != self.collection {
             return Err(Error::corrupt("an auth section header", seq));
         }
@@ -1008,6 +1038,9 @@ impl Engine for AuthEngine {
         for (n, op) in ops.into_iter().enumerate() {
             let n = u32::try_from(n).map_err(|_| Error::corrupt("an auth section", seq))?;
             self.audit_op(seq, n, &op)?;
+            if let Some(change) = self.change_of(&op) {
+                changes.push(change);
+            }
             match op {
                 Op::IssueSession { digest, session } => {
                     let epoch = self.epochs.get(session.account);
@@ -2671,19 +2704,19 @@ mod tests {
             collection: 1,
             body: &body,
         };
-        engine.apply(1, &plain).unwrap();
+        engine.apply(1, &plain, &mut Vec::new()).unwrap();
         assert!(matches!(engine.sessions.get(&[4; 32]), Some(Slot::Live(_))));
         // A format 2 section must be sealed, and a format 1 one must not.
         let unsealed = Section {
             format: FORMAT,
             ..plain
         };
-        assert!(engine.apply(2, &unsealed).is_err());
+        assert!(engine.apply(2, &unsealed, &mut Vec::new()).is_err());
         let flagged = Section {
             flags: SEALED,
             ..plain
         };
-        assert!(engine.apply(3, &flagged).is_err());
+        assert!(engine.apply(3, &flagged, &mut Vec::new()).is_err());
         drop(engine);
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -59,6 +59,7 @@
 
 - Types, revisions, statuses, scheduling, locales, route index, redirects, references, reverse index, listings, change feed (FR-9, FR-10).
   - [x] Drafts, revisions, publishing, statuses, visibility; redirects on a path change (`PLAN.md` D-069, D-070).
+  - [x] Change feed (`PLAN.md` D-071).
 - Auth extras (FR-8). Metrics and health hooks.
   - [x] `account`, `add_identifier`, `remove_identifier` (from 0.3, `PLAN.md` D-066), roles (D-067), `set_password` (D-068).
 - **Exit:** James's site serves its pages from nex-db.

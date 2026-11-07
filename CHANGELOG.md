@@ -13,6 +13,7 @@ All notable changes to `nex-db` are documented in this file. The format is based
 - `set_password`: replaces the password and ends the account's sessions in the same commit.
 - Drafts and publishing: `save_draft` with `Patch`, `save_revision`, `publish`, `unpublish`, `set_path`, `set_status`, `set_visibility`; `Content::draft`, `revisions`, `revision`; `Status`, `Visibility`, `RevisionInfo`; `Entry::status`, `visibility`, `updated_at`, `published_at`, `first_published_at`.
 - `RouteKind::Redirect` (a moved entity's old path, 301) and `RouteKind::Gone`; `RouteEntry::visibility`.
+- The change feed: `Database::feed`, `Database::position`, `Feed`, `Position`, `Change`, and `Error::FeedBehind` (NEX-1012).
 
 ### Changed
 

@@ -107,6 +107,10 @@ name = "content"
 required-features = ["content"]
 
 [[test]]
+name = "feed"
+required-features = ["auth", "content"]
+
+[[test]]
 name = "kill"
 required-features = ["auth", "content"]
 

@@ -20,6 +20,7 @@ use crate::{
     },
     engine::{Engine, EngineId, Registry, Staged},
     error::{Error, Result},
+    feed::{Feed, FeedLog, Position},
 };
 
 /// Open (or create) the database in the directory `path`.
@@ -226,6 +227,28 @@ impl Database {
     #[must_use]
     pub fn path(&self) -> &Path {
         self.core.dir()
+    }
+
+    /// The position of the last visible commit, to start a change feed
+    /// from now.
+    #[must_use]
+    pub fn position(&self) -> Position {
+        Position(self.core.visible())
+    }
+
+    /// The changes committed after `from`, in order. See [`Feed`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::FeedBehind`] when `from` is older than the feed keeps (the
+    /// changes of the last 65,536 commits that changed something, since
+    /// the database was opened).
+    pub fn feed(&self, from: Position) -> Result<Feed<'_>> {
+        Feed::new(self, from)
+    }
+
+    pub(crate) fn feed_log(&self) -> &FeedLog {
+        self.core.feed()
     }
 
     /// The auth engine: sessions, accounts, passwords.

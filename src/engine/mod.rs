@@ -54,6 +54,7 @@
 use crate::{
     core::record::{Section, Seq},
     error::{Error, Result},
+    feed::Change,
 };
 
 #[cfg(test)]
@@ -125,16 +126,18 @@ pub(crate) trait Engine: Send + Sync {
     /// [`Error::Invalid`] when the definition is not one this engine accepts.
     fn define(&self, definition: &[u8]) -> Result<()>;
 
-    /// Install a committed section at `seq`. The section carries its
-    /// collection, format, flags, and body. Deterministic and idempotent: a
-    /// section at or below what the engine already holds is skipped.
+    /// Install a committed section at `seq`, adding what it changed to
+    /// `changes` for the change feed. The section carries its collection,
+    /// format, flags, and body. Deterministic and idempotent: a section at
+    /// or below what the engine already holds is skipped (and reports no
+    /// changes).
     ///
     /// # Errors
     ///
     /// [`Error::Corrupt`] when the section cannot be decoded, and
     /// [`Error::Storage`] when the engine's own files refuse the change. Any
     /// error halts the database's writes.
-    fn apply(&self, seq: Seq, section: &Section<'_>) -> Result<()>;
+    fn apply(&self, seq: Seq, section: &Section<'_>, changes: &mut Vec<Change>) -> Result<()>;
 
     /// The highest sequence number this engine's own files hold. Recovery
     /// replays the log from just above the lowest mark of all engines.

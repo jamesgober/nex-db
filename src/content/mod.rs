@@ -14,6 +14,7 @@ pub(crate) mod entity;
 pub(crate) mod lists;
 pub(crate) mod locale;
 mod routes;
+pub(crate) mod types;
 
 use std::{
     collections::HashMap,
@@ -35,6 +36,7 @@ use self::{
     lists::{Cursor, ListIndex, Listing, Page},
     locale::{Locale, SpaceSpec},
     routes::RouteTable,
+    types::{Type, TypeIndex, Types},
 };
 use crate::{
     Database,
@@ -70,6 +72,8 @@ const OP_PUT_ROUTE: u8 = 4;
 const OP_DELETE_ROUTE: u8 = 5;
 /// Replace the space's settings.
 const OP_SET_SPACE: u8 = 6;
+/// Replace the space's types.
+const OP_SET_TYPES: u8 = 7;
 
 /// The status an entity's old path redirects with when the path changes.
 const MOVED: u16 = 301;
@@ -112,6 +116,13 @@ fn space_key(collection: u32) -> Vec<u8> {
 
 /// Conflict key of the space's settings.
 const SPACE_CONFLICT_KEY: &[u8] = b"m";
+
+fn types_key(collection: u32) -> Vec<u8> {
+    prefix(collection, b't')
+}
+
+/// Conflict key of the space's types.
+const TYPES_CONFLICT_KEY: &[u8] = b"t";
 
 fn route_prefix(collection: u32) -> Vec<u8> {
     prefix(collection, b'r')
@@ -163,6 +174,9 @@ pub(crate) struct ContentEngine {
     lists: ListIndex,
     /// The space's default locale and fallback chains.
     space: RwLock<SpaceSpec>,
+    /// The space's types, and what they index.
+    types: RwLock<Types>,
+    type_index: Mutex<TypeIndex>,
     /// Entity head versions kept for running snapshots.
     versions: Versions,
     conflicts: ConflictTable,
@@ -193,12 +207,18 @@ impl ContentEngine {
         };
         let routes = RouteTable::new();
         let lists = ListIndex::new();
+        let types = match store.get(types_key(collection))? {
+            Some(bytes) => Types::decode(&bytes, applied)?,
+            None => Types::default(),
+        };
+        let mut type_index = TypeIndex::default();
         // Every head goes into the listing index. Entities stored by 0.1 to
         // 0.3 have no route records: their routes come from the entities.
         let start = entity_prefix(collection);
         for (_, value) in store.scan(start.clone()..after(&start))? {
             let head = Head::decode(&value, applied)?;
             lists.update(&head);
+            type_index.update(&types, &head);
             if Head::is_legacy(&value) {
                 let base = head.base();
                 if let Some(path) = base.draft.path.as_deref() {
@@ -226,6 +246,8 @@ impl ContentEngine {
             routes,
             lists,
             space: RwLock::new(space),
+            types: RwLock::new(types),
+            type_index: Mutex::new(type_index),
             versions: Versions::new(),
             conflicts: ConflictTable::new(),
         })
@@ -255,6 +277,28 @@ impl ContentEngine {
             .get(revision_key(self.collection, rid, n))?
             .map(|bytes| Revision::decode(&bytes, 0))
             .transpose()
+    }
+
+    fn types(&self) -> Types {
+        self.types
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn type_index(&self) -> std::sync::MutexGuard<'_, TypeIndex> {
+        self.type_index
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Every head in the store.
+    fn all_heads(&self) -> Result<Vec<Head>> {
+        let start = entity_prefix(self.collection);
+        self.store
+            .scan(start.clone()..after(&start))?
+            .map(|(_, value)| Head::decode(&value, 0))
+            .collect()
     }
 
     /// The space's settings.
@@ -368,6 +412,7 @@ enum Op<'a> {
     PutRoute(&'a str, &'a str, &'a [u8]),
     DeleteRoute(&'a str, &'a str),
     SetSpace(&'a [u8]),
+    SetTypes(&'a [u8]),
 }
 
 fn decode_ops(seq: Seq, format: u16, body: &[u8]) -> Result<Vec<Op<'_>>> {
@@ -383,6 +428,7 @@ fn decode_ops(seq: Seq, format: u16, body: &[u8]) -> Result<Vec<Op<'_>>> {
             (FORMAT, OP_PUT_ROUTE) => Op::PutRoute(r.str16()?, r.str16()?, r.bytes16()?),
             (FORMAT, OP_DELETE_ROUTE) => Op::DeleteRoute(r.str16()?, r.str16()?),
             (FORMAT, OP_SET_SPACE) => Op::SetSpace(r.bytes16()?),
+            (FORMAT, OP_SET_TYPES) => Op::SetTypes(r.bytes32()?),
             _ => return Err(Error::corrupt("a content operation", seq)),
         };
         ops.push(op);
@@ -429,6 +475,7 @@ impl Engine for ContentEngine {
         let mut routes: Vec<(String, String, Option<RouteEntry>)> = Vec::new();
         let mut heads = Vec::new();
         let mut space = None;
+        let mut types = None;
         for op in &ops {
             match op {
                 Op::Create(record) => {
@@ -478,6 +525,10 @@ impl Engine for ContentEngine {
                     space = Some(SpaceSpec::decode(value, seq)?);
                     batch.put(space_key(self.collection), *value);
                 }
+                Op::SetTypes(value) => {
+                    types = Some(Types::decode(value, seq)?);
+                    batch.put(types_key(self.collection), *value);
+                }
             }
         }
         batch.put(META_APPLIED, seq.to_le_bytes());
@@ -495,6 +546,21 @@ impl Engine for ContentEngine {
         }
         if let Some(space) = space {
             *self.space.write().unwrap_or_else(PoisonError::into_inner) = space;
+        }
+        if let Some(types) = types {
+            // New unique fields index entities already stored.
+            let mut index = TypeIndex::default();
+            for head in self.all_heads()? {
+                index.update(&types, &head);
+            }
+            *self.type_index() = index;
+            *self.types.write().unwrap_or_else(PoisonError::into_inner) = types;
+        } else if !heads.is_empty() {
+            let types = self.types();
+            let mut index = self.type_index();
+            for head in &heads {
+                index.update(&types, head);
+            }
         }
         Ok(())
     }
@@ -535,6 +601,7 @@ enum StagedOp {
     Revision(Rid, u32, Vec<u8>),
     Route(String, String, Option<RouteEntry>),
     Space(Vec<u8>),
+    Types(Vec<u8>),
 }
 
 /// One transaction's content work.
@@ -547,6 +614,10 @@ pub(crate) struct ContentStaged<'e> {
     revisions: HashMap<(Rid, u32), (Locale, Body)>,
     /// Routes as this work left them.
     routes: HashMap<(String, String), Option<RouteEntry>>,
+    /// The space's types as this work left them.
+    types: Option<Types>,
+    /// Unique values this work published, and the entity holding each.
+    unique: HashMap<Vec<u8>, Rid>,
     writes: Vec<Vec<u8>>,
 }
 
@@ -558,6 +629,8 @@ impl<'e> ContentStaged<'e> {
             ops: Vec::new(),
             revisions: HashMap::new(),
             routes: HashMap::new(),
+            types: None,
+            unique: HashMap::new(),
             writes: Vec::new(),
         }
     }
@@ -619,6 +692,10 @@ impl Staged for ContentStaged<'_> {
                     w.u8(OP_SET_SPACE);
                     w.bytes16(value)?;
                 }
+                StagedOp::Types(value) => {
+                    w.u8(OP_SET_TYPES);
+                    w.bytes32(value)?;
+                }
             }
         }
         for head in &self.heads {
@@ -657,7 +734,19 @@ impl ContentTx<'_, '_> {
             .ok_or_else(|| Error::invalid("entity", "no such entity"))
     }
 
-    fn put_head(&mut self, mut head: Head) {
+    /// The space's types as this transaction sees them.
+    fn types(&self) -> Types {
+        match &self.staged.types {
+            Some(types) => types.clone(),
+            None => self.staged.engine.types(),
+        }
+    }
+
+    fn put_head(&mut self, mut head: Head) -> Result<()> {
+        let types = self.types();
+        for variant in &head.variants {
+            types.check(&head.kind, &variant.draft)?;
+        }
         head.updated_ms = now_ms();
         head.status = match head.status {
             Status::Draft | Status::Review if head.is_published() => Status::Published,
@@ -672,6 +761,65 @@ impl ContentTx<'_, '_> {
                 self.staged.writes.push(key);
             }
         }
+        Ok(())
+    }
+
+    /// Refuse publishing `head` when another entity's published value
+    /// takes one of its unique values.
+    fn claim_unique(&mut self, head: &Head) -> Result<()> {
+        for key in self.types().unique_keys(head) {
+            let holder = match self.staged.unique.get(&key) {
+                Some(rid) => Some(*rid),
+                None => self.staged.engine.type_index().holder(&key),
+            };
+            if holder.is_some_and(|r| r != head.rid) {
+                return Err(Error::AlreadyExists {
+                    what: "field value",
+                });
+            }
+            self.staged.writes.push(key.clone());
+            let _ = self.staged.unique.insert(key, head.rid);
+        }
+        Ok(())
+    }
+
+    /// Define `ty` in the space, or extend it: a redefinition keeps every
+    /// field, kind, and flag it had.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the name or a field name breaks its rule, a
+    /// field is declared twice, a redefinition drops something, the type
+    /// becomes a singleton while it has more than one entity, or a new
+    /// unique field already has a value two published entities share.
+    pub fn define(&mut self, ty: Type) -> Result<()> {
+        entity::check_name("type", &ty.name)?;
+        for (name, _, _) in &ty.fields {
+            entity::check_name("field name", name)?;
+        }
+        let engine = self.staged.engine;
+        let next = self.types().with(ty.clone())?;
+        if ty.singleton && engine.type_index().count(&ty.name).0 > 1 {
+            return Err(Error::invalid("type", "has more than one entity"));
+        }
+        let mut seen = HashMap::new();
+        for head in engine.all_heads()? {
+            for key in next.unique_keys(&head) {
+                if seen.insert(key, head.rid).is_some_and(|r| r != head.rid) {
+                    return Err(Error::invalid(
+                        "type",
+                        "published entities share a value of a unique field",
+                    ));
+                }
+            }
+        }
+        self.staged
+            .ops
+            .retain(|op| !matches!(op, StagedOp::Types(_)));
+        self.staged.ops.push(StagedOp::Types(next.encode()?));
+        self.staged.writes.push(TYPES_CONFLICT_KEY.to_vec());
+        self.staged.types = Some(next);
+        Ok(())
     }
 
     /// The route at `path` on `site` as this transaction sees it.
@@ -797,13 +945,31 @@ impl ContentTx<'_, '_> {
     /// - [`Error::Invalid`] when a name, path, site, or value breaks its rule.
     pub fn create(&mut self, entity: Entity) -> Result<Rid> {
         let rid = Rid::generate();
-        let default = self.staged.engine.space().default_locale;
+        let engine = self.staged.engine;
+        if self
+            .types()
+            .get(entity.kind_name())
+            .is_some_and(|t| t.singleton)
+        {
+            let staged = self
+                .staged
+                .heads
+                .iter()
+                .any(|h| h.kind == entity.kind_name());
+            if staged || engine.type_index().count(entity.kind_name()).0 > 0 {
+                return Err(Error::AlreadyExists { what: "singleton" });
+            }
+            self.staged
+                .writes
+                .push(format!("k{}", entity.kind_name()).into_bytes());
+        }
+        let default = engine.space().default_locale;
         let head = entity.into_head(rid, now_ms(), default)?;
         let base = head.base();
         if let Some(path) = base.draft.path.as_deref() {
             self.check_free(&head.site, path, rid, base.locale)?;
         }
-        self.put_head(head);
+        self.put_head(head)?;
         Ok(rid)
     }
 
@@ -818,7 +984,7 @@ impl ContentTx<'_, '_> {
         let mut head = self.head(rid)?;
         let locale = head.base().locale;
         self.patch_variant(&mut head, locale, patch)?;
-        self.put_head(head);
+        self.put_head(head)?;
         Ok(())
     }
 
@@ -850,7 +1016,7 @@ impl ContentTx<'_, '_> {
             head.add_variant(locale, draft, source)?;
         }
         self.patch_variant(&mut head, locale, patch)?;
-        self.put_head(head);
+        self.put_head(head)?;
         Ok(())
     }
 
@@ -865,7 +1031,7 @@ impl ContentTx<'_, '_> {
         let mut head = self.head(rid)?;
         let locale = head.base().locale;
         let n = self.record_revision(&mut head, locale, message)?;
-        self.put_head(head);
+        self.put_head(head)?;
         Ok(n)
     }
 
@@ -939,7 +1105,8 @@ impl ContentTx<'_, '_> {
             self.route_published(&head, locale, old.as_deref())?;
             newest = newest.max(n);
         }
-        self.put_head(head);
+        self.claim_unique(&head)?;
+        self.put_head(head)?;
         Ok(newest)
     }
 
@@ -976,7 +1143,7 @@ impl ContentTx<'_, '_> {
             }
         }
         if any {
-            self.put_head(head);
+            self.put_head(head)?;
         }
         Ok(any)
     }
@@ -1013,7 +1180,7 @@ impl ContentTx<'_, '_> {
         if let Some(old) = old {
             self.route_published(&head, locale, old.as_deref())?;
         }
-        self.put_head(head);
+        self.put_head(head)?;
         Ok(())
     }
 
@@ -1045,7 +1212,7 @@ impl ContentTx<'_, '_> {
         }
         let mut head = self.head(rid)?;
         head.status = status;
-        self.put_head(head);
+        self.put_head(head)?;
         Ok(())
     }
 
@@ -1070,7 +1237,7 @@ impl ContentTx<'_, '_> {
         for (path, entry) in routes {
             self.put_route(&site, &path, Some(entry));
         }
-        self.put_head(head);
+        self.put_head(head)?;
         Ok(())
     }
 
@@ -1129,6 +1296,39 @@ impl Content<'_> {
     /// As [`get`](Self::get).
     pub fn draft_in(&self, rid: Rid, locale: Locale) -> Result<Option<Entry>> {
         self.engine().draft_in(rid, Some(locale), Seq::MAX)
+    }
+
+    /// Define or extend a type in its own commit. See
+    /// [`ContentTx::define`].
+    ///
+    /// ```
+    /// # #[cfg(feature = "content")]
+    /// # fn main() -> nex_db::Result<()> {
+    /// # let dir = std::env::temp_dir().join(format!("nex-db-define-doc-{}", std::process::id()));
+    /// # let _ = std::fs::remove_dir_all(&dir);
+    /// use nex_db::{Entity, FieldType, Type};
+    /// let db = nex_db::open(&dir)?;
+    /// db.content().define(Type::new("post").field("words", FieldType::Int))?;
+    /// assert!(db.content().create(Entity::new("post").field("words", "many")).is_err());
+    /// # drop(db);
+    /// # std::fs::remove_dir_all(&dir).unwrap();
+    /// # Ok(())
+    /// # }
+    /// # #[cfg(not(feature = "content"))]
+    /// # fn main() {}
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`ContentTx::define`], plus the errors of [`Database::commit`].
+    pub fn define(&self, ty: Type) -> Result<()> {
+        self.db.commit(|tx| tx.content().define(ty.clone()))
+    }
+
+    /// The type named `name`, if the space defines it.
+    #[must_use]
+    pub fn type_named(&self, name: &str) -> Option<Type> {
+        self.engine().types().get(name).cloned()
     }
 
     /// The space's settings.

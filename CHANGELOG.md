@@ -16,6 +16,7 @@ All notable changes to `nex-db` are documented in this file. The format is based
 - The change feed: `Database::feed`, `Database::position`, `Feed`, `Position`, `Change`, and `Error::FeedBehind` (NEX-1012).
 - Listings: `Content::list`, `next_page`, `Listing` (`latest`, `updated`, `site`, `limit`), `Page`, and `Cursor`.
 - `Database::health` and `Health`; `Builder::observer`, `Observer`, `CommitInfo`, and `SecurityEvent`.
+- Types: `Content::define`, `type_named`, `Type` (`field`, `unique`, `singleton`), and `FieldType`.
 - Locales: `Locale`, `SpaceSpec`, `Content::space` and `set_space`, `Entity::locale`, `translate`, `publish_in`, `unpublish_in`, `set_path_in`, `get_in`, `draft_in`; `Entry::locale` and `fallback`; `RouteEntry::locale`; `RevisionInfo::locale`.
 
 ### Changed

@@ -255,6 +255,8 @@ sessions.
 | `collection, 'r', site, 0, path` | a route |
 | `collection, 'm'` | the space's settings: `format u8 (1)`, `default locale`, `chain count u8`, then per chain `locale`, `count u8`, and that many `locale` |
 
+| `collection, 't'` | the space's types: `format u8 (1)`, `type count u16`, then per type `name str16`, `singleton u8`, `field count u16`, and per field `name str16`, `kind u8` (1 text, 2 int, 3 bool, 4 account, 5 entity), `flags u8` (1 unique) |
+
 A locale is stored as `length u8` and its ASCII tag (at most 15 bytes).
 
 The route index is rebuilt at open from the route records, and from the

@@ -129,6 +129,7 @@ pub use crate::content::{
     },
     lists::{Cursor, Listing, Page},
     locale::{Locale, SpaceSpec},
+    types::{FieldType, Type},
 };
 pub use crate::{
     core::keys::Keys,

@@ -440,3 +440,97 @@ fn test_translations_publish_per_locale_and_fall_back() {
     assert!(db.content().draft_in(rid, fr).unwrap().is_some());
     assert!(db.content().draft_in(rid, fr_ca).unwrap().is_none());
 }
+
+#[test]
+fn test_types_check_kinds_unique_values_and_singletons() {
+    use nex_db::{FieldType, Type};
+    let dir = TempDir::new("types");
+    {
+        let db = Database::open(&dir.0).unwrap();
+        db.content()
+            .define(
+                Type::new("post")
+                    .field("words", FieldType::Int)
+                    .field("slug", FieldType::Text)
+                    .unique(),
+            )
+            .unwrap();
+        db.content()
+            .define(Type::new("settings").singleton())
+            .unwrap();
+        assert!(
+            db.content()
+                .create(Entity::new("post").field("words", "many"))
+                .is_err()
+        );
+        let a = db
+            .content()
+            .create(
+                Entity::new("post")
+                    .field("words", 3_i64)
+                    .field("slug", "hello"),
+            )
+            .unwrap();
+        assert!(
+            db.content()
+                .save_draft(a, Patch::new().set("words", true))
+                .is_err()
+        );
+        // Drafts may share a unique value; publishing may not.
+        let b = db
+            .content()
+            .create(Entity::new("post").field("slug", "hello"))
+            .unwrap();
+        let _ = db.content().publish(a).unwrap();
+        assert!(matches!(
+            db.content().publish(b),
+            Err(Error::AlreadyExists {
+                what: "field value"
+            })
+        ));
+        let _ = db.content().create(Entity::new("settings")).unwrap();
+        assert!(matches!(
+            db.content().create(Entity::new("settings")),
+            Err(Error::AlreadyExists { what: "singleton" })
+        ));
+        // A type only grows.
+        assert!(
+            db.content()
+                .define(Type::new("post").field("words", FieldType::Text))
+                .is_err()
+        );
+        // Two published pages share a title: it cannot become unique.
+        for _ in 0..2 {
+            let rid = db
+                .content()
+                .create(Entity::new("page").field("title", "Same"))
+                .unwrap();
+            let _ = db.content().publish(rid).unwrap();
+        }
+        assert!(
+            db.content()
+                .define(Type::new("page").field("title", FieldType::Text).unique())
+                .is_err()
+        );
+        // Unpublishing frees the value.
+        let _ = db.content().unpublish(a).unwrap();
+        let _ = db.content().publish(b).unwrap();
+    }
+    let db = Database::open(&dir.0).unwrap();
+    let post = db.content().type_named("post").unwrap();
+    assert_eq!(post.fields().count(), 2);
+    assert!(
+        db.content()
+            .create(Entity::new("post").field("words", "many"))
+            .is_err()
+    );
+    assert!(matches!(
+        db.content().create(Entity::new("settings")),
+        Err(Error::AlreadyExists { what: "singleton" })
+    ));
+    let c = db
+        .content()
+        .create(Entity::new("post").field("slug", "hello"))
+        .unwrap();
+    assert!(db.content().publish(c).is_err());
+}

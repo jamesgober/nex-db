@@ -217,6 +217,10 @@ impl Entity {
         self
     }
 
+    pub(crate) fn kind_name(&self) -> &str {
+        &self.kind
+    }
+
     pub(crate) fn site_name(&self) -> &str {
         self.site.as_deref().unwrap_or(DEFAULT_SITE)
     }
@@ -907,7 +911,7 @@ pub(crate) fn decode_route(bytes: &[u8], at: u64) -> Result<RouteEntry> {
     })
 }
 
-fn check_name(what: &'static str, name: &str) -> Result<()> {
+pub(crate) fn check_name(what: &'static str, name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= MAX_NAME
         && name

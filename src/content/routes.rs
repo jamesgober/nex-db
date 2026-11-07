@@ -91,6 +91,7 @@ mod tests {
             revision,
             kind: RouteKind::Page,
             visibility: Visibility::Public,
+            locale: crate::content::locale::Locale::EN,
         }
     }
 

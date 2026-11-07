@@ -61,6 +61,7 @@
   - [x] Drafts, revisions, publishing, statuses, visibility; redirects on a path change (`PLAN.md` D-069, D-070).
   - [x] Change feed (`PLAN.md` D-071).
   - [x] Listings by site and type, two orders, cursors (`PLAN.md` D-072).
+  - [x] Locales: per-locale drafts, publishing, and paths, fallback chains (`PLAN.md` D-074).
   - Blocker recorded: lsm-db 1.1 scans materialize the whole range, so derived indexes stay in memory and are rebuilt at open; a lazy, bounded scan is requested from lsm-db.
 - Auth extras (FR-8). Metrics and health hooks.
   - [x] Health and observers (`PLAN.md` D-073); `metrics` still to come.

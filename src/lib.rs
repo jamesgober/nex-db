@@ -128,6 +128,7 @@ pub use crate::content::{
         Visibility,
     },
     lists::{Cursor, Listing, Page},
+    locale::{Locale, SpaceSpec},
 };
 pub use crate::{
     core::keys::Keys,

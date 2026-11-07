@@ -583,8 +583,8 @@ assert_eq!(db.content().revisions(rid)?.len(), 2);
 | `create(Entity) -> Result<Rid>` | P0 | 0.1; starts as a draft from 0.4 |
 | `save_draft(rid, Patch) -> Result<()>` | P0 | no revision |
 | `save_revision(rid, message) -> Result<u32>` | P0 | |
-| `publish(rid) -> Result<u32>` | P0 | publishes the draft; returns the revision (a new one only when the draft changed); per locale (`publish(rid, locales)`) once locales arrive |
-| `unpublish(rid) -> Result<bool>` | P0 | the path stops resolving; draft and revisions stay |
+| `publish(rid) -> Result<u32>` | P0 | publishes the draft; returns the revision (a new one only when the draft changed) in the entity's own locale; `publish_in(rid, locales)` for others |
+| `unpublish(rid) -> Result<bool>` | P0 | every locale; the paths stop resolving; drafts and revisions stay; `unpublish_in(rid, locales)` for some |
 | `schedule(rid, Action::Publish \| Action::Unpublish, at)` | P1 | fired by the database at `at` |
 | `set_status(rid, Status)`, `set_visibility(rid, Visibility)` | P1 | |
 | `trash(rid)`, `restore(rid)`, `delete(rid)` | P1 | `delete` applies the reference rules |
@@ -603,16 +603,47 @@ action)`, `schedule_release(release, at)`, `publish_release(release)` (P2).
 
 ### Locales (0.4)
 
-A locale is a `Locale`, a small `Copy` tag such as `fr-CA`. Each space has a
-default locale and fallback chains (`fr-CA` to `fr` to `en`).
+A locale is a `Locale`, a small `Copy` tag such as `fr-CA`
+(`Locale::new("fr-CA")?`, `Locale::EN`). Each space has a default locale and
+fallback chains (`fr-CA` to `fr`), set with
+`db.content().set_space(SpaceSpec::new(en).fallback(fr_ca, &[fr])?)` and read
+with `space()`; a space that sets none uses `en`. An entity is written in one
+locale (`Entity::locale`, default the space's), and each translation has its
+own draft, published revision, and path. A read that finds nothing published
+in the locale asked for, or along its chain, gets the entity's own locale.
+
+```rust
+use nex_db::{Entity, Locale, Patch, SpaceSpec};
+
+# let dir = std::env::temp_dir().join(format!("nex-db-api-locales-{}", std::process::id()));
+# let _ = std::fs::remove_dir_all(&dir);
+# let db = nex_db::open(&dir)?;
+let (en, fr) = (Locale::new("en")?, Locale::new("fr")?);
+let rid = db.content().create(Entity::new("page").field("title", "Hello").path("/hello"))?;
+db.commit(|tx| {
+    tx.content().publish(rid)?;
+    tx.content().translate(rid, fr, Patch::new().set("title", "Bonjour").path("/fr/bonjour"))?;
+    tx.content().publish_in(rid, &[fr])
+})?;
+let page = db.content().get_in(rid, fr)?.expect("published");
+assert_eq!(page.field("title").and_then(|v| v.as_text()), Some("Bonjour"));
+let route = db.content().resolve(nex_db::DEFAULT_SITE, "/fr/bonjour")?.expect("routed");
+assert_eq!(route.locale(), fr);
+assert_eq!(db.content().get(rid)?.expect("published").locale(), en);
+# let _ = SpaceSpec::new(en);
+# drop(db);
+# std::fs::remove_dir_all(&dir).unwrap();
+# Ok::<(), nex_db::Error>(())
+```
 
 | Operation | Grade | Notes |
 |---|---|---|
-| `get(rid) -> Result<Option<Entry>>` | P0 | 0.1; the published revision in the space's default locale, or `None` when nothing is published |
-| `draft(rid) -> Result<Option<Entry>>` | P0 | the working draft, for editors |
+| `get(rid) -> Result<Option<Entry>>` | P0 | 0.1; the published revision in the space's default locale (by its chain, then the entity's own), or `None` when nothing is published |
+| `draft(rid)`, `draft_in(rid, locale) -> Result<Option<Entry>>` | P0 | the working draft, for editors |
 | `get_in(rid, locale) -> Result<Option<Entry>>` | P0 | follows the fallback chain; `Entry::fallback()` says when it did |
+| `publish_in(rid, &[Locale])`, `unpublish_in(rid, &[Locale])`, `set_path_in(rid, locale, path)` (tx) | P0 | per locale; `publish`, `unpublish`, and `set_path` act on the entity's own locale (`unpublish`: every locale) |
 | `get_many(&[Rid], locale) -> Result<Vec<Option<Entry>>>` | P1 | one snapshot |
-| `translate(rid, locale, Patch)` (tx) | P0 | records the source revision it was translated from |
+| `translate(rid, locale, Patch)` (tx) | P0 | starts a translation from the entity's own fields (without a path) and records the published revision it was translated from |
 | `list(Listing::outdated(locale))` | P1 | translations older than their source |
 
 Each locale has its own path; all of them point at the same `Rid`.
@@ -648,7 +679,7 @@ assert!(db.content().resolve("other.example", "/about")?.is_none());
 ```
 
 `RouteEntry` is a small `Copy` value: `entity()`, `revision()`, `kind()`
-(0.1), and `locale()` and `visibility()` (0.4). `RouteKind` (non-exhaustive):
+(0.1), and `locale()` (the locale the path serves) and `visibility()` (0.4). `RouteKind` (non-exhaustive):
 
 | Kind | Since | Answer |
 |---|---|---|
@@ -665,7 +696,7 @@ redirects again is shortened, so a chain is never followed.
 | Operation | Grade | Notes |
 |---|---|---|
 | `resolve(site, path) -> Result<Option<RouteEntry>>` | P0 | 0.1 |
-| `set_path(rid, path)` (tx) | P0 | the old path redirects with 301; per locale once locales arrive |
+| `set_path(rid, path)`, `set_path_in(rid, locale, path)` (tx) | P0 | the old path redirects with 301 |
 | `add_redirect(site, from, to, status)` (tx), `remove_route(site, path)` (tx) | P1 | |
 | `routes(rid) -> Result<Vec<(String, String)>>` | P2 | every path of an entity |
 | `resolve_draft(site, path) -> Result<Option<RouteEntry>>` | P2 | 0.6; drafts at their real paths, for previews |

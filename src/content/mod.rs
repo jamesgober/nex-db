@@ -12,6 +12,7 @@
 
 pub(crate) mod entity;
 pub(crate) mod lists;
+pub(crate) mod locale;
 mod routes;
 
 use std::{
@@ -19,7 +20,7 @@ use std::{
     fmt,
     path::{Path, PathBuf},
     sync::{
-        Mutex, PoisonError,
+        Mutex, PoisonError, RwLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -32,6 +33,7 @@ use self::{
         Status, Visibility, decode_route, encode_route,
     },
     lists::{Cursor, ListIndex, Listing, Page},
+    locale::{Locale, SpaceSpec},
     routes::RouteTable,
 };
 use crate::{
@@ -66,6 +68,8 @@ const OP_PUT_REVISION: u8 = 3;
 const OP_PUT_ROUTE: u8 = 4;
 /// Remove a route.
 const OP_DELETE_ROUTE: u8 = 5;
+/// Replace the space's settings.
+const OP_SET_SPACE: u8 = 6;
 
 /// The status an entity's old path redirects with when the path changes.
 const MOVED: u16 = 301;
@@ -101,6 +105,13 @@ fn revision_key(collection: u32, rid: Rid, n: u32) -> Vec<u8> {
     key.extend_from_slice(&n.to_be_bytes());
     key
 }
+
+fn space_key(collection: u32) -> Vec<u8> {
+    prefix(collection, b'm')
+}
+
+/// Conflict key of the space's settings.
+const SPACE_CONFLICT_KEY: &[u8] = b"m";
 
 fn route_prefix(collection: u32) -> Vec<u8> {
     prefix(collection, b'r')
@@ -150,6 +161,8 @@ pub(crate) struct ContentEngine {
     routes: RouteTable,
     /// Published entities by site and type.
     lists: ListIndex,
+    /// The space's default locale and fallback chains.
+    space: RwLock<SpaceSpec>,
     /// Entity head versions kept for running snapshots.
     versions: Versions,
     conflicts: ConflictTable,
@@ -187,8 +200,9 @@ impl ContentEngine {
             let head = Head::decode(&value, applied)?;
             lists.update(&head);
             if Head::is_legacy(&value) {
-                if let Some(path) = head.draft.path.as_deref() {
-                    routes.set(&head.site, path, 0, Some(page(&head, 1)));
+                let base = head.base();
+                if let Some(path) = base.draft.path.as_deref() {
+                    routes.set(&head.site, path, 0, Some(page(&head, base.locale, 1)));
                 }
             }
         }
@@ -198,6 +212,10 @@ impl ContentEngine {
             let (site, path) = split_route(name, applied)?;
             routes.set(site, path, 0, Some(decode_route(&value, applied)?));
         }
+        let space = match store.get(space_key(collection))? {
+            Some(bytes) => SpaceSpec::decode(&bytes, applied)?,
+            None => SpaceSpec::default(),
+        };
         Ok(ContentEngine {
             collection,
             dir: dir.to_path_buf(),
@@ -207,6 +225,7 @@ impl ContentEngine {
             writing: Mutex::new(()),
             routes,
             lists,
+            space: RwLock::new(space),
             versions: Versions::new(),
             conflicts: ConflictTable::new(),
         })
@@ -238,18 +257,37 @@ impl ContentEngine {
             .transpose()
     }
 
-    /// The published entry of `rid` as a snapshot at `at` sees it.
-    fn published_at(&self, rid: Rid, at: Seq) -> Result<Option<Entry>> {
+    /// The space's settings.
+    fn space(&self) -> SpaceSpec {
+        self.space
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The published entry of `rid` as a snapshot at `at` sees it: in
+    /// `asked` (the space's default locale when `None`), else along its
+    /// fallback chain, else in the entity's own locale.
+    fn published_in(&self, rid: Rid, asked: Option<Locale>, at: Seq) -> Result<Option<Entry>> {
         let Some(bytes) = self.head_bytes_at(rid, at)? else {
             return Ok(None);
         };
         let head = Head::decode(&bytes, at)?;
-        let Some(published) = head.published.clone() else {
+        let space = self.space();
+        let asked = asked.unwrap_or(space.default_locale);
+        let found = space
+            .order(asked)
+            .chain(std::iter::once(head.base().locale))
+            .find_map(|l| {
+                head.variant(l)
+                    .and_then(|v| v.published.clone().map(|p| (v, p)))
+            });
+        let Some((variant, published)) = found else {
             return Ok(None);
         };
         // A record from 0.1 to 0.3 is its own published body.
         let mut body = if Head::is_legacy(&bytes) {
-            head.draft.clone()
+            variant.draft.clone()
         } else {
             match self.revision(rid, published.revision)? {
                 Some(revision) => revision.body,
@@ -258,7 +296,28 @@ impl ContentEngine {
         };
         // The path can move without a new revision.
         body.path = published.path;
-        Ok(Some(head.entry(published.revision, body)))
+        Ok(Some(head.entry(
+            variant.locale,
+            published.revision,
+            body,
+            Some(asked),
+        )))
+    }
+
+    /// The working draft of `rid` in `locale` (its own when `None`).
+    fn draft_in(&self, rid: Rid, locale: Option<Locale>, at: Seq) -> Result<Option<Entry>> {
+        Ok(self.head_at(rid, at)?.and_then(|head| {
+            let variant = match locale {
+                Some(l) => head.variant(l)?,
+                None => head.base(),
+            };
+            Some(head.entry(
+                variant.locale,
+                head.last_revision,
+                variant.draft.clone(),
+                None,
+            ))
+        }))
     }
 
     fn revisions(&self, rid: Rid) -> Result<Vec<RevisionInfo>> {
@@ -273,6 +332,7 @@ impl ContentEngine {
             let revision = Revision::decode(&value, 0)?;
             out.push(RevisionInfo {
                 number: n,
+                locale: revision.locale,
                 at_ms: revision.at_ms,
                 message: revision.message,
             });
@@ -289,13 +349,14 @@ fn split_route(name: &[u8], at: Seq) -> Result<(&str, &str)> {
     Ok((site, path))
 }
 
-/// The page route of `head` at `revision`.
-fn page(head: &Head, revision: u32) -> RouteEntry {
+/// The page route of `head` in `locale` at `revision`.
+fn page(head: &Head, locale: Locale, revision: u32) -> RouteEntry {
     RouteEntry {
         entity: head.rid,
         revision,
         kind: RouteKind::Page,
         visibility: head.visibility,
+        locale,
     }
 }
 
@@ -306,6 +367,7 @@ enum Op<'a> {
     PutRevision(Rid, u32, &'a [u8]),
     PutRoute(&'a str, &'a str, &'a [u8]),
     DeleteRoute(&'a str, &'a str),
+    SetSpace(&'a [u8]),
 }
 
 fn decode_ops(seq: Seq, format: u16, body: &[u8]) -> Result<Vec<Op<'_>>> {
@@ -320,6 +382,7 @@ fn decode_ops(seq: Seq, format: u16, body: &[u8]) -> Result<Vec<Op<'_>>> {
             }
             (FORMAT, OP_PUT_ROUTE) => Op::PutRoute(r.str16()?, r.str16()?, r.bytes16()?),
             (FORMAT, OP_DELETE_ROUTE) => Op::DeleteRoute(r.str16()?, r.str16()?),
+            (FORMAT, OP_SET_SPACE) => Op::SetSpace(r.bytes16()?),
             _ => return Err(Error::corrupt("a content operation", seq)),
         };
         ops.push(op);
@@ -365,6 +428,7 @@ impl Engine for ContentEngine {
         let mut batch = Batch::new();
         let mut routes: Vec<(String, String, Option<RouteEntry>)> = Vec::new();
         let mut heads = Vec::new();
+        let mut space = None;
         for op in &ops {
             match op {
                 Op::Create(record) => {
@@ -377,8 +441,9 @@ impl Engine for ContentEngine {
                         rid: head.rid,
                         revision: 1,
                     });
-                    if let Some(path) = head.draft.path.as_deref() {
-                        let entry = page(&head, 1);
+                    let base = head.base();
+                    if let Some(path) = base.draft.path.as_deref() {
+                        let entry = page(&head, base.locale, 1);
                         let stored = stored_route_key(self.collection, &head.site, path);
                         batch.put(stored, encode_route(&entry));
                         routes.push((head.site.clone(), path.to_owned(), Some(entry)));
@@ -393,7 +458,7 @@ impl Engine for ContentEngine {
                     let head = Head::decode(value, seq)?;
                     changes.push(Change::EntityChanged {
                         rid: *rid,
-                        revision: head.published.as_ref().map_or(0, |p| p.revision),
+                        revision: head.base().published.as_ref().map_or(0, |p| p.revision),
                     });
                     heads.push(head);
                 }
@@ -409,6 +474,10 @@ impl Engine for ContentEngine {
                     batch.delete(stored_route_key(self.collection, site, path));
                     routes.push(((*site).to_owned(), (*path).to_owned(), None));
                 }
+                Op::SetSpace(value) => {
+                    space = Some(SpaceSpec::decode(value, seq)?);
+                    batch.put(space_key(self.collection), *value);
+                }
             }
         }
         batch.put(META_APPLIED, seq.to_le_bytes());
@@ -423,6 +492,9 @@ impl Engine for ContentEngine {
         }
         for head in &heads {
             self.lists.update(head);
+        }
+        if let Some(space) = space {
+            *self.space.write().unwrap_or_else(PoisonError::into_inner) = space;
         }
         Ok(())
     }
@@ -462,6 +534,7 @@ impl Engine for ContentEngine {
 enum StagedOp {
     Revision(Rid, u32, Vec<u8>),
     Route(String, String, Option<RouteEntry>),
+    Space(Vec<u8>),
 }
 
 /// One transaction's content work.
@@ -471,7 +544,7 @@ pub(crate) struct ContentStaged<'e> {
     heads: Vec<Head>,
     ops: Vec<StagedOp>,
     /// Revisions this work recorded, by entity and number.
-    revisions: HashMap<(Rid, u32), Body>,
+    revisions: HashMap<(Rid, u32), (Locale, Body)>,
     /// Routes as this work left them.
     routes: HashMap<(String, String), Option<RouteEntry>>,
     writes: Vec<Vec<u8>>,
@@ -542,6 +615,10 @@ impl Staged for ContentStaged<'_> {
                     w.str16(site)?;
                     w.str16(path)?;
                 }
+                StagedOp::Space(value) => {
+                    w.u8(OP_SET_SPACE);
+                    w.bytes16(value)?;
+                }
             }
         }
         for head in &self.heads {
@@ -582,6 +659,11 @@ impl ContentTx<'_, '_> {
 
     fn put_head(&mut self, mut head: Head) {
         head.updated_ms = now_ms();
+        head.status = match head.status {
+            Status::Draft | Status::Review if head.is_published() => Status::Published,
+            Status::Published if !head.is_published() => Status::Draft,
+            status => status,
+        };
         let key = entity_key(self.staged.engine.collection, head.rid);
         match self.staged.heads.iter_mut().find(|h| h.rid == head.rid) {
             Some(slot) => *slot = head,
@@ -611,29 +693,35 @@ impl ContentTx<'_, '_> {
             .push(StagedOp::Route(site.to_owned(), path.to_owned(), entry));
     }
 
-    /// Refuse `path` on `site` when another entity's page is there.
-    /// Redirects and gone markers give way.
-    fn check_free(&self, site: &str, path: &str, rid: Rid) -> Result<()> {
+    /// Refuse `path` on `site` when another entity's page (or this
+    /// entity's page in another locale) is there. Redirects and gone
+    /// markers give way.
+    fn check_free(&self, site: &str, path: &str, rid: Rid, locale: Locale) -> Result<()> {
         match self.route(site, path) {
             Some(RouteEntry {
                 entity,
                 kind: RouteKind::Page,
+                locale: at,
                 ..
-            }) if entity != rid => Err(Error::AlreadyExists { what: "path" }),
+            }) if entity != rid || at != locale => Err(Error::AlreadyExists { what: "path" }),
             _ => Ok(()),
         }
     }
 
-    /// Serve `head` at its published path at `revision`, and leave the old
+    /// Serve `locale` of `head` at its published path, and leave the old
     /// published path, if it differs, as a 301 to the entity.
-    fn route_published(&mut self, head: &Head, old: Option<&str>) -> Result<()> {
-        let Some(published) = &head.published else {
+    fn route_published(&mut self, head: &Head, locale: Locale, old: Option<&str>) -> Result<()> {
+        let Some(published) = head.variant(locale).and_then(|v| v.published.as_ref()) else {
             return Ok(());
         };
         let new = published.path.as_deref();
         if let Some(path) = new {
-            self.check_free(&head.site, path, head.rid)?;
-            self.put_route(&head.site, path, Some(page(head, published.revision)));
+            self.check_free(&head.site, path, head.rid, locale)?;
+            self.put_route(
+                &head.site,
+                path,
+                Some(page(head, locale, published.revision)),
+            );
         }
         if let Some(old) = old.filter(|old| Some(*old) != new) {
             let moved = RouteEntry {
@@ -644,33 +732,41 @@ impl ContentTx<'_, '_> {
                     status: MOVED,
                 },
                 visibility: head.visibility,
+                locale,
             };
             self.put_route(&head.site, old, Some(moved));
         }
         Ok(())
     }
 
-    /// The body of revision `n` of `rid` as this transaction sees it.
-    fn revision_body(&self, rid: Rid, n: u32) -> Result<Option<Body>> {
-        if let Some(body) = self.staged.revisions.get(&(rid, n)) {
-            return Ok(Some(body.clone()));
+    /// The locale and body of revision `n` of `rid` as this transaction
+    /// sees it.
+    fn revision_body(&self, rid: Rid, n: u32) -> Result<Option<(Locale, Body)>> {
+        if let Some(found) = self.staged.revisions.get(&(rid, n)) {
+            return Ok(Some(found.clone()));
         }
-        Ok(self.staged.engine.revision(rid, n)?.map(|r| r.body))
+        Ok(self
+            .staged
+            .engine
+            .revision(rid, n)?
+            .map(|r| (r.locale, r.body)))
     }
 
-    fn record_revision(&mut self, head: &mut Head, message: &str) -> Result<u32> {
+    fn record_revision(&mut self, head: &mut Head, locale: Locale, message: &str) -> Result<u32> {
+        let draft = head
+            .variant(locale)
+            .ok_or_else(|| Error::invalid("locale", "the entity has no such translation"))?
+            .draft
+            .clone();
         let n = head
             .last_revision
             .checked_add(1)
             .ok_or_else(|| Error::invalid("entity", "has too many revisions"))?;
-        let revision = Revision::new(now_ms(), message, head.draft.clone())?;
+        let revision = Revision::new(locale, now_ms(), message, draft.clone())?;
         self.staged
             .ops
             .push(StagedOp::Revision(head.rid, n, revision.encode()?));
-        let _ = self
-            .staged
-            .revisions
-            .insert((head.rid, n), head.draft.clone());
+        let _ = self.staged.revisions.insert((head.rid, n), (locale, draft));
         head.last_revision = n;
         Ok(n)
     }
@@ -701,15 +797,18 @@ impl ContentTx<'_, '_> {
     /// - [`Error::Invalid`] when a name, path, site, or value breaks its rule.
     pub fn create(&mut self, entity: Entity) -> Result<Rid> {
         let rid = Rid::generate();
-        let head = entity.into_head(rid, now_ms())?;
-        if let Some(path) = head.draft.path.as_deref() {
-            self.check_free(&head.site, path, rid)?;
+        let default = self.staged.engine.space().default_locale;
+        let head = entity.into_head(rid, now_ms(), default)?;
+        let base = head.base();
+        if let Some(path) = base.draft.path.as_deref() {
+            self.check_free(&head.site, path, rid, base.locale)?;
         }
         self.put_head(head);
         Ok(rid)
     }
 
-    /// Change the working draft. Records no revision.
+    /// Change the working draft of the entity's own locale. Records no
+    /// revision.
     ///
     /// # Errors
     ///
@@ -717,13 +816,46 @@ impl ContentTx<'_, '_> {
     /// breaks a rule of [`create`](Self::create).
     pub fn save_draft(&mut self, rid: Rid, patch: Patch) -> Result<()> {
         let mut head = self.head(rid)?;
-        patch.apply(&mut head.draft)?;
+        let locale = head.base().locale;
+        self.patch_variant(&mut head, locale, patch)?;
         self.put_head(head);
         Ok(())
     }
 
-    /// Record the working draft as a fixed revision with `message` (at most
-    /// 1,024 bytes) and return its number.
+    fn patch_variant(&self, head: &mut Head, locale: Locale, patch: Patch) -> Result<()> {
+        let variant = head
+            .variant_mut(locale)
+            .ok_or_else(|| Error::invalid("locale", "the entity has no such translation"))?;
+        patch.apply(&mut variant.draft)
+    }
+
+    /// Change the draft of the `locale` translation, starting it when there
+    /// is none: a new translation starts from the fields of the entity's
+    /// own draft, without a path, and records the revision of its own
+    /// locale it was translated from.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the entity does not exist, has 64 locales,
+    /// or the result breaks a rule of [`create`](Self::create).
+    pub fn translate(&mut self, rid: Rid, locale: Locale, patch: Patch) -> Result<()> {
+        let mut head = self.head(rid)?;
+        if head.variant(locale).is_none() {
+            let base = head.base();
+            let source = base.published.as_ref().map_or(0, |p| p.revision);
+            let draft = Body {
+                path: None,
+                fields: base.draft.fields.clone(),
+            };
+            head.add_variant(locale, draft, source)?;
+        }
+        self.patch_variant(&mut head, locale, patch)?;
+        self.put_head(head);
+        Ok(())
+    }
+
+    /// Record the working draft of the entity's own locale as a fixed
+    /// revision with `message` (at most 1,024 bytes) and return its number.
     ///
     /// # Errors
     ///
@@ -731,87 +863,155 @@ impl ContentTx<'_, '_> {
     /// too long.
     pub fn save_revision(&mut self, rid: Rid, message: &str) -> Result<u32> {
         let mut head = self.head(rid)?;
-        let n = self.record_revision(&mut head, message)?;
+        let locale = head.base().locale;
+        let n = self.record_revision(&mut head, locale, message)?;
         self.put_head(head);
         Ok(n)
     }
 
-    /// Publish the working draft and return the published revision: the
-    /// newest one when the draft has not changed since it, else a new one.
-    /// The entity is then served at the draft's path; a different path it
-    /// was published at before becomes a 301 to it.
+    /// Publish the working draft of the entity's own locale. See
+    /// [`publish_in`](Self::publish_in).
     ///
     /// # Errors
     ///
-    /// - [`Error::AlreadyExists`] (`what = "path"`) when another entity is
-    ///   served at the path.
-    /// - [`Error::Invalid`] when the entity does not exist or is trashed.
+    /// As [`publish_in`](Self::publish_in).
     pub fn publish(&mut self, rid: Rid) -> Result<u32> {
+        let locale = self.head(rid)?.base().locale;
+        self.publish_in(rid, &[locale])
+    }
+
+    /// Publish the working drafts of `locales` and return the newest
+    /// revision published. A locale whose draft has not changed since its
+    /// published revision keeps that revision; otherwise a new one is
+    /// recorded. Each locale is then served at its draft's path; a
+    /// different path it was published at before becomes a 301 to it.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::AlreadyExists`] (`what = "path"`) when another page is
+    ///   served at a path.
+    /// - [`Error::Invalid`] when the entity does not exist, is trashed, or
+    ///   has no translation for a locale.
+    pub fn publish_in(&mut self, rid: Rid, locales: &[Locale]) -> Result<u32> {
         let mut head = self.head(rid)?;
         if head.status == Status::Trashed {
             return Err(Error::invalid("entity", "is in the trash"));
         }
-        let unchanged = head.last_revision > 0
-            && self.revision_body(rid, head.last_revision)?.as_ref() == Some(&head.draft);
-        let n = if unchanged {
-            head.last_revision
-        } else {
-            self.record_revision(&mut head, "")?
-        };
-        let old = head.published.take().and_then(|p| p.path);
-        let now = now_ms();
-        head.published = Some(Published {
-            revision: n,
-            at_ms: now,
-            path: head.draft.path.clone(),
-        });
-        if head.first_published_ms == 0 {
-            head.first_published_ms = now;
+        let mut newest = 0;
+        for &locale in locales {
+            let variant = head
+                .variant(locale)
+                .ok_or_else(|| Error::invalid("locale", "the entity has no such translation"))?;
+            // The newest revision of the entity if it is this locale's,
+            // then the published one: either is kept when the draft has not
+            // changed since.
+            let mut keep = None;
+            let candidates = [
+                Some(head.last_revision).filter(|n| *n > 0),
+                variant.published.as_ref().map(|p| p.revision),
+            ];
+            for n in candidates.into_iter().flatten() {
+                if let Some((l, body)) = self.revision_body(rid, n)? {
+                    if l == locale && body == variant.draft {
+                        keep = Some(n);
+                        break;
+                    }
+                }
+            }
+            let n = match keep {
+                Some(n) => n,
+                None => self.record_revision(&mut head, locale, "")?,
+            };
+            let now = now_ms();
+            let Some(variant) = head.variant_mut(locale) else {
+                continue;
+            };
+            let old = variant.published.take().and_then(|p| p.path);
+            variant.published = Some(Published {
+                revision: n,
+                at_ms: now,
+                path: variant.draft.path.clone(),
+            });
+            if head.first_published_ms == 0 {
+                head.first_published_ms = now;
+            }
+            head.status = Status::Published;
+            self.route_published(&head, locale, old.as_deref())?;
+            newest = newest.max(n);
         }
-        head.status = Status::Published;
-        self.route_published(&head, old.as_deref())?;
         self.put_head(head);
-        Ok(n)
+        Ok(newest)
     }
 
-    /// Stop serving the entity: its path no longer resolves and
-    /// [`Content::get`] finds nothing. The draft and revisions stay; the
-    /// status becomes [`Status::Draft`]. Returns `false` when nothing was
-    /// published.
+    /// Stop serving the entity in every locale. See
+    /// [`unpublish_in`](Self::unpublish_in).
+    ///
+    /// # Errors
+    ///
+    /// As [`unpublish_in`](Self::unpublish_in).
+    pub fn unpublish(&mut self, rid: Rid) -> Result<bool> {
+        let locales: Vec<Locale> = self.head(rid)?.variants.iter().map(|v| v.locale).collect();
+        self.unpublish_in(rid, &locales)
+    }
+
+    /// Stop serving `locales` of the entity: their paths no longer resolve
+    /// and readers fall back to other locales. Drafts and revisions stay.
+    /// When no locale is left published the status becomes
+    /// [`Status::Draft`]. Returns `false` when none of them was published.
     ///
     /// # Errors
     ///
     /// [`Error::Invalid`] when the entity does not exist.
-    pub fn unpublish(&mut self, rid: Rid) -> Result<bool> {
+    pub fn unpublish_in(&mut self, rid: Rid, locales: &[Locale]) -> Result<bool> {
         let mut head = self.head(rid)?;
-        let Some(published) = head.published.take() else {
-            return Ok(false);
-        };
-        if let Some(path) = published.path {
-            self.put_route(&head.site, &path, None);
+        let site = head.site.clone();
+        let mut any = false;
+        for &locale in locales {
+            let Some(published) = head.variant_mut(locale).and_then(|v| v.published.take()) else {
+                continue;
+            };
+            any = true;
+            if let Some(path) = published.path {
+                self.put_route(&site, &path, None);
+            }
         }
-        head.status = Status::Draft;
-        self.put_head(head);
-        Ok(true)
+        if any {
+            self.put_head(head);
+        }
+        Ok(any)
     }
 
-    /// Serve the entity at `path` from now on: the draft's path changes,
-    /// and when the entity is published, it moves at once and its old path
+    /// Serve the entity's own locale at `path`. See
+    /// [`set_path_in`](Self::set_path_in).
+    ///
+    /// # Errors
+    ///
+    /// As [`set_path_in`](Self::set_path_in).
+    pub fn set_path(&mut self, rid: Rid, path: &str) -> Result<()> {
+        let locale = self.head(rid)?.base().locale;
+        self.set_path_in(rid, locale, path)
+    }
+
+    /// Serve `locale` of the entity at `path` from now on: its draft's path
+    /// changes, and when it is published, it moves at once and its old path
     /// becomes a 301 to it.
     ///
     /// # Errors
     ///
-    /// - [`Error::AlreadyExists`] (`what = "path"`) when another entity is
+    /// - [`Error::AlreadyExists`] (`what = "path"`) when another page is
     ///   served at the path.
-    /// - [`Error::Invalid`] when the entity does not exist or the path
-    ///   breaks its rule.
-    pub fn set_path(&mut self, rid: Rid, path: &str) -> Result<()> {
+    /// - [`Error::Invalid`] when the entity does not exist, has no such
+    ///   translation, or the path breaks its rule.
+    pub fn set_path_in(&mut self, rid: Rid, locale: Locale, path: &str) -> Result<()> {
         let mut head = self.head(rid)?;
-        Patch::new().path(path).apply(&mut head.draft)?;
-        self.check_free(&head.site, path, rid)?;
-        if let Some(published) = head.published.as_mut() {
-            let old = published.path.replace(path.to_owned());
-            self.route_published(&head, old.as_deref())?;
+        self.patch_variant(&mut head, locale, Patch::new().path(path))?;
+        self.check_free(&head.site, path, rid, locale)?;
+        let old = head
+            .variant_mut(locale)
+            .and_then(|v| v.published.as_mut())
+            .map(|p| p.path.replace(path.to_owned()));
+        if let Some(old) = old {
+            self.route_published(&head, locale, old.as_deref())?;
         }
         self.put_head(head);
         Ok(())
@@ -819,7 +1019,7 @@ impl ContentTx<'_, '_> {
 
     /// Set the entity's status to `status`: [`Status::Draft`] or
     /// [`Status::Review`] for an unpublished entity, or
-    /// [`Status::Archived`], which also unpublishes it.
+    /// [`Status::Archived`], which also unpublishes every locale.
     ///
     /// # Errors
     ///
@@ -832,7 +1032,7 @@ impl ContentTx<'_, '_> {
                 let _ = self.unpublish(rid)?;
             }
             Status::Draft | Status::Review => {
-                if self.head(rid)?.published.is_some() {
+                if self.head(rid)?.is_published() {
                     return Err(Error::invalid("status", "unpublish the entity first"));
                 }
             }
@@ -849,8 +1049,8 @@ impl ContentTx<'_, '_> {
         Ok(())
     }
 
-    /// Set who may see the entity. A published entity's route carries the
-    /// change at once.
+    /// Set who may see the entity. The routes of its published locales
+    /// carry the change at once.
     ///
     /// # Errors
     ///
@@ -858,15 +1058,31 @@ impl ContentTx<'_, '_> {
     pub fn set_visibility(&mut self, rid: Rid, visibility: Visibility) -> Result<()> {
         let mut head = self.head(rid)?;
         head.visibility = visibility;
-        if let Some(published) = &head.published {
-            if let Some(path) = &published.path {
-                let entry = page(&head, published.revision);
-                let path = path.clone();
-                self.put_route(&head.site.clone(), &path, Some(entry));
-            }
+        let site = head.site.clone();
+        let routes: Vec<(String, RouteEntry)> = head
+            .variants
+            .iter()
+            .filter_map(|v| {
+                let p = v.published.as_ref()?;
+                Some((p.path.clone()?, page(&head, v.locale, p.revision)))
+            })
+            .collect();
+        for (path, entry) in routes {
+            self.put_route(&site, &path, Some(entry));
         }
         self.put_head(head);
         Ok(())
+    }
+
+    /// Replace the space's settings: its default locale and fallback
+    /// chains. Entities keep the locales they were written in; readers who
+    /// ask for no locale get the new default.
+    pub fn set_space(&mut self, spec: SpaceSpec) {
+        self.staged
+            .ops
+            .retain(|op| !matches!(op, StagedOp::Space(_)));
+        self.staged.ops.push(StagedOp::Space(spec.encode()));
+        self.staged.writes.push(SPACE_CONFLICT_KEY.to_vec());
     }
 }
 
@@ -891,7 +1107,46 @@ impl Content<'_> {
     /// [`Error::Storage`] when the store cannot be read, [`Error::Corrupt`]
     /// when a stored record fails its checks.
     pub fn get(&self, rid: Rid) -> Result<Option<Entry>> {
-        self.engine().published_at(rid, Seq::MAX)
+        self.engine().published_in(rid, None, Seq::MAX)
+    }
+
+    /// The published revision of `rid` in `locale`, else along the space's
+    /// fallback chain for it, else in the entity's own locale;
+    /// [`Entry::fallback`] says when another locale was served.
+    ///
+    /// # Errors
+    ///
+    /// As [`get`](Self::get).
+    pub fn get_in(&self, rid: Rid, locale: Locale) -> Result<Option<Entry>> {
+        self.engine().published_in(rid, Some(locale), Seq::MAX)
+    }
+
+    /// The working draft of `rid` in `locale`, or `None` when it has no
+    /// such translation.
+    ///
+    /// # Errors
+    ///
+    /// As [`get`](Self::get).
+    pub fn draft_in(&self, rid: Rid, locale: Locale) -> Result<Option<Entry>> {
+        self.engine().draft_in(rid, Some(locale), Seq::MAX)
+    }
+
+    /// The space's settings.
+    pub fn space(&self) -> SpaceSpec {
+        self.engine().space()
+    }
+
+    /// Replace the space's settings in their own commit. See
+    /// [`ContentTx::set_space`].
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Database::commit`].
+    pub fn set_space(&self, spec: SpaceSpec) -> Result<()> {
+        self.db.commit(|tx| {
+            tx.content().set_space(spec.clone());
+            Ok(())
+        })
     }
 
     /// The working draft of `rid`, for editors, or `None` when the entity
@@ -901,10 +1156,7 @@ impl Content<'_> {
     ///
     /// As [`get`](Self::get).
     pub fn draft(&self, rid: Rid) -> Result<Option<Entry>> {
-        Ok(self
-            .engine()
-            .head(rid)?
-            .map(|head| head.entry(head.last_revision, head.draft.clone())))
+        self.engine().draft_in(rid, None, Seq::MAX)
     }
 
     /// Every revision of `rid`, oldest first.
@@ -926,7 +1178,9 @@ impl Content<'_> {
         let Some(head) = engine.head(rid)? else {
             return Ok(None);
         };
-        Ok(engine.revision(rid, n)?.map(|r| head.entry(n, r.body)))
+        Ok(engine
+            .revision(rid, n)?
+            .map(|r| head.entry(r.locale, n, r.body, None)))
     }
 
     /// The route at `path` on `site`, or `None`. Only published entities
@@ -996,7 +1250,7 @@ impl Content<'_> {
         let mut items = Vec::with_capacity(ids.len());
         for rid in ids {
             // Unpublished since the index was read: left out.
-            if let Some(entry) = engine.published_at(rid, Seq::MAX)? {
+            if let Some(entry) = engine.published_in(rid, None, Seq::MAX)? {
                 items.push(entry);
             }
         }
@@ -1094,7 +1348,17 @@ impl ContentRead<'_> {
     /// of [`Content::get`].
     pub fn get(&self, rid: Rid) -> Result<Option<Entry>> {
         let at = self.at()?;
-        self.engine.published_at(rid, at)
+        self.engine.published_in(rid, None, at)
+    }
+
+    /// As [`Content::get_in`], as of the snapshot.
+    ///
+    /// # Errors
+    ///
+    /// As [`get`](Self::get).
+    pub fn get_in(&self, rid: Rid, locale: Locale) -> Result<Option<Entry>> {
+        let at = self.at()?;
+        self.engine.published_in(rid, Some(locale), at)
     }
 
     /// The working draft of `rid` as of the snapshot, or `None`.
@@ -1104,10 +1368,7 @@ impl ContentRead<'_> {
     /// As [`get`](Self::get).
     pub fn draft(&self, rid: Rid) -> Result<Option<Entry>> {
         let at = self.at()?;
-        Ok(self
-            .engine
-            .head_at(rid, at)?
-            .map(|head| head.entry(head.last_revision, head.draft.clone())))
+        self.engine.draft_in(rid, None, at)
     }
 
     /// The route at `path` on `site` as of the snapshot, or `None`.
@@ -1194,7 +1455,7 @@ mod tests {
         }
         let engine = ContentEngine::open(&dir, 2).unwrap();
         assert!(engine.routes.get(crate::DEFAULT_SITE, "/old").is_some());
-        let entry = engine.published_at(rid, Seq::MAX).unwrap().unwrap();
+        let entry = engine.published_in(rid, None, Seq::MAX).unwrap().unwrap();
         assert_eq!(entry.status(), Status::Published);
         assert_eq!(entry.revision(), 1);
         assert_eq!(entry.field("title").and_then(|v| v.as_text()), Some("Old"));

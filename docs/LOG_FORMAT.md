@@ -206,6 +206,7 @@ an Argon2id string in the PHC format.
 | 3 | store a revision | `rid [16]`, `number u32`, `revision bytes32` |
 | 4 | set a route | `site str16`, `path str16`, `route bytes16` |
 | 5 | remove a route | `site str16`, `path str16` |
+| 6 | replace the space's settings | `settings bytes16` (as stored, see `FILE_FORMATS.md`) |
 
 Heads, revisions, and routes are the records stored in the content store; see
 [FILE_FORMATS.md](./FILE_FORMATS.md#content-store-contentstore). Staging

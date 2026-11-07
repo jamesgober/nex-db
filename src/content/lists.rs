@@ -206,9 +206,9 @@ impl ListIndex {
                 let _ = inner.rows.remove(&row);
             }
         }
-        let Some(published) = &head.published else {
+        if !head.is_published() {
             return;
-        };
+        }
         let next = inner.groups.len() as u32;
         let group = *inner
             .groups
@@ -217,7 +217,12 @@ impl ListIndex {
         let rid = *head.rid.as_bytes();
         let rows = [
             (group, ORDER_LATEST, u64::MAX - head.first_published_ms, rid),
-            (group, ORDER_UPDATED, u64::MAX - published.at_ms, rid),
+            (
+                group,
+                ORDER_UPDATED,
+                u64::MAX - head.last_published_ms(),
+                rid,
+            ),
         ];
         for row in rows {
             let _ = inner.rows.insert(row);
@@ -265,10 +270,14 @@ mod tests {
 
     fn head(n: u8, first: u64, last: u64) -> Head {
         let mut head = Entity::new("post")
-            .into_head(Rid::from_bytes([n; 16]), 0)
+            .into_head(
+                Rid::from_bytes([n; 16]),
+                0,
+                crate::content::locale::Locale::EN,
+            )
             .unwrap();
         head.first_published_ms = first;
-        head.published = Some(Published {
+        head.variants[0].published = Some(Published {
             revision: 1,
             at_ms: last,
             path: None,
@@ -297,7 +306,7 @@ mod tests {
         assert!(after.is_none());
 
         let mut gone = head(2, 20, 20);
-        gone.published = None;
+        gone.variants[0].published = None;
         index.update(&gone);
         assert_eq!(n(ids(&Listing::latest("post"))), [3, 1]);
     }

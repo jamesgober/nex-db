@@ -253,6 +253,9 @@ sessions.
 | `collection, 'e', rid [16]` | entity head (format 2), or a 0.1 to 0.3 entity record (format 1) |
 | `collection, 'v', rid [16], number u32 (big-endian)` | a fixed revision |
 | `collection, 'r', site, 0, path` | a route |
+| `collection, 'm'` | the space's settings: `format u8 (1)`, `default locale`, `chain count u8`, then per chain `locale`, `count u8`, and that many `locale` |
+
+A locale is stored as `length u8` and its ASCII tag (at most 15 bytes).
 
 The route index is rebuilt at open from the route records, and from the
 paths of format 1 entity records, which have none.
@@ -268,19 +271,26 @@ type str16
 site str16
 status u8                 1 draft, 2 review, 3 published, 4 archived, 5 trashed
 visibility u8             1 public, 2 members, 3 private
-last revision u32         0 before the first
-published revision u32    0 when nothing is published
-published ms u64
-published path str16      empty for none
+last revision u32         the newest of any locale; 0 before the first
 first published ms u64    0 when never published
-draft path str16          empty for none
-draft fields              as in the entity record below
+locale count u8           at least 1; the first is the entity's own locale
+locale count times:
+    locale
+    source revision u32   for a translation, the revision it was made from
+    published revision u32  0 when this locale is not published
+    published ms u64
+    published path str16  empty for none
+    draft path str16      empty for none
+    draft fields          as in the entity record below
 ```
+
+A format 1 record reads as an entity in `en`.
 
 ### Revision
 
 ```text
 format u8                 1
+locale
 at ms u64
 message str16             at most 1,024 bytes
 path str16                empty for none
@@ -297,6 +307,7 @@ target [16]               the entity a redirect points at
 entity [16]
 revision u32
 visibility u8             as in the head
+locale                    the locale the path serves
 ```
 
 ### Entity record (format 1, 0.1 to 0.3)

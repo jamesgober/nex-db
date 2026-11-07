@@ -345,3 +345,98 @@ fn test_listings_page_newest_first_and_follow_publishing() {
     assert!(Cursor::parse("not a cursor").is_err());
     let _ = DEFAULT_SITE;
 }
+
+#[test]
+fn test_translations_publish_per_locale_and_fall_back() {
+    use nex_db::{Locale, SpaceSpec};
+    let l = |t: &str| Locale::new(t).unwrap();
+    let (en, fr, fr_ca, de) = (l("en"), l("fr"), l("fr-CA"), l("de"));
+    let dir = TempDir::new("locales");
+    let rid = {
+        let db = Database::open(&dir.0).unwrap();
+        assert_eq!(db.content().space().default_locale(), Locale::EN);
+        db.content()
+            .set_space(SpaceSpec::new(en).fallback(fr_ca, &[fr]).unwrap())
+            .unwrap();
+        let rid = db
+            .content()
+            .create(Entity::new("page").field("title", "Hello").path("/hello"))
+            .unwrap();
+        assert_eq!(db.content().draft(rid).unwrap().unwrap().locale(), en);
+        let _ = db.content().publish(rid).unwrap();
+        db.commit(|tx| {
+            tx.content().translate(
+                rid,
+                fr,
+                Patch::new().set("title", "Bonjour").path("/fr/bonjour"),
+            )?;
+            tx.content().publish_in(rid, &[fr])
+        })
+        .unwrap();
+        // A translation cannot take a path another locale serves.
+        let taken = db.commit(|tx| {
+            tx.content()
+                .translate(rid, de, Patch::new().path("/hello"))?;
+            tx.content().publish_in(rid, &[de])
+        });
+        assert!(matches!(taken, Err(Error::AlreadyExists { what: "path" })));
+        rid
+    };
+    let db = Database::open(&dir.0).unwrap();
+    assert_eq!(db.content().space().default_locale(), en);
+    let in_fr = db.content().get_in(rid, fr).unwrap().unwrap();
+    assert_eq!(
+        in_fr.field("title").and_then(Value::as_text),
+        Some("Bonjour")
+    );
+    assert_eq!((in_fr.locale(), in_fr.fallback()), (fr, None));
+    // fr-CA has nothing: its chain gives fr.
+    let in_fr_ca = db.content().get_in(rid, fr_ca).unwrap().unwrap();
+    assert_eq!((in_fr_ca.locale(), in_fr_ca.fallback()), (fr, Some(fr_ca)));
+    // de has no chain: the entity's own locale.
+    let in_de = db.content().get_in(rid, de).unwrap().unwrap();
+    assert_eq!((in_de.locale(), in_de.fallback()), (en, Some(de)));
+    let route = db
+        .content()
+        .resolve(DEFAULT_SITE, "/fr/bonjour")
+        .unwrap()
+        .unwrap();
+    assert_eq!((route.entity(), route.locale()), (rid, fr));
+    assert_eq!(
+        db.content()
+            .resolve(DEFAULT_SITE, "/hello")
+            .unwrap()
+            .unwrap()
+            .locale(),
+        en
+    );
+    assert_eq!(
+        db.content()
+            .revisions(rid)
+            .unwrap()
+            .iter()
+            .map(|r| r.locale())
+            .collect::<Vec<_>>(),
+        [en, fr]
+    );
+
+    // Unpublishing one locale leaves the others served.
+    assert!(
+        db.commit(|tx| tx.content().unpublish_in(rid, &[fr]))
+            .unwrap()
+    );
+    assert!(
+        db.content()
+            .resolve(DEFAULT_SITE, "/fr/bonjour")
+            .unwrap()
+            .is_none()
+    );
+    let back = db.content().get_in(rid, fr).unwrap().unwrap();
+    assert_eq!(back.locale(), en);
+    assert_eq!(
+        db.content().draft(rid).unwrap().unwrap().status(),
+        Status::Published
+    );
+    assert!(db.content().draft_in(rid, fr).unwrap().is_some());
+    assert!(db.content().draft_in(rid, fr_ca).unwrap().is_none());
+}

@@ -2,6 +2,7 @@
 
 use std::{collections::HashSet, time::SystemTime};
 
+use super::locale::Locale;
 use crate::{
     core::codec::{Reader, Writer},
     error::{Error, Result},
@@ -19,9 +20,11 @@ const MAX_TEXT: usize = 1024 * 1024;
 
 /// Stored entity record format of 0.1 to 0.3: one published revision.
 const RECORD_FORMAT: u8 = 1;
-/// Stored entity record format from 0.4: the working draft and what is
-/// published.
+/// Stored entity record format from 0.4: per locale, the working draft
+/// and what is published.
 const HEAD_FORMAT: u8 = 2;
+/// Most locales one entity has.
+const MAX_VARIANTS: usize = 64;
 /// Format of a stored revision.
 const REVISION_FORMAT: u8 = 1;
 /// Format of a stored route.
@@ -165,6 +168,7 @@ pub struct Entity {
     kind: String,
     site: Option<String>,
     path: Option<String>,
+    locale: Option<Locale>,
     fields: Vec<(String, Value)>,
 }
 
@@ -176,8 +180,18 @@ impl Entity {
             kind: kind.into(),
             site: None,
             path: None,
+            locale: None,
             fields: Vec::new(),
         }
+    }
+
+    /// The locale the entity is written in (default: the space's default
+    /// locale). Translations into other locales are added with
+    /// [`translate`](crate::ContentTx::translate).
+    #[must_use]
+    pub fn locale(mut self, locale: Locale) -> Self {
+        self.locale = Some(locale);
+        self
     }
 
     /// Set the field `name` to `value`.
@@ -207,9 +221,14 @@ impl Entity {
         self.site.as_deref().unwrap_or(DEFAULT_SITE)
     }
 
-    /// Check every rule and return the new entity's head: a draft with
-    /// nothing published.
-    pub(crate) fn into_head(self, rid: Rid, created_ms: u64) -> Result<Head> {
+    /// Check every rule and return the new entity's head: a draft in its
+    /// locale (or `default_locale`) with nothing published.
+    pub(crate) fn into_head(
+        self,
+        rid: Rid,
+        created_ms: u64,
+        default_locale: Locale,
+    ) -> Result<Head> {
         check_name("type", &self.kind)?;
         let site = self.site_name().to_owned();
         if site.is_empty()
@@ -235,9 +254,13 @@ impl Entity {
             status: Status::Draft,
             visibility: Visibility::Public,
             last_revision: 0,
-            published: None,
             first_published_ms: 0,
-            draft: body,
+            variants: vec![Variant {
+                locale: self.locale.unwrap_or(default_locale),
+                draft: body,
+                source: 0,
+                published: None,
+            }],
         })
     }
 
@@ -493,7 +516,7 @@ impl Visibility {
     }
 }
 
-/// What is published of an entity.
+/// What is published of one locale of an entity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Published {
     pub(crate) revision: u32,
@@ -501,8 +524,20 @@ pub(crate) struct Published {
     pub(crate) path: Option<String>,
 }
 
-/// What the store keeps per entity: its identity, its working draft, and
-/// what is published (the published body is a stored revision).
+/// One locale of an entity: its working draft and what is published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Variant {
+    pub(crate) locale: Locale,
+    pub(crate) draft: Body,
+    /// For a translation, the revision of the entity's own locale it was
+    /// translated from; 0 for the entity's own locale.
+    pub(crate) source: u32,
+    pub(crate) published: Option<Published>,
+}
+
+/// What the store keeps per entity: its identity, and per locale its
+/// working draft and what is published (a published body is a stored
+/// revision). The first variant is the entity's own locale.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Head {
     pub(crate) rid: Rid,
@@ -512,14 +547,55 @@ pub(crate) struct Head {
     pub(crate) updated_ms: u64,
     pub(crate) status: Status,
     pub(crate) visibility: Visibility,
-    /// The newest revision number; 0 before the first.
+    /// The newest revision number of any locale; 0 before the first.
     pub(crate) last_revision: u32,
-    pub(crate) published: Option<Published>,
     pub(crate) first_published_ms: u64,
-    pub(crate) draft: Body,
+    pub(crate) variants: Vec<Variant>,
 }
 
 impl Head {
+    /// The entity's own locale.
+    pub(crate) fn base(&self) -> &Variant {
+        // A head always has its own locale: decode refuses one without.
+        &self.variants[0]
+    }
+
+    pub(crate) fn variant(&self, locale: Locale) -> Option<&Variant> {
+        self.variants.iter().find(|v| v.locale == locale)
+    }
+
+    pub(crate) fn variant_mut(&mut self, locale: Locale) -> Option<&mut Variant> {
+        self.variants.iter_mut().find(|v| v.locale == locale)
+    }
+
+    /// Add `locale` with `draft`, translated from revision `source`.
+    pub(crate) fn add_variant(&mut self, locale: Locale, draft: Body, source: u32) -> Result<()> {
+        if self.variants.len() >= MAX_VARIANTS {
+            return Err(Error::invalid("entity", "has 64 locales already"));
+        }
+        self.variants.push(Variant {
+            locale,
+            draft,
+            source,
+            published: None,
+        });
+        Ok(())
+    }
+
+    /// True when any locale is published.
+    pub(crate) fn is_published(&self) -> bool {
+        self.variants.iter().any(|v| v.published.is_some())
+    }
+
+    /// When any locale was last published; 0 when none is.
+    pub(crate) fn last_published_ms(&self) -> u64 {
+        self.variants
+            .iter()
+            .filter_map(|v| v.published.as_ref().map(|p| p.at_ms))
+            .max()
+            .unwrap_or(0)
+    }
+
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         let mut w = Writer::new(&mut out);
@@ -532,27 +608,32 @@ impl Head {
         w.u8(self.status.code());
         w.u8(self.visibility.code());
         w.u32(self.last_revision);
-        match &self.published {
-            Some(p) => {
-                w.u32(p.revision);
-                w.u64(p.at_ms);
-                w.str16(p.path.as_deref().unwrap_or(""))?;
-            }
-            None => {
-                w.u32(0);
-                w.u64(0);
-                w.str16("")?;
-            }
-        }
         w.u64(self.first_published_ms);
-        w.str16(self.draft.path.as_deref().unwrap_or(""))?;
-        write_fields(&mut w, &self.draft.fields)?;
+        w.u8(self.variants.len() as u8);
+        for v in &self.variants {
+            v.locale.write(&mut w);
+            w.u32(v.source);
+            match &v.published {
+                Some(p) => {
+                    w.u32(p.revision);
+                    w.u64(p.at_ms);
+                    w.str16(p.path.as_deref().unwrap_or(""))?;
+                }
+                None => {
+                    w.u32(0);
+                    w.u64(0);
+                    w.str16("")?;
+                }
+            }
+            w.str16(v.draft.path.as_deref().unwrap_or(""))?;
+            write_fields(&mut w, &v.draft.fields)?;
+        }
         Ok(out)
     }
 
-    /// Decode a stored head. A record from 0.1 to 0.3 reads as an entity
-    /// published at revision 1, its draft the same; its body is the
-    /// record's own (see [`legacy_body`]).
+    /// Decode a stored head. A record from 0.1 to 0.3 reads as an entity in
+    /// [`Locale::EN`] published at revision 1, its draft the same; its body
+    /// is the record's own (see [`is_legacy`](Self::is_legacy)).
     pub(crate) fn decode(bytes: &[u8], at: u64) -> Result<Head> {
         let mut r = Reader::new(bytes, "an entity record", at);
         match r.u8()? {
@@ -574,13 +655,17 @@ impl Head {
                     status: Status::Published,
                     visibility: Visibility::Public,
                     last_revision: revision,
-                    published: Some(Published {
-                        revision,
-                        at_ms: created_ms,
-                        path: path.clone(),
-                    }),
                     first_published_ms: created_ms,
-                    draft: Body { path, fields },
+                    variants: vec![Variant {
+                        locale: Locale::EN,
+                        published: Some(Published {
+                            revision,
+                            at_ms: created_ms,
+                            path: path.clone(),
+                        }),
+                        draft: Body { path, fields },
+                        source: 0,
+                    }],
                 })
             }
             HEAD_FORMAT => {
@@ -592,12 +677,34 @@ impl Head {
                 let status = Status::of(r.u8()?, at)?;
                 let visibility = Visibility::of(r.u8()?, at)?;
                 let last_revision = r.u32()?;
-                let revision = r.u32()?;
-                let published_ms = r.u64()?;
-                let published_path = Some(r.str16()?.to_owned()).filter(|p| !p.is_empty());
                 let first_published_ms = r.u64()?;
-                let draft_path = Some(r.str16()?.to_owned()).filter(|p| !p.is_empty());
-                let fields = read_fields(&mut r, at)?;
+                let count = r.u8()?;
+                if count == 0 {
+                    return Err(Error::corrupt("an entity without a locale", at));
+                }
+                let mut variants = Vec::with_capacity(usize::from(count));
+                for _ in 0..count {
+                    let locale = Locale::read(&mut r, at)?;
+                    let source = r.u32()?;
+                    let revision = r.u32()?;
+                    let published_ms = r.u64()?;
+                    let published_path = Some(r.str16()?.to_owned()).filter(|p| !p.is_empty());
+                    let draft_path = Some(r.str16()?.to_owned()).filter(|p| !p.is_empty());
+                    let fields = read_fields(&mut r, at)?;
+                    variants.push(Variant {
+                        locale,
+                        draft: Body {
+                            path: draft_path,
+                            fields,
+                        },
+                        source,
+                        published: (revision != 0).then_some(Published {
+                            revision,
+                            at_ms: published_ms,
+                            path: published_path,
+                        }),
+                    });
+                }
                 r.finish()?;
                 Ok(Head {
                     rid,
@@ -608,16 +715,8 @@ impl Head {
                     status,
                     visibility,
                     last_revision,
-                    published: (revision != 0).then_some(Published {
-                        revision,
-                        at_ms: published_ms,
-                        path: published_path,
-                    }),
                     first_published_ms,
-                    draft: Body {
-                        path: draft_path,
-                        fields,
-                    },
+                    variants,
                 })
             }
             _ => Err(Error::corrupt("an entity record format", at)),
@@ -630,8 +729,19 @@ impl Head {
         bytes.first() == Some(&RECORD_FORMAT)
     }
 
-    /// The entry a reader sees for `body` at `revision`.
-    pub(crate) fn entry(&self, revision: u32, body: Body) -> Entry {
+    /// The entry a reader sees for `body` of `locale` at `revision`;
+    /// `asked` is the locale the reader asked for, when another was served.
+    pub(crate) fn entry(
+        &self,
+        locale: Locale,
+        revision: u32,
+        body: Body,
+        asked: Option<Locale>,
+    ) -> Entry {
+        let published_ms = self
+            .variant(locale)
+            .and_then(|v| v.published.as_ref())
+            .map_or(0, |p| p.at_ms);
         Entry {
             rid: self.rid,
             kind: self.kind.clone(),
@@ -643,8 +753,10 @@ impl Head {
             fields: body.fields,
             status: self.status,
             visibility: self.visibility,
-            published_ms: self.published.as_ref().map_or(0, |p| p.at_ms),
+            published_ms,
             first_published_ms: self.first_published_ms,
+            locale,
+            fallback: asked.filter(|a| *a != locale),
         }
     }
 }
@@ -652,17 +764,19 @@ impl Head {
 /// A fixed revision: the body as it was, when, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Revision {
+    pub(crate) locale: Locale,
     pub(crate) at_ms: u64,
     pub(crate) message: String,
     pub(crate) body: Body,
 }
 
 impl Revision {
-    pub(crate) fn new(at_ms: u64, message: &str, body: Body) -> Result<Revision> {
+    pub(crate) fn new(locale: Locale, at_ms: u64, message: &str, body: Body) -> Result<Revision> {
         if message.len() > MAX_MESSAGE {
             return Err(Error::invalid("revision message", "at most 1024 bytes"));
         }
         Ok(Revision {
+            locale,
             at_ms,
             message: message.to_owned(),
             body,
@@ -673,6 +787,7 @@ impl Revision {
         let mut out = Vec::new();
         let mut w = Writer::new(&mut out);
         w.u8(REVISION_FORMAT);
+        self.locale.write(&mut w);
         w.u64(self.at_ms);
         w.str16(&self.message)?;
         w.str16(self.body.path.as_deref().unwrap_or(""))?;
@@ -685,12 +800,14 @@ impl Revision {
         if r.u8()? != REVISION_FORMAT {
             return Err(Error::corrupt("an entity revision format", at));
         }
+        let locale = Locale::read(&mut r, at)?;
         let at_ms = r.u64()?;
         let message = r.str16()?.to_owned();
         let path = Some(r.str16()?.to_owned()).filter(|p| !p.is_empty());
         let fields = read_fields(&mut r, at)?;
         r.finish()?;
         Ok(Revision {
+            locale,
             at_ms,
             message,
             body: Body { path, fields },
@@ -702,6 +819,7 @@ impl Revision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevisionInfo {
     pub(crate) number: u32,
+    pub(crate) locale: Locale,
     pub(crate) at_ms: u64,
     pub(crate) message: String,
 }
@@ -711,6 +829,12 @@ impl RevisionInfo {
     #[must_use]
     pub const fn number(&self) -> u32 {
         self.number
+    }
+
+    /// The locale it is in.
+    #[must_use]
+    pub const fn locale(&self) -> Locale {
+        self.locale
     }
 
     /// When it was recorded.
@@ -751,6 +875,7 @@ pub(crate) fn encode_route(entry: &RouteEntry) -> Vec<u8> {
     w.bytes(entry.entity.as_bytes());
     w.u32(entry.revision);
     w.u8(entry.visibility.code());
+    entry.locale.write(&mut w);
     out
 }
 
@@ -765,6 +890,7 @@ pub(crate) fn decode_route(bytes: &[u8], at: u64) -> Result<RouteEntry> {
     let entity = Rid::from_bytes(r.fixed()?);
     let revision = r.u32()?;
     let visibility = Visibility::of(r.u8()?, at)?;
+    let locale = Locale::read(&mut r, at)?;
     r.finish()?;
     let kind = match kind {
         1 => RouteKind::Page,
@@ -777,6 +903,7 @@ pub(crate) fn decode_route(bytes: &[u8], at: u64) -> Result<RouteEntry> {
         revision,
         kind,
         visibility,
+        locale,
     })
 }
 
@@ -813,9 +940,24 @@ pub struct Entry {
     visibility: Visibility,
     published_ms: u64,
     first_published_ms: u64,
+    locale: Locale,
+    fallback: Option<Locale>,
 }
 
 impl Entry {
+    /// The locale of this entry.
+    #[must_use]
+    pub const fn locale(&self) -> Locale {
+        self.locale
+    }
+
+    /// The locale asked for, when it had nothing published and this
+    /// entry's locale was served in its place.
+    #[must_use]
+    pub const fn fallback(&self) -> Option<Locale> {
+        self.fallback
+    }
+
     /// The entity's record id.
     #[must_use]
     pub const fn rid(&self) -> Rid {
@@ -916,6 +1058,7 @@ pub struct RouteEntry {
     pub(crate) revision: u32,
     pub(crate) kind: RouteKind,
     pub(crate) visibility: Visibility,
+    pub(crate) locale: Locale,
 }
 
 impl RouteEntry {
@@ -943,6 +1086,12 @@ impl RouteEntry {
     pub const fn visibility(&self) -> Visibility {
         self.visibility
     }
+
+    /// The locale the path serves.
+    #[must_use]
+    pub const fn locale(&self) -> Locale {
+        self.locale
+    }
 }
 
 #[cfg(test)]
@@ -964,17 +1113,22 @@ mod tests {
             .field("parent", rid())
             .site("example.com")
             .path("/u/ann");
-        let mut head = entity.into_head(rid(), 5).unwrap();
-        head.published = Some(Published {
+        let mut head = entity.into_head(rid(), 5, Locale::EN).unwrap();
+        head.variants[0].published = Some(Published {
             revision: 2,
             at_ms: 6,
             path: Some("/u/ann".into()),
         });
+        let fr = Locale::new("fr").unwrap();
+        head.add_variant(fr, head.variants[0].draft.clone(), 2)
+            .unwrap();
         head.last_revision = 3;
         head.first_published_ms = 4;
         let back = Head::decode(&head.encode().unwrap(), 0).unwrap();
         assert_eq!(back, head);
-        let entry = back.entry(2, back.draft.clone());
+        let entry = back.entry(Locale::EN, 2, back.base().draft.clone(), Some(fr));
+        assert_eq!(entry.fallback(), Some(fr));
+        assert_eq!(back.variant(fr).map(|v| v.source), Some(2));
         assert_eq!(entry.rid(), rid());
         assert_eq!(entry.kind(), "profile");
         assert_eq!(entry.revision(), 2);
@@ -1005,8 +1159,9 @@ mod tests {
         assert!(Head::is_legacy(&bytes));
         let head = Head::decode(&bytes, 0).unwrap();
         assert_eq!(head.status, Status::Published);
-        assert_eq!(head.published.as_ref().map(|p| p.revision), Some(1));
-        assert_eq!(head.draft.path.as_deref(), Some("/n"));
+        assert_eq!(head.base().published.as_ref().map(|p| p.revision), Some(1));
+        assert_eq!(head.base().draft.path.as_deref(), Some("/n"));
+        assert_eq!(head.base().locale, Locale::EN);
         assert_eq!(head.site, DEFAULT_SITE);
     }
 
@@ -1025,7 +1180,10 @@ mod tests {
         for entity in bad {
             let shown = format!("{entity:?}");
             assert!(
-                matches!(entity.into_head(rid(), 0), Err(Error::Invalid { .. })),
+                matches!(
+                    entity.into_head(rid(), 0, Locale::EN),
+                    Err(Error::Invalid { .. })
+                ),
                 "{shown}"
             );
         }
@@ -1058,6 +1216,7 @@ mod tests {
     #[test]
     fn test_revision_and_route_round_trip_and_truncations_are_corrupt() {
         let rev = Revision::new(
+            Locale::EN,
             9,
             "first",
             Body {
@@ -1084,10 +1243,14 @@ mod tests {
                 revision: 4,
                 kind,
                 visibility: Visibility::Members,
+                locale: Locale::EN,
             };
             assert_eq!(decode_route(&encode_route(&entry), 0).unwrap(), entry);
         }
-        let head = Entity::new("p").path("/x").into_head(rid(), 0).unwrap();
+        let head = Entity::new("p")
+            .path("/x")
+            .into_head(rid(), 0, Locale::EN)
+            .unwrap();
         let bytes = head.encode().unwrap();
         for len in 0..bytes.len() {
             assert!(Head::decode(&bytes[..len], 0).is_err(), "prefix {len}");

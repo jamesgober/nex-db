@@ -11,10 +11,13 @@ All notable changes to `nex-db` are documented in this file. The format is based
 - `Auth::account` and `Account`; `add_identifier` and `remove_identifier` (up to five identifiers per account).
 - Roles: `Role`, `RoleId`, `define_role`, `assign_roles`, `roles`, `role`, `role_named`, and `allowed`.
 - `set_password`: replaces the password and ends the account's sessions in the same commit.
+- Drafts and publishing: `save_draft` with `Patch`, `save_revision`, `publish`, `unpublish`, `set_path`, `set_status`, `set_visibility`; `Content::draft`, `revisions`, `revision`; `Status`, `Visibility`, `RevisionInfo`; `Entry::status`, `visibility`, `updated_at`, `published_at`, `first_published_at`.
+- `RouteKind::Redirect` (a moved entity's old path, 301) and `RouteKind::Gone`; `RouteEntry::visibility`.
 
 ### Changed
 
 - Account records are format 3 (further identifiers and roles); format 2 records still read.
+- `create` makes a draft: `get` and `resolve` find an entity only once it is published. Content sections are format 2; stores and logs written by 0.1 to 0.3 still read, their entities published at revision 1.
 
 ## [0.3.0] - 2026-11-07
 

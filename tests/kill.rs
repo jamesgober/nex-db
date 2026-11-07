@@ -71,12 +71,13 @@ fn kill_child() {
         let token = db
             .commit(|tx| {
                 let account = tx.auth().create_account(&identifier(i), &password)?;
-                let _ = tx.content().create(
+                let rid = tx.content().create(
                     Entity::new("profile")
                         .field("account", account)
                         .site(SITE)
                         .path(profile_path(i)),
                 )?;
+                let _ = tx.content().publish(rid)?;
                 tx.auth().issue_session(account, SessionSpec::web())
             })
             .unwrap();

@@ -250,11 +250,58 @@ sessions.
 
 | Key | Value |
 |---|---|
-| `collection, 'e', rid [16]` | entity record |
+| `collection, 'e', rid [16]` | entity head (format 2), or a 0.1 to 0.3 entity record (format 1) |
+| `collection, 'v', rid [16], number u32 (big-endian)` | a fixed revision |
+| `collection, 'r', site, 0, path` | a route |
 
-Routes are not stored: they are rebuilt from the entity records at open.
+The route index is rebuilt at open from the route records, and from the
+paths of format 1 entity records, which have none.
 
-### Entity record
+### Entity head (format 2)
+
+```text
+format u8                 2
+rid [16]
+created ms u64
+updated ms u64
+type str16
+site str16
+status u8                 1 draft, 2 review, 3 published, 4 archived, 5 trashed
+visibility u8             1 public, 2 members, 3 private
+last revision u32         0 before the first
+published revision u32    0 when nothing is published
+published ms u64
+published path str16      empty for none
+first published ms u64    0 when never published
+draft path str16          empty for none
+draft fields              as in the entity record below
+```
+
+### Revision
+
+```text
+format u8                 1
+at ms u64
+message str16             at most 1,024 bytes
+path str16                empty for none
+fields                    as in the entity record below
+```
+
+### Route
+
+```text
+format u8                 1
+kind u8                   1 page, 2 redirect, 3 gone
+status u16                the redirect's HTTP status; 0 otherwise
+target [16]               the entity a redirect points at
+entity [16]
+revision u32
+visibility u8             as in the head
+```
+
+### Entity record (format 1, 0.1 to 0.3)
+
+Read as an entity published at revision 1 whose draft is the same.
 
 ```text
 format u8                 1

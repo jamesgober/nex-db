@@ -46,11 +46,12 @@ fn populate(db: &Database, start: usize, n: usize) -> Vec<nex_db::Token> {
                 let account = tx
                     .auth()
                     .create_account(&format!("u{i}@example.com"), &password)?;
-                let _ = tx.content().create(
+                let rid = tx.content().create(
                     Entity::new("profile")
                         .field("account", account)
                         .path(format!("/u/{i}")),
                 )?;
+                let _ = tx.content().publish(rid)?;
                 tx.auth().issue_session(account, SessionSpec::web())
             })
             .unwrap()

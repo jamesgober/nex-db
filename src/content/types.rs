@@ -9,7 +9,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::entity::{Body, Head, Value};
+use super::{
+    entity::{Body, Head, Value},
+    locale::Locale,
+};
 use crate::{
     core::codec::{Reader, Writer},
     error::{Error, Result},
@@ -285,20 +288,22 @@ impl Types {
         Ok(())
     }
 
-    /// The unique keys `head`'s published values take.
-    pub(crate) fn unique_keys(&self, head: &Head) -> Vec<Vec<u8>> {
-        let Some(ty) = self.get(&head.kind) else {
+    /// True when type `kind` declares a unique field.
+    pub(crate) fn has_unique(&self, kind: &str) -> bool {
+        self.get(kind)
+            .is_some_and(|t| t.unique_fields().next().is_some())
+    }
+
+    /// The unique keys `body`, a body of an entity of `kind`, takes when it
+    /// is published.
+    pub(crate) fn unique_keys(&self, kind: &str, body: &Body) -> Vec<Vec<u8>> {
+        let Some(ty) = self.get(kind) else {
             return Vec::new();
         };
         let mut keys = Vec::new();
         for field in ty.unique_fields() {
-            for variant in head.variants.iter().filter(|v| v.published.is_some()) {
-                if let Some((_, value)) = variant.draft.fields.iter().find(|(n, _)| n == field) {
-                    let key = unique_key(&head.kind, field, value);
-                    if !keys.contains(&key) {
-                        keys.push(key);
-                    }
-                }
+            if let Some((_, value)) = body.fields.iter().find(|(n, _)| n == field) {
+                keys.push(unique_key(kind, field, value));
             }
         }
         keys
@@ -384,46 +389,78 @@ pub(crate) fn unique_key(kind: &str, field: &str, value: &Value) -> Vec<u8> {
     key
 }
 
+/// The unique keys one published locale of an entity holds: its locale,
+/// the revision they were read from, and the keys.
+type Held = (Locale, u32, Vec<Vec<u8>>);
+
 /// Derived indexes over the heads that types need: unique values of
-/// published entities, and the entity of each singleton type.
+/// published bodies, and the entity of each singleton type.
 #[derive(Debug, Default)]
 pub(crate) struct TypeIndex {
     unique: HashMap<Vec<u8>, Rid>,
-    /// Each entity's unique keys, to drop them when it changes.
-    held: HashMap<Rid, Vec<Vec<u8>>>,
+    /// Each entity's unique keys by published locale, to drop them when it
+    /// changes and to keep them while its published revision does not.
+    held: HashMap<Rid, Vec<Held>>,
     /// Entities by type, counted, with one of them.
     kinds: HashMap<String, (usize, Rid)>,
     known: HashSet<Rid>,
 }
 
 impl TypeIndex {
-    /// Place `head` as it now is.
-    pub(crate) fn update(&mut self, types: &Types, head: &Head) {
+    /// Place `head` as it now is. `published` reads the body of one of its
+    /// published revisions; it is called only for a type with a unique
+    /// field, and only for a locale whose published revision changed.
+    pub(crate) fn update(
+        &mut self,
+        types: &Types,
+        head: &Head,
+        mut published: impl FnMut(Locale, u32) -> Result<Body>,
+    ) -> Result<()> {
         if self.known.insert(head.rid) {
             let entry = self.kinds.entry(head.kind.clone()).or_insert((0, head.rid));
             entry.0 += 1;
         }
-        for key in self.held.remove(&head.rid).unwrap_or_default() {
-            if self.unique.get(&key) == Some(&head.rid) {
-                let _ = self.unique.remove(&key);
+        let old = self.held.remove(&head.rid).unwrap_or_default();
+        let mut next = Vec::new();
+        if types.has_unique(&head.kind) {
+            for variant in &head.variants {
+                let Some(p) = &variant.published else {
+                    continue;
+                };
+                let kept = old
+                    .iter()
+                    .find(|(l, n, _)| *l == variant.locale && *n == p.revision);
+                let keys = match kept {
+                    Some((_, _, keys)) => keys.clone(),
+                    None => types.unique_keys(&head.kind, &published(variant.locale, p.revision)?),
+                };
+                next.push((variant.locale, p.revision, keys));
             }
         }
-        let keys = types.unique_keys(head);
-        for key in &keys {
-            let _ = self.unique.insert(key.clone(), head.rid);
+        self.release(head.rid, old);
+        for (_, _, keys) in &next {
+            for key in keys {
+                let _ = self.unique.insert(key.clone(), head.rid);
+            }
         }
-        if !keys.is_empty() {
-            let _ = self.held.insert(head.rid, keys);
+        if !next.is_empty() {
+            let _ = self.held.insert(head.rid, next);
+        }
+        Ok(())
+    }
+
+    fn release(&mut self, rid: Rid, held: Vec<Held>) {
+        for key in held.into_iter().flat_map(|(_, _, keys)| keys) {
+            if self.unique.get(&key) == Some(&rid) {
+                let _ = self.unique.remove(&key);
+            }
         }
     }
 
     /// Forget `rid`: it was deleted.
     pub(crate) fn remove(&mut self, rid: Rid, kind: &str) {
-        for key in self.held.remove(&rid).unwrap_or_default() {
-            if self.unique.get(&key) == Some(&rid) {
-                let _ = self.unique.remove(&key);
-            }
-        }
+        let held = self.held.remove(&rid).unwrap_or_default();
+        self.release(rid, held);
         if self.known.remove(&rid) {
             if let Some(entry) = self.kinds.get_mut(kind) {
                 entry.0 = entry.0.saturating_sub(1);

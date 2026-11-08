@@ -512,9 +512,24 @@ fn test_types_check_kinds_unique_values_and_singletons() {
                 .define(Type::new("page").field("title", FieldType::Text).unique())
                 .is_err()
         );
+        // A draft edit leaves the published value taken.
+        db.content()
+            .save_draft(a, Patch::new().set("slug", "renamed"))
+            .unwrap();
+        assert!(db.content().publish(b).is_err());
         // Unpublishing frees the value.
         let _ = db.content().unpublish(a).unwrap();
         let _ = db.content().publish(b).unwrap();
+        // Publishing the edit takes the new value only.
+        let _ = db.content().publish(a).unwrap();
+        let d = db
+            .content()
+            .create(Entity::new("post").field("slug", "renamed"))
+            .unwrap();
+        assert!(db.content().publish(d).is_err());
+        db.content()
+            .save_draft(a, Patch::new().set("slug", "again"))
+            .unwrap();
     }
     let db = Database::open(&dir.0).unwrap();
     let post = db.content().type_named("post").unwrap();
@@ -533,6 +548,18 @@ fn test_types_check_kinds_unique_values_and_singletons() {
         .create(Entity::new("post").field("slug", "hello"))
         .unwrap();
     assert!(db.content().publish(c).is_err());
+    // After a reopen the index holds published values, not drafts: `a` is
+    // published as "renamed" with a draft of "again".
+    let e = db
+        .content()
+        .create(Entity::new("post").field("slug", "renamed"))
+        .unwrap();
+    assert!(db.content().publish(e).is_err());
+    let f = db
+        .content()
+        .create(Entity::new("post").field("slug", "again"))
+        .unwrap();
+    let _ = db.content().publish(f).unwrap();
 }
 
 #[test]

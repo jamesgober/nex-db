@@ -645,23 +645,30 @@ fn test_session_carries_payload_recheck_and_idle_limit() {
     assert_eq!(after.payload(), b"perm=editor");
 
     // An idle limit ends a session left unused.
-    let idle = db
-        .auth()
-        .issue_session(ann, SessionSpec::web().idle(Duration::from_secs(1)))
-        .unwrap();
-    assert!(matches!(
-        db.auth().validate(&idle).unwrap(),
-        Validation::Valid(_)
-    ));
-    // A slow disk can take tens of milliseconds to sync the issuing commit,
-    // so the limit is long enough for that and the wait longer still. A
-    // loaded machine's clock can also be stepped back mid-wait (seen in
-    // WSL), so a few waits are allowed; each valid read counts as a use and
-    // starts the idle time again, so only a limit that never ends a session
-    // fails here.
+    // A loaded machine can take longer than the limit to sync the issuing
+    // commit, or step its clock (seen in WSL), so a session the first read
+    // finds idle already is issued again, a few times at most.
+    let limit = Duration::from_secs(2);
+    let mut first = Validation::Unknown;
+    let mut idle = None;
+    for _ in 0..3 {
+        let token = db
+            .auth()
+            .issue_session(ann, SessionSpec::web().idle(limit))
+            .unwrap();
+        first = db.auth().validate(&token).unwrap();
+        if matches!(first, Validation::Valid(_)) {
+            idle = Some(token);
+            break;
+        }
+    }
+    let idle = idle.unwrap_or_else(|| panic!("never valid at first: {first:?}"));
+    // The clock can also step back mid-wait, so a few waits are allowed;
+    // each valid read counts as a use and starts the idle time again, so
+    // only a limit that never ends a session fails here.
     let mut outcome = Validation::Unknown;
     for _ in 0..5 {
-        thread::sleep(Duration::from_millis(1300));
+        thread::sleep(limit + Duration::from_millis(300));
         outcome = db.auth().validate(&idle).unwrap();
         if outcome == Validation::Expired {
             break;

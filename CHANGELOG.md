@@ -19,6 +19,7 @@ All notable changes to `nex-db` are documented in this file. The format is based
 - `Database::health` and `Health`; `Builder::observer`, `Observer`, `CommitInfo`, and `SecurityEvent`.
 - `trash`, `restore`, and `delete` (paths of a trashed or deleted entity answer `RouteKind::Gone`).
 - Types: `Content::define`, `type_named`, `Type` (`field`, `unique`, `singleton`), and `FieldType`.
+- The `metrics` feature: `metrics::Recorder`, an observer that reports into metrics-lib.
 - Session listing: `Auth::sessions`, `SessionInfo`, `SessionId`, and `revoke_session`.
 - API keys: `create_api_key`, `validate_api_key`, `revoke_api_key`, `ApiKey`, `ApiKeyId`, and `ApiKeyCheck`.
 - Recovery codes: `new_recovery_codes`, `use_recovery_code`, and `RecoveryCodes`.

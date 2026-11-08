@@ -855,7 +855,7 @@ assert_eq!(changed, [(rid, 0), (rid, 1)]);
 |---|---|---|
 | `db.health() -> Health` (`Ready`, `Recovering`, `ReadOnly { reason }`) | 0.4 | P1 |
 | `Observer` trait: `on_commit(&CommitInfo)` (position, attempts, time taken), `on_error(&Error)`, `on_security_event(&SecurityEvent)`; every method has an empty default; set with `Builder::observer`; not called when none is set | 0.4 | P1 |
-| `nex_db::metrics::Recorder` (feature `metrics`) | 0.4 | P2 |
+| `nex_db::metrics::Recorder` (feature `metrics`): `Recorder::new(&metrics_lib::Registry)`, an `Observer` for `Builder::observer`; counters `nex_db_commits_total`, `nex_db_commit_retries_total`, `nex_db_errors_total { code }`, `nex_db_security_events_total { kind }`, and the timer `nex_db_commit_seconds`; labels carry codes and kinds only | 0.4 | P2 |
 
 Security events (repeated failures, a lock-out, a revoked session presented
 again) always reach the observer, with ids and kinds only, never an

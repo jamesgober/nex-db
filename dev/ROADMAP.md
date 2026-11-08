@@ -72,7 +72,7 @@
 - [x] Named realms and spaces with `RealmPolicy` (from 0.3, `PLAN.md` D-087), and catalog locks (D-088).
   - Blocker recorded: lsm-db 1.1 scans materialize the whole range, so derived indexes stay in memory and are rebuilt at open; a lazy, bounded scan is requested from lsm-db.
 - Auth extras (FR-8). Metrics and health hooks.
-  - [x] Health and observers (`PLAN.md` D-073); `metrics` still to come.
+  - [x] Health and observers (`PLAN.md` D-073); the `metrics` feature (D-093).
   - [x] `account`, `add_identifier`, `remove_identifier` (from 0.3, `PLAN.md` D-066), roles (D-067), `set_password` (D-068).
   - [x] Single-use tokens (`PLAN.md` D-077).
   - [x] Session listing and `revoke_session` (`PLAN.md` D-089), API keys (D-090), recovery codes (D-091).

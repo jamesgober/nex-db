@@ -103,10 +103,13 @@ mod engine;
 mod error;
 mod feed;
 mod ids;
+#[cfg(feature = "auth")]
+#[cfg(feature = "metrics")]
+#[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
+pub mod metrics;
 mod observe;
 #[cfg(feature = "auth")]
 mod table;
-#[cfg(feature = "auth")]
 mod wheel;
 
 #[cfg(feature = "auth")]

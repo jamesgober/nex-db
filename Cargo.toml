@@ -53,6 +53,8 @@ default = ["auth", "content"]
 auth = ["dep:lsm-db", "dep:audit-trail", "crypt-io/kdf-argon2"]
 # The content engine: entities and routes.
 content = ["dep:lsm-db"]
+# An observer that reports into metrics-lib (`nex_db::metrics::Recorder`).
+metrics = ["dep:metrics-lib"]
 
 
 # DEPENDENCIES
@@ -75,6 +77,9 @@ lsm-db = { version = "1.1", default-features = false, features = ["std"], option
 # The auth audit chain. No third-party dependency with default features off;
 # hashed with keyed BLAKE3 through crypt-io.
 audit-trail = { version = "1.1", default-features = false, features = ["std"], optional = true }
+# The `metrics` feature's registry. No third-party dependency with only these
+# features.
+metrics-lib = { version = "2.1", default-features = false, features = ["count", "timer"], optional = true }
 
 
 # DEV DEPENDENCIES

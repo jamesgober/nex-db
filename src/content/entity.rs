@@ -26,10 +26,14 @@ const HEAD_FORMAT_2: u8 = 2;
 /// As [`HEAD_FORMAT`] without authors, parent, and order: builds before
 /// 0.4.0 was released. Read only.
 const HEAD_FORMAT_3: u8 = 3;
-/// Stored entity record format from 0.4: per locale, the working draft
-/// and what is published, with the entities the published body refers to;
-/// then the authors, the parent, and the order among its siblings.
-const HEAD_FORMAT: u8 = 4;
+/// As [`HEAD_FORMAT`] without schedules: builds before 0.4.0 was
+/// released. Read only.
+const HEAD_FORMAT_4: u8 = 4;
+/// Stored entity record format from 0.4: per locale, the working draft,
+/// what is published (with the entities the published body refers to), and
+/// its schedule; then the authors, the parent, and the order among its
+/// siblings.
+const HEAD_FORMAT: u8 = 5;
 /// Most authors one entity has.
 pub(crate) const MAX_AUTHORS: usize = 16;
 /// Most locales one entity has.
@@ -360,6 +364,7 @@ impl Entity {
                 draft: body,
                 source: 0,
                 published: None,
+                schedule: None,
             }],
             gone: Vec::new(),
         })
@@ -611,6 +616,37 @@ impl Body {
     }
 }
 
+/// What a schedule does when its time comes, for
+/// [`schedule`](crate::ContentTx::schedule).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Action {
+    /// Publish the locale's working draft, as
+    /// [`publish_in`](crate::ContentTx::publish_in) does.
+    Publish,
+    /// Stop serving the locale, as
+    /// [`unpublish_in`](crate::ContentTx::unpublish_in) does.
+    Unpublish,
+}
+
+impl Action {
+    pub(crate) fn code(self) -> u8 {
+        match self {
+            Action::Publish => 1,
+            Action::Unpublish => 2,
+        }
+    }
+
+    fn of(code: u8, at: u64) -> Result<Option<Action>> {
+        Ok(match code {
+            0 => None,
+            1 => Some(Action::Publish),
+            2 => Some(Action::Unpublish),
+            _ => return Err(Error::corrupt("an entity's schedule", at)),
+        })
+    }
+}
+
 /// Where an entity is in its life.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -709,6 +745,8 @@ pub(crate) struct Variant {
     /// translated from; 0 for the entity's own locale.
     pub(crate) source: u32,
     pub(crate) published: Option<Published>,
+    /// What happens to the locale at a time, in milliseconds.
+    pub(crate) schedule: Option<(Action, u64)>,
 }
 
 /// What the store keeps per entity: its identity, and per locale its
@@ -763,6 +801,7 @@ impl Head {
             draft,
             source,
             published: None,
+            schedule: None,
         });
         Ok(())
     }
@@ -832,6 +871,13 @@ impl Head {
             }
             w.str16(v.draft.path.as_deref().unwrap_or(""))?;
             write_fields(&mut w, &v.draft.fields)?;
+            match v.schedule {
+                Some((action, at_ms)) => {
+                    w.u8(action.code());
+                    w.u64(at_ms);
+                }
+                None => w.u8(0),
+            }
         }
         w.u16(self.gone.len() as u16);
         for (locale, path) in &self.gone {
@@ -888,6 +934,7 @@ impl Head {
                         }),
                         draft: Body { path, fields },
                         source: 0,
+                        schedule: None,
                     }],
                     gone: Vec::new(),
                     authors: Vec::new(),
@@ -896,7 +943,7 @@ impl Head {
                 }
                 .with_draft_refs())
             }
-            format @ (HEAD_FORMAT_2 | HEAD_FORMAT_3 | HEAD_FORMAT) => {
+            format @ (HEAD_FORMAT_2 | HEAD_FORMAT_3 | HEAD_FORMAT_4 | HEAD_FORMAT) => {
                 let rid = Rid::from_bytes(r.fixed()?);
                 let created_ms = r.u64()?;
                 let updated_ms = r.u64()?;
@@ -925,8 +972,17 @@ impl Head {
                     }
                     let draft_path = Some(r.str16()?.to_owned()).filter(|p| !p.is_empty());
                     let fields = read_fields(&mut r, at)?;
+                    let schedule = if format == HEAD_FORMAT {
+                        match Action::of(r.u8()?, at)? {
+                            Some(action) => Some((action, r.u64()?)),
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
                     variants.push(Variant {
                         locale,
+                        schedule,
                         draft: Body {
                             path: draft_path,
                             fields,
@@ -948,7 +1004,7 @@ impl Head {
                 let mut authors = Vec::new();
                 let mut parent = None;
                 let mut order = 0;
-                if format == HEAD_FORMAT {
+                if format == HEAD_FORMAT || format == HEAD_FORMAT_4 {
                     let count = usize::from(r.u8()?);
                     if count > MAX_AUTHORS {
                         return Err(Error::corrupt("an entity's authors", at));
@@ -1011,7 +1067,10 @@ impl Head {
     /// True for a record of a format whose references are in the store
     /// (format 3 on).
     pub(crate) fn is_current(bytes: &[u8]) -> bool {
-        matches!(bytes.first(), Some(&(HEAD_FORMAT_3 | HEAD_FORMAT)))
+        matches!(
+            bytes.first(),
+            Some(&(HEAD_FORMAT_3 | HEAD_FORMAT_4 | HEAD_FORMAT))
+        )
     }
 
     /// The entry a reader sees for `body` of `locale` at `revision`;
@@ -1027,7 +1086,9 @@ impl Head {
             .variant(locale)
             .and_then(|v| v.published.as_ref())
             .map_or(0, |p| p.at_ms);
+        let schedule = self.variant(locale).and_then(|v| v.schedule);
         Entry {
+            schedule,
             rid: self.rid,
             kind: self.kind.clone(),
             created_ms: self.created_ms,
@@ -1233,9 +1294,17 @@ pub struct Entry {
     authors: Vec<AccountId>,
     parent: Option<Rid>,
     order: i64,
+    schedule: Option<(Action, u64)>,
 }
 
 impl Entry {
+    /// What is scheduled for this entry's locale, and when.
+    #[must_use]
+    pub fn scheduled(&self) -> Option<(Action, SystemTime)> {
+        self.schedule
+            .map(|(action, at)| (action, crate::core::time_of(at)))
+    }
+
     /// The entity's authors, in order.
     #[must_use]
     pub fn authors(&self) -> &[AccountId] {
@@ -1437,6 +1506,7 @@ mod tests {
         head.authors = vec![account];
         head.parent = Some(Rid::from_bytes([4; 16]));
         head.order = -7;
+        head.variants[1].schedule = Some((Action::Unpublish, 99));
         head.first_published_ms = 4;
         let back = Head::decode(&head.encode().unwrap(), 0).unwrap();
         assert_eq!(back, head);

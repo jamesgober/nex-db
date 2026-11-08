@@ -125,8 +125,8 @@ pub use crate::auth::{
 pub use crate::content::{
     Content, ContentRead, ContentTx,
     entity::{
-        DEFAULT_SITE, Entity, Entry, Patch, RevisionInfo, RouteEntry, RouteKind, Status, Value,
-        Visibility,
+        Action, DEFAULT_SITE, Entity, Entry, Patch, RevisionInfo, RouteEntry, RouteKind, Status,
+        Value, Visibility,
     },
     lists::{Cursor, Listing, Page},
     locale::{Locale, SpaceSpec},

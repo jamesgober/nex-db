@@ -4,7 +4,7 @@
 //! [`Core`](crate::core::pipeline::Core); this module holds the typed engines
 //! and hands them to the core through the [`Registry`] contract.
 
-use std::{fmt, path::Path};
+use std::{fmt, path::Path, sync::Arc};
 
 #[cfg(feature = "auth")]
 use crate::auth::{Auth, AuthEngine, AuthRead, AuthStaged, AuthTx};
@@ -165,6 +165,17 @@ const DEFAULT_MAX_SESSIONS: usize = 1_000_000;
 /// own files (best effort; the commit log already holds them) and releases
 /// the directory.
 pub struct Database {
+    inner: Arc<Inner>,
+    /// True for the handle `open` returned. Other handles (the scheduler's)
+    /// neither stop the scheduler nor checkpoint when dropped.
+    owner: bool,
+    /// Fires scheduled publishing; stopped when the owner is dropped.
+    #[cfg(feature = "content")]
+    scheduler: Option<crate::content::schedule::Scheduler>,
+}
+
+/// What every handle of one open database shares.
+pub(crate) struct Inner {
     engines: Engines,
     core: Core,
     observers: Observers,
@@ -173,9 +184,9 @@ pub struct Database {
 impl fmt::Debug for Database {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Database")
-            .field("dir", &self.core.dir())
-            .field("visible", &self.core.visible())
-            .field("halted", &self.core.halted())
+            .field("dir", &self.inner.core.dir())
+            .field("visible", &self.inner.core.visible())
+            .field("halted", &self.inner.core.halted())
             .finish_non_exhaustive()
     }
 }
@@ -231,24 +242,48 @@ impl Database {
                 return Err(Error::corrupt("the catalog (default collections)", 0));
             }
         }
-        Ok(Database {
-            engines,
-            core,
-            observers: builder.observers,
-        })
+        #[cfg_attr(not(feature = "content"), allow(unused_mut))]
+        let mut db = Database {
+            inner: Arc::new(Inner {
+                engines,
+                core,
+                observers: builder.observers,
+            }),
+            owner: true,
+            #[cfg(feature = "content")]
+            scheduler: None,
+        };
+        #[cfg(feature = "content")]
+        {
+            db.scheduler = Some(crate::content::schedule::Scheduler::start(Arc::clone(
+                &db.inner,
+            ))?);
+        }
+        Ok(db)
+    }
+
+    /// Another handle of the database `inner` belongs to, for the database's
+    /// own threads.
+    #[cfg(feature = "content")]
+    pub(crate) fn handle(inner: Arc<Inner>) -> Database {
+        Database {
+            inner,
+            owner: false,
+            scheduler: None,
+        }
     }
 
     /// The directory the database lives in.
     #[must_use]
     pub fn path(&self) -> &Path {
-        self.core.dir()
+        self.inner.core.dir()
     }
 
     /// Whether the database serves writes: [`Health::ReadOnly`] after a
     /// failed write, until the process restarts.
     #[must_use]
     pub fn health(&self) -> Health {
-        if self.core.halted() {
+        if self.inner.core.halted() {
             Health::ReadOnly {
                 reason: "a write could not be made durable; restart to recover",
             }
@@ -259,14 +294,14 @@ impl Database {
 
     #[cfg_attr(not(feature = "auth"), allow(dead_code))]
     pub(crate) fn observers(&self) -> &Observers {
-        &self.observers
+        &self.inner.observers
     }
 
     /// The position of the last visible commit, to start a change feed
     /// from now.
     #[must_use]
     pub fn position(&self) -> Position {
-        Position(self.core.visible())
+        Position(self.inner.core.visible())
     }
 
     /// The changes committed after `from`, in order. See [`Feed`].
@@ -281,7 +316,7 @@ impl Database {
     }
 
     pub(crate) fn feed_log(&self) -> &FeedLog {
-        self.core.feed()
+        self.inner.core.feed()
     }
 
     /// The auth engine: sessions, accounts, passwords.
@@ -302,12 +337,12 @@ impl Database {
 
     #[cfg(feature = "auth")]
     pub(crate) fn auth_engine(&self) -> &AuthEngine {
-        &self.engines.auth
+        &self.inner.engines.auth
     }
 
     #[cfg(feature = "content")]
     pub(crate) fn content_engine(&self) -> &ContentEngine {
-        &self.engines.content
+        &self.inner.engines.content
     }
 
     /// Run `f` as one atomic commit across every engine it touches.
@@ -358,7 +393,7 @@ impl Database {
         let started = std::time::Instant::now();
         let result = self.commit_attempts(&mut f, started);
         if let Err(err) = &result {
-            self.observers.error(err);
+            self.inner.observers.error(err);
         }
         result
     }
@@ -368,13 +403,17 @@ impl Database {
         F: FnMut(&mut Transaction<'_>) -> Result<T>,
     {
         for attempt in 1..=ATTEMPTS {
-            let snapshot = self.core.snapshot();
+            let snapshot = self.inner.core.snapshot();
             let mut tx = Transaction::new(self, snapshot.seq());
             let value = f(&mut tx)?;
-            match self.core.commit(&self.engines, &snapshot, &tx.staged()) {
+            match self
+                .inner
+                .core
+                .commit(&self.inner.engines, &snapshot, &tx.staged())
+            {
                 Ok(seq) => {
                     if let Some(seq) = seq {
-                        self.observers.commit(&CommitInfo {
+                        self.inner.observers.commit(&CommitInfo {
                             position: Position(seq),
                             attempts: attempt as u32,
                             took: started.elapsed(),
@@ -384,7 +423,7 @@ impl Database {
                 }
                 Err(Attempt::Conflict) => {
                     drop(snapshot);
-                    self.core.wait_for_sequenced();
+                    self.inner.core.wait_for_sequenced();
                 }
                 Err(Attempt::Failed(err)) => return Err(err),
             }
@@ -430,7 +469,7 @@ impl Database {
     {
         let read = Read {
             db: self,
-            snapshot: self.core.snapshot(),
+            snapshot: self.inner.core.snapshot(),
         };
         f(&read)
     }
@@ -477,9 +516,23 @@ impl Read<'_> {
 
 impl Drop for Database {
     fn drop(&mut self) {
+        if !self.owner {
+            return;
+        }
+        #[cfg(feature = "content")]
+        if let Some(scheduler) = self.scheduler.take() {
+            scheduler.stop();
+        }
         // Best effort: the log holds every commit, so a failure here only
         // means a longer replay at the next open.
-        let _ = self.core.checkpoint(&self.engines, false);
+        let _ = self.inner.core.checkpoint(&self.inner.engines, false);
+    }
+}
+
+impl Inner {
+    #[cfg(feature = "content")]
+    pub(crate) fn content_engine(&self) -> &ContentEngine {
+        &self.engines.content
     }
 }
 

@@ -69,8 +69,9 @@ an engine the build leaves out refuses to open with `Error::Invalid`.
 The minimum supported Rust version is 1.85. nex-db has no async runtime. A
 commit blocks until the log sync that covers it; `hash_password`,
 `verify_password`, and `sign_in` block for one password hash; a feed read
-blocks until the next change. From 0.3 the database runs its own threads for
-scheduled work, expiry, and checkpoints; they sleep until work is due.
+blocks until the next change. From 0.4 the database runs one thread of its
+own (with the `content` feature), which sleeps until a scheduled publish or
+unpublish is due; expiry and checkpoints run on the threads that commit.
 
 ## Tier 1
 
@@ -605,7 +606,7 @@ assert_eq!(db.content().revisions(rid)?.len(), 2);
 | `save_revision(rid, message) -> Result<u32>` | P0 | |
 | `publish(rid) -> Result<u32>` | P0 | publishes the draft; returns the revision (a new one only when the draft changed) in the entity's own locale; `publish_in(rid, locales)` for others |
 | `unpublish(rid) -> Result<bool>` | P0 | every locale; the paths stop resolving; drafts and revisions stay; `unpublish_in(rid, locales)` for some |
-| `schedule(rid, Action::Publish \| Action::Unpublish, at)` | P1 | fired by the database at `at` |
+| `schedule(rid, Action::Publish \| Action::Unpublish, at)` | P1 | fired by the database within moments of `at` (at once when past), in its own commit; `schedule_in(rid, locale, ..)`, `cancel_schedule(rid)`, `cancel_schedule_in`; one schedule per locale, replaced by a new one; `Entry::scheduled()`; a publish takes the draft as it is then; one that cannot run (its path taken) is dropped and reported to the observer; trashing drops them |
 | `set_status(rid, Status)`, `set_visibility(rid, Visibility)` | P1 | |
 | `trash(rid)`, `restore(rid)`, `delete(rid)` | P1 | `trash` takes every locale down and leaves its paths `Gone` (410); `restore` brings it back as a draft and frees them; `delete` removes the entity and its revisions for good, its paths `Gone` until another entity takes them; with references, `delete` applies their rules |
 | `revert(rid, revision)` | P2 | copies an old revision into the draft |

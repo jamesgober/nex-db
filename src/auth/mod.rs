@@ -17,6 +17,7 @@ pub(crate) mod recovery;
 pub(crate) mod roles;
 mod sessions;
 pub(crate) mod token;
+pub(crate) mod totp;
 pub(crate) mod types;
 
 use std::{
@@ -102,6 +103,18 @@ const OP_SET_POLICY: u8 = 10;
 const OP_PUT_KEY: u8 = 11;
 /// Replace an account's recovery codes (`used` 0), or record one used (1).
 const OP_PUT_RECOVERY: u8 = 12;
+/// Store an account's TOTP record (`what`: 1 added, 2 confirmed, 3 a code
+/// used), or remove it (4, with an empty record).
+const OP_PUT_TOTP: u8 = 13;
+const TOTP_ADDED: u8 = 1;
+const TOTP_CONFIRMED: u8 = 2;
+const TOTP_USED: u8 = 3;
+const TOTP_REMOVED: u8 = 4;
+/// The payload of a second-factor challenge: a single-use token no
+/// [`Purpose`] makes, so only `verify_totp` redeems it.
+const CHALLENGE_PAYLOAD: [u8; 4] = [b'S', 0xF0, 0, 0];
+/// How long a second-factor challenge lasts: five minutes.
+const CHALLENGE_MS: u64 = 5 * 60 * 1000;
 
 /// What an account update changed, for the audit chain.
 const UPDATE_STANDING: u8 = 1;
@@ -238,6 +251,19 @@ fn recovery_key(collection: u32, account: AccountId) -> Vec<u8> {
 fn recovery_conflict(account: &AccountId) -> Vec<u8> {
     let mut key = Vec::with_capacity(17);
     key.push(b'R');
+    key.extend_from_slice(account.as_bytes());
+    key
+}
+
+fn totp_key(collection: u32, account: AccountId) -> Vec<u8> {
+    store_key(collection, b't', account.as_bytes())
+}
+
+/// Conflict key of an account's TOTP record.
+#[cfg_attr(not(feature = "mfa"), allow(dead_code))]
+fn totp_conflict(account: &AccountId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(17);
+    key.push(b'T');
     key.extend_from_slice(account.as_bytes());
     key
 }
@@ -503,6 +529,26 @@ impl AuthEngine {
         types::SessionId(id)
     }
 
+    /// `account`'s TOTP record, if it has one.
+    fn totp_record(&self, account: AccountId) -> Result<Option<totp::TotpRecord>> {
+        let key = totp_key(self.collection, account);
+        match self.accounts.get(&key)? {
+            Some(value) => Ok(Some(totp::TotpRecord::decode(&open_value(
+                &self.file_key,
+                &key,
+                &value,
+            )?)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// True when `account` must give a second factor to sign in. A build
+    /// without the `mfa` feature still answers, so it cannot sign such an
+    /// account in on the password alone.
+    fn needs_second_factor(&self, account: AccountId) -> Result<bool> {
+        Ok(self.totp_record(account)?.is_some_and(|r| r.confirmed))
+    }
+
     fn recovery_digest(&self, account: AccountId, symbols: &[u8]) -> [u8; 32] {
         let mut input = Zeroizing::new(Vec::with_capacity(16 + symbols.len()));
         input.extend_from_slice(account.as_bytes());
@@ -716,6 +762,21 @@ impl AuthEngine {
                 None => (*at_ms, "identifier.removed", "identifier".to_owned()),
             },
             Op::SetPolicy { at_ms, .. } => (*at_ms, "policy.changed", "roles".to_owned()),
+            Op::PutTotp {
+                account: a,
+                what,
+                at_ms,
+                ..
+            } => (
+                *at_ms,
+                match *what {
+                    TOTP_ADDED => "account.totp_added",
+                    TOTP_CONFIRMED => "account.totp_confirmed",
+                    TOTP_USED => "account.totp_used",
+                    _ => "account.totp_removed",
+                },
+                account(*a),
+            ),
             Op::PutRecovery {
                 account: a,
                 used,
@@ -775,7 +836,8 @@ impl AuthEngine {
             | Op::SetIdentifier { .. }
             | Op::SetPolicy { .. }
             | Op::PutKey { .. }
-            | Op::PutRecovery { .. } => {
+            | Op::PutRecovery { .. }
+            | Op::PutTotp { .. } => {
                 return None;
             }
         })
@@ -983,6 +1045,12 @@ enum Op<'a> {
         value: &'a [u8],
         at_ms: u64,
     },
+    PutTotp {
+        account: AccountId,
+        what: u8,
+        value: &'a [u8],
+        at_ms: u64,
+    },
 }
 
 fn decode_ops(seq: Seq, body: &[u8]) -> Result<Vec<Op<'_>>> {
@@ -1074,6 +1142,15 @@ fn decode_ops(seq: Seq, body: &[u8]) -> Result<Vec<Op<'_>>> {
                 }
             }
             OP_SET_POLICY => Op::SetPolicy {
+                value: r.bytes32()?,
+                at_ms: r.u64()?,
+            },
+            OP_PUT_TOTP => Op::PutTotp {
+                account: AccountId::from_bytes(r.fixed()?),
+                what: match r.u8()? {
+                    w @ TOTP_ADDED..=TOTP_REMOVED => w,
+                    _ => return Err(Error::corrupt("a TOTP operation", seq)),
+                },
                 value: r.bytes32()?,
                 at_ms: r.u64()?,
             },
@@ -1172,6 +1249,20 @@ impl Engine for AuthEngine {
                 if let Op::SetPolicy { value, .. } = op {
                     policy = Some(Policy::decode(value, seq)?);
                     batch.put(policy_key(self.collection), *value);
+                }
+                if let Op::PutTotp {
+                    account,
+                    what,
+                    value,
+                    ..
+                } = op
+                {
+                    let key = totp_key(self.collection, *account);
+                    if *what == TOTP_REMOVED {
+                        batch.delete(key);
+                    } else {
+                        batch.put(key, *value);
+                    }
                 }
                 if let Op::PutRecovery { account, value, .. } = op {
                     batch.put(recovery_key(self.collection, *account), *value);
@@ -1277,7 +1368,8 @@ impl Engine for AuthEngine {
                 | Op::SetIdentifier { .. }
                 | Op::SetPolicy { .. }
                 | Op::PutKey { .. }
-                | Op::PutRecovery { .. } => {}
+                | Op::PutRecovery { .. }
+                | Op::PutTotp { .. } => {}
             }
         }
         Ok(())
@@ -1366,6 +1458,14 @@ enum StagedOp {
         account: AccountId,
         used: bool,
         /// The digests, sealed while staging.
+        value: Vec<u8>,
+        at_ms: u64,
+    },
+    #[cfg_attr(not(feature = "mfa"), allow(dead_code))]
+    PutTotp {
+        account: AccountId,
+        what: u8,
+        /// The record, sealed while staging; empty when removed.
         value: Vec<u8>,
         at_ms: u64,
     },
@@ -1583,6 +1683,18 @@ fn write_ops(ops: &[StagedOp], out: &mut Vec<u8>) -> Result<()> {
             }
             StagedOp::SetPolicy { value, at_ms } => {
                 w.u8(OP_SET_POLICY);
+                w.bytes32(value)?;
+                w.u64(*at_ms);
+            }
+            StagedOp::PutTotp {
+                account,
+                what,
+                value,
+                at_ms,
+            } => {
+                w.u8(OP_PUT_TOTP);
+                w.bytes(account.as_bytes());
+                w.u8(*what);
                 w.bytes32(value)?;
                 w.u64(*at_ms);
             }
@@ -2088,6 +2200,25 @@ impl AuthTx<'_, '_> {
         account: AccountId,
         ttl: Duration,
     ) -> Result<Token> {
+        self.stage_single_use_payload(purpose.payload(), account, ttl)
+    }
+
+    /// Stage a second-factor challenge for `account`: a single-use token
+    /// only `verify_totp` redeems.
+    fn stage_challenge(&mut self, account: AccountId) -> Result<Token> {
+        self.stage_single_use_payload(
+            CHALLENGE_PAYLOAD,
+            account,
+            Duration::from_millis(CHALLENGE_MS),
+        )
+    }
+
+    fn stage_single_use_payload(
+        &mut self,
+        payload: [u8; 4],
+        account: AccountId,
+        ttl: Duration,
+    ) -> Result<Token> {
         let engine = self.staged.engine;
         let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
         if ttl_ms == 0 || ttl_ms > MAX_SINGLE_USE_MS {
@@ -2106,7 +2237,7 @@ impl AuthTx<'_, '_> {
             epoch: 0,
             idle_ms: sessions::SINGLE_USE_IDLE,
             recheck_ms: 0,
-            payload: Payload::new(&purpose.payload())?,
+            payload: Payload::new(&payload)?,
         };
         self.stage_digest(session, |random| engine.single_use_digest(random))
     }
@@ -2537,6 +2668,168 @@ impl AuthTx<'_, '_> {
             }
             _ => Ok(()),
         }
+    }
+
+    /// Start TOTP for `account`: a new secret, replacing any it had. Codes
+    /// are not asked for at sign-in until the account confirms one with
+    /// [`confirm_totp`](Self::confirm_totp).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the account does not exist.
+    #[cfg(feature = "mfa")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+    pub fn add_totp(&mut self, account: AccountId) -> Result<totp::TotpEnrollment> {
+        let engine = self.staged.engine;
+        if !self.staged.accounts.contains(&account) && !engine.account_exists(account)? {
+            return Err(Error::invalid("account", "no such account"));
+        }
+        let random =
+            crypt_io::generate_key().map_err(|e| Error::storage("drawing random bytes", e))?;
+        let mut secret = Zeroizing::new([0; totp::SECRET_LEN]);
+        secret.copy_from_slice(&random[..totp::SECRET_LEN]);
+        let record = totp::TotpRecord {
+            secret: secret.clone(),
+            confirmed: false,
+            last_step: 0,
+        };
+        self.stage_totp(account, Some(&record), TOTP_ADDED)?;
+        Ok(totp::TotpEnrollment { secret })
+    }
+
+    /// Confirm `account`'s TOTP secret with a code from the app: `true`
+    /// turns TOTP on, so sign-ins ask for a code from then on.
+    ///
+    /// # Errors
+    ///
+    /// Only storage errors.
+    #[cfg(feature = "mfa")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+    pub fn confirm_totp(&mut self, account: AccountId, code: &str) -> Result<bool> {
+        self.use_totp(account, code, false)
+    }
+
+    /// Check a TOTP code of `account`, which must have TOTP on: `true` once
+    /// per code. For an application that checks the password with
+    /// [`verify_password`](Auth::verify_password) and issues sessions
+    /// itself; [`Auth::verify_totp`] does both for a sign-in.
+    ///
+    /// # Errors
+    ///
+    /// Only storage errors.
+    #[cfg(feature = "mfa")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+    pub fn check_totp(&mut self, account: AccountId, code: &str) -> Result<bool> {
+        self.use_totp(account, code, true)
+    }
+
+    /// Accept `code` for `account`'s TOTP record (confirmed, when
+    /// `confirmed`), recording its step so it works once.
+    #[cfg(feature = "mfa")]
+    fn use_totp(&mut self, account: AccountId, code: &str, confirmed: bool) -> Result<bool> {
+        let engine = self.staged.engine;
+        self.staged.note(totp_conflict(&account));
+        let Some(record) = engine.totp_record(account)? else {
+            return Ok(false);
+        };
+        if record.confirmed != confirmed {
+            return Ok(false);
+        }
+        let Some(step) = record.accept(code, now_ms() / 1000) else {
+            // Concurrent uses of one code conflict on the record.
+            self.staged.writes.push(totp_conflict(&account));
+            return Ok(false);
+        };
+        let next = totp::TotpRecord {
+            secret: record.secret.clone(),
+            confirmed: true,
+            last_step: step,
+        };
+        let what = if confirmed { TOTP_USED } else { TOTP_CONFIRMED };
+        self.stage_totp(account, Some(&next), what)?;
+        Ok(true)
+    }
+
+    /// Turn TOTP off for `account`; `false` when it had none.
+    ///
+    /// # Errors
+    ///
+    /// Only storage errors.
+    #[cfg(feature = "mfa")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+    pub fn remove_totp(&mut self, account: AccountId) -> Result<bool> {
+        let engine = self.staged.engine;
+        self.staged.note(totp_conflict(&account));
+        if engine.totp_record(account)?.is_none() {
+            return Ok(false);
+        }
+        self.stage_totp(account, None, TOTP_REMOVED)?;
+        Ok(true)
+    }
+
+    #[cfg(feature = "mfa")]
+    fn stage_totp(
+        &mut self,
+        account: AccountId,
+        record: Option<&totp::TotpRecord>,
+        what: u8,
+    ) -> Result<()> {
+        let engine = self.staged.engine;
+        let value = match record {
+            Some(record) => seal_value(
+                &engine.file_key,
+                &totp_key(engine.collection, account),
+                &record.encode(),
+            )?,
+            None => Vec::new(),
+        };
+        self.staged.writes.push(totp_conflict(&account));
+        self.staged.ops.push(StagedOp::PutTotp {
+            account,
+            what,
+            value,
+            at_ms: now_ms(),
+        });
+        Ok(())
+    }
+
+    /// Complete a sign-in that answered [`SignIn::NeedsSecondFactor`]:
+    /// redeem `challenge` and issue a session, when `code` is a fresh TOTP
+    /// code of its account. `None` when the challenge is unknown, used, or
+    /// expired; `Some(false)` for a wrong code (the challenge stays).
+    #[cfg(feature = "mfa")]
+    fn complete_second_factor(
+        &mut self,
+        challenge: &str,
+        code: &str,
+        spec: SessionSpec,
+    ) -> Result<Option<(AccountId, Option<Token>)>> {
+        let engine = self.staged.engine;
+        let Some(random) = token::parse(challenge) else {
+            return Ok(None);
+        };
+        let digest = engine.single_use_digest(&random);
+        self.staged.note(session_key(&digest));
+        let account = match engine.sessions.get(&digest) {
+            Some(Slot::Live(session))
+                if now_ms() < session.expires_ms
+                    && session.payload.as_bytes() == CHALLENGE_PAYLOAD =>
+            {
+                session.account
+            }
+            _ => return Ok(None),
+        };
+        if !self.check_totp(account, code)? {
+            return Ok(Some((account, None)));
+        }
+        self.staged.writes.push(session_key(&digest));
+        self.staged.ops.push(StagedOp::RevokeSession {
+            digest,
+            reason: RevokeReason::Revoked,
+            at_ms: now_ms(),
+        });
+        let token = self.issue_session(account, spec)?;
+        Ok(Some((account, Some(token))))
     }
 
     /// Make ten new recovery codes for `account`, replacing any it had:
@@ -3067,9 +3360,114 @@ impl Auth<'_> {
                 let token = self.issue_session(account, spec)?;
                 Ok(SignIn::Success { account, token })
             }
+            Login::NeedsSecondFactor { account } => {
+                let challenge = self
+                    .db
+                    .commit(|tx| tx.auth_of(self.engine.collection).stage_challenge(account))?;
+                Ok(SignIn::NeedsSecondFactor { challenge })
+            }
             Login::LockedOut { until } => Ok(SignIn::LockedOut { until }),
             _ => Ok(SignIn::Failed),
         }
+    }
+
+    /// Complete a sign-in that answered [`SignIn::NeedsSecondFactor`] with
+    /// a code from the account's authenticator app: a session on success.
+    /// A wrong code counts as a failed sign-in (lock-out applies) and the
+    /// challenge stays for another try until it expires (five minutes);
+    /// an unknown, used, or expired challenge gives [`SignIn::Failed`].
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Database::commit`].
+    #[cfg(feature = "mfa")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+    pub fn verify_totp(
+        &self,
+        challenge: impl AsRef<str>,
+        code: &str,
+        spec: SessionSpec,
+    ) -> Result<SignIn> {
+        let engine = self.engine;
+        let challenge = challenge.as_ref();
+        let outcome = self.db.commit(|tx| {
+            tx.auth_of(engine.collection)
+                .complete_second_factor(challenge, code, spec)
+        })?;
+        match outcome {
+            Some((account, Some(token))) => {
+                engine.clear_failures(account);
+                Ok(SignIn::Success { account, token })
+            }
+            Some((account, None)) => {
+                let now = now_ms();
+                let realm = engine.realm();
+                if engine.count_failure(account, now) >= realm.lockout_failures {
+                    let until = time_of(now.saturating_add(realm.lockout_ms));
+                    self.db
+                        .commit(|tx| tx.auth_of(engine.collection).lock_out(account, until))?;
+                    engine.clear_failures(account);
+                    self.db
+                        .observers()
+                        .security(SecurityEvent::LockedOut { account });
+                }
+                self.db.observers().security(SecurityEvent::SignInFailed {
+                    account: Some(account),
+                });
+                Ok(SignIn::Failed)
+            }
+            None => Ok(SignIn::Failed),
+        }
+    }
+
+    /// Start TOTP in its own commit. See [`AuthTx::add_totp`].
+    ///
+    /// # Errors
+    ///
+    /// As [`AuthTx::add_totp`], plus the errors of [`Database::commit`].
+    #[cfg(feature = "mfa")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+    pub fn add_totp(&self, account: AccountId) -> Result<totp::TotpEnrollment> {
+        self.db
+            .commit(|tx| tx.auth_of(self.engine.collection).add_totp(account))
+    }
+
+    /// Confirm TOTP in its own commit. See [`AuthTx::confirm_totp`].
+    ///
+    /// # Errors
+    ///
+    /// As [`AuthTx::confirm_totp`], plus the errors of [`Database::commit`].
+    #[cfg(feature = "mfa")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+    pub fn confirm_totp(&self, account: AccountId, code: &str) -> Result<bool> {
+        self.db.commit(|tx| {
+            tx.auth_of(self.engine.collection)
+                .confirm_totp(account, code)
+        })
+    }
+
+    /// Check a TOTP code in its own commit. See [`AuthTx::check_totp`].
+    ///
+    /// # Errors
+    ///
+    /// As [`AuthTx::check_totp`], plus the errors of [`Database::commit`].
+    #[cfg(feature = "mfa")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+    pub fn check_totp(&self, account: AccountId, code: &str) -> Result<bool> {
+        self.db
+            .commit(|tx| tx.auth_of(self.engine.collection).check_totp(account, code))
+    }
+
+    /// Turn TOTP off in its own commit. See [`AuthTx::remove_totp`].
+    ///
+    /// # Errors
+    ///
+    /// As [`AuthTx::remove_totp`], plus the errors of [`Database::commit`].
+    #[cfg(feature = "mfa")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+    pub fn remove_totp(&self, account: AccountId) -> Result<bool> {
+        self.db
+            .commit(|tx| tx.auth_of(self.engine.collection).remove_totp(account))
     }
 
     /// Check `password` for `identifier` inside the engine without issuing
@@ -3089,6 +3487,9 @@ impl Auth<'_> {
         match engine.check(identifier, password)? {
             Checked::Verified(account) => {
                 engine.clear_failures(account);
+                if engine.needs_second_factor(account)? {
+                    return Ok(Login::NeedsSecondFactor { account });
+                }
                 Ok(Login::Verified(account))
             }
             Checked::Blocked(until) => {

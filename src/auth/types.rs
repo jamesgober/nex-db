@@ -436,6 +436,14 @@ pub enum SignIn {
         /// When the account may sign in again, if ever.
         until: Option<SystemTime>,
     },
+    /// The password matched and the account has a second factor on: no
+    /// session yet. Ask for a code and complete the sign-in with
+    /// `verify_totp` (feature `mfa`) within five minutes.
+    NeedsSecondFactor {
+        /// Carries the half-done sign-in to `verify_totp`: a single-use
+        /// token, not a session.
+        challenge: Token,
+    },
 }
 
 /// The outcome of [`verify_password`](crate::Auth::verify_password): a
@@ -451,6 +459,13 @@ pub enum Login {
     LockedOut {
         /// When the account may sign in again, if ever.
         until: Option<SystemTime>,
+    },
+    /// The password matched and the account has a second factor on: do not
+    /// treat it as signed in until a code checks (`check_totp`, feature
+    /// `mfa`).
+    NeedsSecondFactor {
+        /// The account whose password matched.
+        account: AccountId,
     },
 }
 

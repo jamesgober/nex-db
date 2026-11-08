@@ -1216,19 +1216,24 @@ fn test_reads_never_see_a_head_before_its_revision() {
         .unwrap();
     let _ = db.content().publish(rid).unwrap();
     let done = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(std::sync::Barrier::new(2));
     let reader = {
-        let (db, done) = (Arc::clone(&db), Arc::clone(&done));
+        let (db, done, started) = (Arc::clone(&db), Arc::clone(&done), Arc::clone(&started));
         std::thread::spawn(move || {
+            started.wait();
             let mut reads = 0u64;
-            while !done.load(Ordering::Acquire) {
-                // Every read either finds the entity or not; never an error.
+            loop {
+                // Every read finds the entity; never an error.
                 let entry = db.content().get(rid).unwrap().unwrap();
                 assert!(entry.field("n").is_some());
                 reads += 1;
+                if done.load(Ordering::Acquire) {
+                    return reads;
+                }
             }
-            reads
         })
     };
+    started.wait();
     for n in 1..200_i64 {
         db.commit(|tx| {
             tx.content().save_draft(rid, Patch::new().set("n", n))?;

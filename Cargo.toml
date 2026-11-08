@@ -55,9 +55,16 @@ auth = ["dep:lsm-db", "dep:audit-trail", "crypt-io/kdf-argon2"]
 content = ["dep:lsm-db"]
 # An observer that reports into metrics-lib (`nex_db::metrics::Recorder`).
 metrics = ["dep:metrics-lib"]
-# Second factors: TOTP (and passkeys, to come), through crypt-io's `otp`
-# module. Off by default: it builds crypt-io's C backend (aws-lc).
-mfa = ["auth", "crypt-io/otp"]
+# Second factors: TOTP and passkeys, through crypt-io's `otp` and `sign`
+# modules. Off by default: it builds crypt-io's C backend (AWS-LC).
+mfa = [
+    "auth",
+    "crypt-io/otp",
+    "crypt-io/hash-sha2",
+    "crypt-io/sign-p256",
+    "crypt-io/sign-ed25519",
+    "crypt-io/sign-rsa",
+]
 
 
 # DEPENDENCIES

@@ -188,6 +188,7 @@ The operations:
 | 10 | replace the realm's roles | `policy bytes32` (as stored, see `FILE_FORMATS.md`), `at ms u64` |
 | 11 | store an API key (made or revoked) | `id [16]`, `key digest [32]`, `account [16]`, `revoked u8`, `record bytes32` (sealed, as stored), `at ms u64` |
 | 12 | store an account's recovery codes | `account [16]`, `used u8` (0 new codes, 1 one used), `record bytes32` (sealed, as stored), `at ms u64` |
+| 14 | store a passkey (0.5) | `credential digest [32]`, `account [16]`, `what u8` (1 added, 2 used, 3 removed), `record bytes32` (sealed, as stored; empty when removed), `at ms u64` |
 | 13 | store an account's TOTP record (0.5) | `account [16]`, `what u8` (1 added, 2 confirmed, 3 a code used, 4 removed), `record bytes32` (sealed, as stored; empty when removed), `at ms u64` |
 
 A session is valid only while its epoch equals the account's current epoch

@@ -85,6 +85,7 @@
 - Split auth (FR-11), per-account keys and erasure (FR-12), search (FR-13), backup and restore (FR-14).
 - From 0.4: TOTP and passkeys (crypt-io 1.5).
   - [x] TOTP, feature `mfa` (`PLAN.md` D-094).
+  - [x] Passkeys, feature `mfa` (`PLAN.md` D-095).
 - **Exit:** every P0 and P1 item in `docs/API.md` exists.
 
 ## 0.6.0 Optimisation

@@ -8,6 +8,7 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 ### Added
 
+- Passkeys (feature `mfa`): `passkey_registration`, `add_passkey`, `passkey_sign_in`, `verify_passkey`, `passkeys`, `remove_passkey`; `RelyingParty`, `PasskeyChallenge`, `PasskeyRegistration`, `PasskeyAssertion`, `PasskeyId`, and `PasskeyInfo`.
 - TOTP second factors (feature `mfa`): `add_totp`, `confirm_totp`, `check_totp`, `remove_totp`, `verify_totp`, and `TotpEnrollment`; `SignIn::NeedsSecondFactor` and `Login::NeedsSecondFactor`.
 
 ### Changed

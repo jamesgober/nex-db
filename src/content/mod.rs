@@ -213,6 +213,10 @@ pub(crate) struct ContentEngine {
     /// Entity head versions kept for running snapshots.
     versions: Versions,
     conflicts: ConflictTable,
+    /// The latest publication time given out or stored: each publication
+    /// is later than it, so listings follow publication order even when
+    /// the system clock steps back.
+    published_ms: AtomicU64,
 }
 
 impl fmt::Debug for ContentEngine {
@@ -251,10 +255,12 @@ impl ContentEngine {
         // records: those are written now, from the heads.
         let mut links = Batch::new();
         let mut any_links = false;
+        let mut published_ms = 0;
         let start = entity_prefix(collection);
         for (_, value) in store.scan(start.clone()..after(&start))? {
             let head = Head::decode(&value, applied)?;
             lists.update(&head);
+            published_ms = published_ms.max(head.last_published_ms());
             let legacy = Head::is_legacy(&value);
             type_index.update(&types, &head, |locale, n| {
                 published_body(&store, collection, &head, legacy, locale, n)
@@ -299,7 +305,27 @@ impl ContentEngine {
             type_index: Mutex::new(type_index),
             versions: Versions::new(),
             conflicts: ConflictTable::new(),
+            published_ms: AtomicU64::new(published_ms),
         })
+    }
+
+    /// A publication time: now, or a millisecond after the latest one when
+    /// the clock reads earlier.
+    fn publish_ms(&self) -> u64 {
+        let now = now_ms();
+        let mut last = self.published_ms.load(Ordering::Acquire);
+        loop {
+            let next = now.max(last.saturating_add(1));
+            match self.published_ms.compare_exchange_weak(
+                last,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return next,
+                Err(seen) => last = seen,
+            }
+        }
     }
 
     /// The stored head bytes of `rid` as a snapshot at `at` sees them.
@@ -673,6 +699,9 @@ impl Engine for ContentEngine {
         }
         for (head, _) in &heads {
             self.lists.update(head);
+            let _ = self
+                .published_ms
+                .fetch_max(head.last_published_ms(), Ordering::AcqRel);
         }
         for (rid, kind) in &deleted {
             self.lists.remove(*rid);
@@ -1366,7 +1395,7 @@ impl ContentTx<'_, '_> {
                 Some(n) => n,
                 None => self.record_revision(&mut head, locale, "")?,
             };
-            let now = now_ms();
+            let now = self.staged.engine.publish_ms();
             let Some(variant) = head.variant_mut(locale) else {
                 continue;
             };
@@ -1706,7 +1735,7 @@ impl ContentTx<'_, '_> {
             let n = self.record_body(&mut head, locale, body, "")?;
             if let Some(p) = head.variant_mut(locale).and_then(|v| v.published.as_mut()) {
                 p.revision = n;
-                p.at_ms = now_ms();
+                p.at_ms = self.staged.engine.publish_ms();
                 p.refs = refs;
             }
             self.route_published(&head, locale, None)?;

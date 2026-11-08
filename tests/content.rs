@@ -283,8 +283,6 @@ fn test_listings_page_newest_first_and_follow_publishing() {
                 .unwrap();
             let _ = db.content().publish(rid).unwrap();
             posts.push(rid);
-            // Publication times one millisecond apart at least.
-            std::thread::sleep(std::time::Duration::from_millis(3));
         }
         // A draft and a page of another type are not listed.
         let _ = db

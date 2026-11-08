@@ -19,6 +19,7 @@ All notable changes to `nex-db` are documented in this file. The format is based
 - `Database::health` and `Health`; `Builder::observer`, `Observer`, `CommitInfo`, and `SecurityEvent`.
 - `trash`, `restore`, and `delete` (paths of a trashed or deleted entity answer `RouteKind::Gone`).
 - Types: `Content::define`, `type_named`, `Type` (`field`, `unique`, `singleton`), and `FieldType`.
+- Named realms and spaces: `Database::define_realm`, `auth_realm`, `set_realm_policy`, `define_space`, `content_space`, and `collections`; `RealmPolicy`, `CollectionInfo`, and `CollectionKind`; `Transaction::auth_realm` and `content_space`.
 - `Database::commit_serializable`, and `ContentTx::draft` to read inside a transaction.
 - Scheduled publishing: `Action`, `schedule`, `schedule_in`, `cancel_schedule`, `cancel_schedule_in`, and `Entry::scheduled`; a thread of the database fires them.
 - Terms: `Value::List`, `FieldType::List` and `FieldType::Terms`, `Type::terms` and `Type::taxonomy`, and `Listing::term`.
@@ -28,6 +29,7 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 ### Changed
 
+- A log record holds one section per collection (an engine may now have several); records written before still read.
 - A commit that loses to a conflict waits for the winning commit to be visible before it retries.
 - Entity heads are format 5 (the references of published bodies, authors, parent, order, and schedules); formats 2 to 4 still read.
 - Account records are format 3 (further identifiers and roles); format 2 records still read.

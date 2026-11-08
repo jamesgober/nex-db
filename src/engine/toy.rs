@@ -230,7 +230,7 @@ const TOY_A: EngineId = EngineId(62);
 const TOY_B: EngineId = EngineId(63);
 
 impl Registry for Toys {
-    fn get(&self, id: EngineId) -> Option<&dyn Engine> {
+    fn get(&self, id: EngineId, _collection: u32) -> Option<&dyn Engine> {
         match id {
             TOY_A => Some(&self.a),
             TOY_B => Some(&self.b),
@@ -502,7 +502,7 @@ fn test_toy_unhosted_engine_in_log_keeps_database_closed() {
     // Reopen hosting only toy A: the log names an engine this build lacks.
     struct OnlyA(ToyEngine);
     impl Registry for OnlyA {
-        fn get(&self, id: EngineId) -> Option<&dyn Engine> {
+        fn get(&self, id: EngineId, _collection: u32) -> Option<&dyn Engine> {
             (id == TOY_A).then_some(&self.0 as &dyn Engine)
         }
         fn each(&self, f: &mut dyn FnMut(&dyn Engine)) {

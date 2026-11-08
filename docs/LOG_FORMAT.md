@@ -63,7 +63,10 @@ offset  size  field
   It lets a reader see which engines a record touches without reading the
   sections, and it must match the sections exactly. Engine ids above 127 do
   not exist.
-- A record holds at most one section per engine.
+- A record holds at most one section per collection; an engine has one
+  section for each of its collections the commit touched (0.4: realms and
+  spaces besides the defaults). Records written before 0.4 hold one section
+  per engine.
 - No bytes follow the last section.
 
 ### Kinds
@@ -134,11 +137,14 @@ ends.
 | Code | Operation | Fields |
 |---|---|---|
 | 1 | define | `id u32`, `engine u16`, `name str16`, `definition bytes32` |
+| 2 | redefine (0.4) | `id u32`, `definition bytes32`: an existing collection's new definition |
 
 A define of an existing collection must repeat its id, engine, and definition
-exactly; anything else is refused. The definition (at most 64 KiB) belongs to
-the engine; the auth and content engines accept only an empty one in this
-version. Format 1 (without the definition) was never released.
+exactly; anything else is refused. A redefine changes only the definition of
+a collection that exists. The definition (at most 64 KiB) belongs to the
+engine: for a realm its policy, for a space the settings it starts with
+(see `FILE_FORMATS.md`), empty for the defaults. Format 1 (without the
+definition) was never released.
 
 The first record of a new database is a Catalog record that defines the
 realm `users` (id 1, auth) and the space `site` (id 2, content).

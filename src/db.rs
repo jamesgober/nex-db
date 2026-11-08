@@ -4,7 +4,11 @@
 //! [`Core`](crate::core::pipeline::Core); this module holds the typed engines
 //! and hands them to the core through the [`Registry`] contract.
 
-use std::{fmt, path::Path, sync::Arc};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, PoisonError},
+};
 
 #[cfg(feature = "auth")]
 use crate::auth::{Auth, AuthEngine, AuthRead, AuthStaged, AuthTx};
@@ -12,7 +16,7 @@ use crate::auth::{Auth, AuthEngine, AuthRead, AuthStaged, AuthTx};
 use crate::content::{Content, ContentEngine, ContentRead, ContentStaged, ContentTx};
 use crate::{
     core::{
-        catalog::{DEFAULT_REALM, DEFAULT_SPACE},
+        catalog::{Collection, DEFAULT_REALM, DEFAULT_SPACE, MAX_NAME},
         fs,
         keys::{self, Keys},
         pipeline::{ATTEMPTS, Attempt, CHECKPOINT_EVERY, Core, SnapshotGuard},
@@ -54,32 +58,177 @@ pub fn open(path: impl AsRef<Path>) -> Result<Database> {
     Database::open(path)
 }
 
-/// The engines this build hosts, apart from the catalog.
+/// Realms, and spaces, beyond the default one a database can hold.
+#[cfg_attr(not(any(feature = "auth", feature = "content")), allow(dead_code))]
+const MAX_EXTRA: usize = 15;
+
+/// The engines this build hosts, apart from the catalog: one per realm and
+/// one per space.
 struct Engines {
+    #[cfg_attr(not(any(feature = "auth", feature = "content")), allow(dead_code))]
+    dir: PathBuf,
+    #[cfg(feature = "auth")]
+    root: keys::RootKey,
+    #[cfg(feature = "auth")]
+    max_sessions: usize,
     #[cfg(feature = "auth")]
     auth: AuthEngine,
+    /// Named realms, in the order they were hosted. A slot is set once and
+    /// never moves, so a reference to its engine stays valid.
+    #[cfg(feature = "auth")]
+    realms: [std::sync::OnceLock<AuthEngine>; MAX_EXTRA],
     #[cfg(feature = "content")]
     content: ContentEngine,
+    #[cfg(feature = "content")]
+    spaces: [std::sync::OnceLock<ContentEngine>; MAX_EXTRA],
+    /// Shared by every space's schedules.
+    #[cfg(feature = "content")]
+    wake: Arc<crate::content::schedule::Wake>,
+    /// Hosting takes one collection at a time.
+    #[cfg_attr(not(any(feature = "auth", feature = "content")), allow(dead_code))]
+    hosting: Mutex<()>,
+}
+
+impl Engines {
+    #[cfg(feature = "auth")]
+    fn realm(&self, collection: u32) -> Option<&AuthEngine> {
+        if collection == DEFAULT_REALM.id {
+            return Some(&self.auth);
+        }
+        self.realms
+            .iter()
+            .filter_map(std::sync::OnceLock::get)
+            .find(|e| e.collection() == collection)
+    }
+
+    #[cfg(feature = "content")]
+    fn space(&self, collection: u32) -> Option<&ContentEngine> {
+        if collection == DEFAULT_SPACE.id {
+            return Some(&self.content);
+        }
+        self.spaces
+            .iter()
+            .filter_map(std::sync::OnceLock::get)
+            .find(|e| e.collection() == collection)
+    }
+}
+
+/// Put `engine` in the first free slot.
+#[cfg(any(feature = "auth", feature = "content"))]
+fn place<T>(slots: &[std::sync::OnceLock<T>; MAX_EXTRA], engine: T) -> Result<()> {
+    let slot = slots.iter().find(|s| s.get().is_none()).ok_or_else(|| {
+        Error::invalid(
+            "collections",
+            "at most 15 realms and 15 spaces besides the defaults",
+        )
+    })?;
+    slot.set(engine)
+        .map_err(|_| Error::invalid("collections", "hosted twice"))
 }
 
 impl Registry for Engines {
-    fn get(&self, id: EngineId) -> Option<&dyn Engine> {
+    fn get(&self, id: EngineId, collection: u32) -> Option<&dyn Engine> {
+        let _ = collection;
         match id {
             #[cfg(feature = "auth")]
-            EngineId::AUTH => Some(&self.auth),
+            EngineId::AUTH => self.realm(collection).map(|e| e as &dyn Engine),
             #[cfg(feature = "content")]
-            EngineId::CONTENT => Some(&self.content),
+            EngineId::CONTENT => self.space(collection).map(|e| e as &dyn Engine),
             _ => None,
+        }
+    }
+
+    fn host(&self, collection: &Collection) -> Result<()> {
+        let _hosting = self.hosting.lock().unwrap_or_else(PoisonError::into_inner);
+        match collection.engine {
+            #[cfg(feature = "auth")]
+            EngineId::AUTH => {
+                if let Some(engine) = self.realm(collection.id) {
+                    return engine.adopt(&collection.definition);
+                }
+                let dir = self.dir.join("auth").join("realms");
+                fs::create_dir(&dir)?;
+                let dir = dir.join(collection.id.to_string());
+                fs::create_dir(&dir)?;
+                let mut label = b"nex-db 2026 realm root ".to_vec();
+                label.extend_from_slice(&collection.id.to_be_bytes());
+                let engine = AuthEngine::open(
+                    &dir.join("accounts"),
+                    &self.root.sub(&label),
+                    collection.id,
+                    self.max_sessions,
+                )?;
+                engine.adopt(&collection.definition)?;
+                place(&self.realms, engine)
+            }
+            #[cfg(feature = "content")]
+            EngineId::CONTENT => {
+                if let Some(engine) = self.space(collection.id) {
+                    return engine.adopt(&collection.definition);
+                }
+                let dir = self.dir.join("content").join("spaces");
+                fs::create_dir(&dir)?;
+                let dir = dir.join(collection.id.to_string());
+                fs::create_dir(&dir)?;
+                let engine =
+                    ContentEngine::open(&dir.join("store"), collection.id, Arc::clone(&self.wake))?;
+                engine.adopt(&collection.definition)?;
+                place(&self.spaces, engine)
+            }
+            _ => Ok(()),
         }
     }
 
     fn each(&self, f: &mut dyn FnMut(&dyn Engine)) {
         #[cfg(feature = "auth")]
-        f(&self.auth);
+        {
+            f(&self.auth);
+            for engine in self.realms.iter().filter_map(std::sync::OnceLock::get) {
+                f(engine);
+            }
+        }
         #[cfg(feature = "content")]
-        f(&self.content);
+        {
+            f(&self.content);
+            for engine in self.spaces.iter().filter_map(std::sync::OnceLock::get) {
+                f(engine);
+            }
+        }
         let _ = f;
     }
+}
+
+/// A collection, as [`Database::collections`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionInfo {
+    name: String,
+    kind: CollectionKind,
+}
+
+impl CollectionInfo {
+    /// The collection's name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// What it holds.
+    #[must_use]
+    pub const fn kind(&self) -> CollectionKind {
+        self.kind
+    }
+}
+
+/// What a collection holds.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CollectionKind {
+    /// A realm: accounts and sessions.
+    Realm,
+    /// A space: content.
+    Space,
+    /// An engine this build does not name.
+    Other,
 }
 
 /// Opens a database with settings other than the defaults. Made by
@@ -224,7 +373,10 @@ impl Database {
         #[cfg_attr(not(feature = "auth"), allow(unused_variables))]
         let root = keys::root_key(&builder.keys, &auth_dir, new_database)?;
 
+        #[cfg(feature = "content")]
+        let wake = Arc::new(crate::content::schedule::Wake::default());
         let engines = Engines {
+            dir: dir.clone(),
             #[cfg(feature = "auth")]
             auth: AuthEngine::open(
                 &auth_dir.join("accounts"),
@@ -232,13 +384,36 @@ impl Database {
                 DEFAULT_REALM.id,
                 builder.max_sessions,
             )?,
+            #[cfg(feature = "auth")]
+            root,
+            #[cfg(feature = "auth")]
+            max_sessions: builder.max_sessions,
+            #[cfg(feature = "auth")]
+            realms: [const { std::sync::OnceLock::new() }; MAX_EXTRA],
             #[cfg(feature = "content")]
-            content: ContentEngine::open(&dir.join("content").join("store"), DEFAULT_SPACE.id)?,
+            content: ContentEngine::open(
+                &dir.join("content").join("store"),
+                DEFAULT_SPACE.id,
+                Arc::clone(&wake),
+            )?,
+            #[cfg(feature = "content")]
+            spaces: [const { std::sync::OnceLock::new() }; MAX_EXTRA],
+            #[cfg(feature = "content")]
+            wake,
+            hosting: Mutex::new(()),
         };
+        // Collections the catalog already holds get their engines before
+        // the log replays into them; ones the log defines, as it replays.
+        for collection in core.catalog().collections() {
+            engines.host(&collection)?;
+        }
 
         core.recover(&engines, new_database, &[DEFAULT_REALM, DEFAULT_SPACE])?;
         for expected in [DEFAULT_REALM, DEFAULT_SPACE] {
-            if core.catalog().collection(expected.id) != Some(expected) {
+            // A default collection keeps its id, engine, and name; its
+            // definition (a realm's policy) may change.
+            let found = core.catalog().collection(expected.id);
+            if !found.is_some_and(|c| c.engine == expected.engine && c.name == expected.name) {
                 return Err(Error::corrupt("the catalog (default collections)", 0));
             }
         }
@@ -324,7 +499,10 @@ impl Database {
     #[cfg_attr(docsrs, doc(cfg(feature = "auth")))]
     #[must_use]
     pub fn auth(&self) -> Auth<'_> {
-        Auth { db: self }
+        Auth {
+            db: self,
+            engine: &self.inner.engines.auth,
+        }
     }
 
     /// The content engine: entities and routes.
@@ -332,12 +510,202 @@ impl Database {
     #[cfg_attr(docsrs, doc(cfg(feature = "content")))]
     #[must_use]
     pub fn content(&self) -> Content<'_> {
-        Content { db: self }
+        Content {
+            db: self,
+            engine: &self.inner.engines.content,
+        }
     }
 
     #[cfg(feature = "auth")]
     pub(crate) fn auth_engine(&self) -> &AuthEngine {
         &self.inner.engines.auth
+    }
+
+    /// The engine of realm `collection`; the default realm's when there is
+    /// none (callers pass ids of realms they found).
+    #[cfg(feature = "auth")]
+    pub(crate) fn realm_engine(&self, collection: u32) -> &AuthEngine {
+        self.inner
+            .engines
+            .realm(collection)
+            .unwrap_or(&self.inner.engines.auth)
+    }
+
+    /// The engine of space `collection`; the default space's when there is
+    /// none (callers pass ids of spaces they found).
+    #[cfg(feature = "content")]
+    pub(crate) fn space_engine(&self, collection: u32) -> &ContentEngine {
+        self.inner
+            .engines
+            .space(collection)
+            .unwrap_or(&self.inner.engines.content)
+    }
+
+    /// Every space, the default first.
+    #[cfg(feature = "content")]
+    pub(crate) fn spaces(&self) -> Vec<Content<'_>> {
+        std::iter::once(&self.inner.engines.content)
+            .chain(
+                self.inner
+                    .engines
+                    .spaces
+                    .iter()
+                    .filter_map(std::sync::OnceLock::get),
+            )
+            .map(|engine| Content { db: self, engine })
+            .collect()
+    }
+
+    #[cfg_attr(not(any(feature = "auth", feature = "content")), allow(dead_code))]
+    fn check_collection_name(name: &str) -> Result<()> {
+        if name.is_empty()
+            || name.len() > MAX_NAME
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(Error::invalid(
+                "collection name",
+                "must be 1 to 64 ASCII letters, digits, '-', or '_'",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Define a realm named `name`: a namespace of accounts and sessions of
+    /// its own, with its own keys, held apart from every other realm. See
+    /// [`auth_realm`](Self::auth_realm).
+    ///
+    /// ```no_run
+    /// # fn main() -> nex_db::Result<()> {
+    /// use nex_db::RealmPolicy;
+    /// let db = nex_db::open("data/site")?;
+    /// db.define_realm("staff", RealmPolicy::new().pending_verification())?;
+    /// let staff = db.auth_realm("staff")?;
+    /// # let _ = staff;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::AlreadyExists`] when a collection has that name.
+    /// - [`Error::Invalid`] when the name breaks its rule or the database
+    ///   holds 15 realms besides the default.
+    /// - [`Error::Storage`] as for any commit.
+    #[cfg(feature = "auth")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "auth")))]
+    pub fn define_realm(&self, name: &str, policy: crate::RealmPolicy) -> Result<()> {
+        Database::check_collection_name(name)?;
+        let _ = self.inner.core.define_collection(
+            &self.inner.engines,
+            EngineId::AUTH,
+            name,
+            &policy.encode(),
+        )?;
+        Ok(())
+    }
+
+    /// Replace the policy of realm `name` (`"users"` is the default
+    /// realm). It applies to sign-ins and sessions from now on; sessions
+    /// already issued keep their limits.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Invalid`] when there is no such realm.
+    /// - [`Error::Storage`] as for any commit.
+    #[cfg(feature = "auth")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "auth")))]
+    pub fn set_realm_policy(&self, name: &str, policy: crate::RealmPolicy) -> Result<()> {
+        let collection = self
+            .inner
+            .core
+            .catalog()
+            .named(name)
+            .filter(|c| c.engine == EngineId::AUTH)
+            .ok_or_else(|| Error::invalid("realm", "no such realm"))?;
+        self.inner
+            .core
+            .redefine_collection(&self.inner.engines, collection.id, &policy.encode())
+    }
+
+    /// The realm named `name` (`"users"` is the one [`auth`](Self::auth)
+    /// gives).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when there is no such realm.
+    #[cfg(feature = "auth")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "auth")))]
+    pub fn auth_realm(&self, name: &str) -> Result<Auth<'_>> {
+        let engine = self
+            .inner
+            .core
+            .catalog()
+            .named(name)
+            .filter(|c| c.engine == EngineId::AUTH)
+            .and_then(|c| self.inner.engines.realm(c.id))
+            .ok_or_else(|| Error::invalid("realm", "no such realm"))?;
+        Ok(Auth { db: self, engine })
+    }
+
+    /// Define a space named `name`: content of its own (entities, routes,
+    /// types), starting with `spec`'s settings. See
+    /// [`content_space`](Self::content_space).
+    ///
+    /// # Errors
+    ///
+    /// As [`define_realm`](Self::define_realm), for spaces.
+    #[cfg(feature = "content")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "content")))]
+    pub fn define_space(&self, name: &str, spec: crate::SpaceSpec) -> Result<()> {
+        Database::check_collection_name(name)?;
+        let _ = self.inner.core.define_collection(
+            &self.inner.engines,
+            EngineId::CONTENT,
+            name,
+            &spec.encode(),
+        )?;
+        Ok(())
+    }
+
+    /// The space named `name` (`"site"` is the one [`content`](Self::content)
+    /// gives).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when there is no such space.
+    #[cfg(feature = "content")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "content")))]
+    pub fn content_space(&self, name: &str) -> Result<Content<'_>> {
+        let engine = self
+            .inner
+            .core
+            .catalog()
+            .named(name)
+            .filter(|c| c.engine == EngineId::CONTENT)
+            .and_then(|c| self.inner.engines.space(c.id))
+            .ok_or_else(|| Error::invalid("space", "no such space"))?;
+        Ok(Content { db: self, engine })
+    }
+
+    /// Every collection: realms and spaces, by name.
+    #[must_use]
+    pub fn collections(&self) -> Vec<CollectionInfo> {
+        self.inner
+            .core
+            .catalog()
+            .collections()
+            .into_iter()
+            .map(|c| CollectionInfo {
+                name: c.name.into_owned(),
+                kind: match c.engine {
+                    EngineId::AUTH => CollectionKind::Realm,
+                    EngineId::CONTENT => CollectionKind::Space,
+                    _ => CollectionKind::Other,
+                },
+            })
+            .collect()
     }
 
     #[cfg(feature = "content")]
@@ -597,10 +965,12 @@ pub struct Transaction<'db> {
     /// What the closure reads is checked too.
     #[cfg_attr(not(any(feature = "auth", feature = "content")), allow(dead_code))]
     serializable: bool,
+    /// One part per realm touched.
     #[cfg(feature = "auth")]
-    auth: Option<AuthStaged<'db>>,
+    auth: Vec<AuthStaged<'db>>,
+    /// One part per space touched.
     #[cfg(feature = "content")]
-    content: Option<ContentStaged<'db>>,
+    content: Vec<ContentStaged<'db>>,
 }
 
 impl fmt::Debug for Transaction<'_> {
@@ -618,9 +988,9 @@ impl<'db> Transaction<'db> {
             snapshot,
             serializable,
             #[cfg(feature = "auth")]
-            auth: None,
+            auth: Vec::new(),
             #[cfg(feature = "content")]
-            content: None,
+            content: Vec::new(),
         }
     }
 
@@ -628,12 +998,39 @@ impl<'db> Transaction<'db> {
     #[cfg(feature = "auth")]
     #[cfg_attr(docsrs, doc(cfg(feature = "auth")))]
     pub fn auth(&mut self) -> AuthTx<'_, 'db> {
+        self.auth_of(DEFAULT_REALM.id)
+    }
+
+    /// Auth operations of realm `name` in this transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when there is no such realm.
+    #[cfg(feature = "auth")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "auth")))]
+    pub fn auth_realm(&mut self, name: &str) -> Result<AuthTx<'_, 'db>> {
+        let id = self.db.auth_realm(name)?.collection();
+        Ok(self.auth_of(id))
+    }
+
+    #[cfg(feature = "auth")]
+    pub(crate) fn auth_of(&mut self, collection: u32) -> AuthTx<'_, 'db> {
         let db = self.db;
-        let serializable = self.serializable;
+        let engine = db.realm_engine(collection);
+        let at = match self
+            .auth
+            .iter()
+            .position(|s| s.collection() == engine.collection())
+        {
+            Some(at) => at,
+            None => {
+                self.auth
+                    .push(AuthStaged::new(engine).serializable(self.serializable));
+                self.auth.len() - 1
+            }
+        };
         AuthTx {
-            staged: self.auth.get_or_insert_with(|| {
-                AuthStaged::new(db.auth_engine()).serializable(serializable)
-            }),
+            staged: &mut self.auth[at],
         }
     }
 
@@ -641,12 +1038,39 @@ impl<'db> Transaction<'db> {
     #[cfg(feature = "content")]
     #[cfg_attr(docsrs, doc(cfg(feature = "content")))]
     pub fn content(&mut self) -> ContentTx<'_, 'db> {
+        self.content_of(DEFAULT_SPACE.id)
+    }
+
+    /// Content operations of space `name` in this transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when there is no such space.
+    #[cfg(feature = "content")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "content")))]
+    pub fn content_space(&mut self, name: &str) -> Result<ContentTx<'_, 'db>> {
+        let id = self.db.content_space(name)?.collection();
+        Ok(self.content_of(id))
+    }
+
+    #[cfg(feature = "content")]
+    pub(crate) fn content_of(&mut self, collection: u32) -> ContentTx<'_, 'db> {
         let db = self.db;
-        let serializable = self.serializable;
+        let engine = db.space_engine(collection);
+        let at = match self
+            .content
+            .iter()
+            .position(|s| s.collection() == engine.collection())
+        {
+            Some(at) => at,
+            None => {
+                self.content
+                    .push(ContentStaged::new(engine).serializable(self.serializable));
+                self.content.len() - 1
+            }
+        };
         ContentTx {
-            staged: self.content.get_or_insert_with(|| {
-                ContentStaged::new(db.content_engine()).serializable(serializable)
-            }),
+            staged: &mut self.content[at],
         }
     }
 
@@ -655,11 +1079,11 @@ impl<'db> Transaction<'db> {
         #[allow(unused_mut)]
         let mut staged: Vec<&dyn Staged> = Vec::new();
         #[cfg(feature = "auth")]
-        if let Some(work) = &self.auth {
+        for work in &self.auth {
             staged.push(work);
         }
         #[cfg(feature = "content")]
-        if let Some(work) = &self.content {
+        for work in &self.content {
             staged.push(work);
         }
         staged

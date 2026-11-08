@@ -41,10 +41,21 @@ length, then the bytes).
 │   ├─ key.check         a check of the root key
 │   ├─ sessions.ckpt     sessions and epochs, as of the last checkpoint
 │   ├─ audit.chain       the audit chain
-│   └─ accounts/         the account store (lsm-db)
+│   ├─ accounts/         the account store (lsm-db)
+│   └─ realms/<id>/      each further realm (0.4): its own sessions.ckpt,
+│                        audit.chain, and accounts/
 └─ content/
-    └─ store/            the content store (lsm-db)
+    ├─ store/            the content store (lsm-db)
+    └─ spaces/<id>/store/  each further space's store (0.4)
 ```
+
+A further realm's keys derive from the root key with the label `nex-db 2026
+realm root` and its collection id (big-endian `u32`). A realm's catalog
+definition is its policy, empty for the defaults, else: `format u8 (1)`,
+`lockout failures u32`, `lockout window ms u64`, `lockout ms u64`, `max
+session ms u64`, `max idle ms u64` (0 for none), `pending verification u8`. A
+space's definition is the settings it starts with, encoded as the `'m'`
+record below, or empty.
 
 Later versions add `auth/hot/` (session checkpoints), `auth/audit/` (the
 audit chain), `auth/revocations/` (revocations kept across restores),

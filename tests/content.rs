@@ -1014,3 +1014,108 @@ fn test_terms_tag_entities_and_list_them() {
         Some("tag")
     );
 }
+
+#[test]
+fn test_scheduled_publishing_fires_on_time() {
+    use nex_db::Action;
+    use std::time::{Duration, SystemTime};
+    let dir = TempDir::new("schedule");
+    let wait_for = |db: &Database, rid, published: bool| {
+        for _ in 0..100 {
+            if db.content().get(rid).unwrap().is_some() == published {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    };
+    let (later, gone) = {
+        let db = Database::open(&dir.0).unwrap();
+        let soon = db
+            .content()
+            .create(Entity::new("post").field("title", "Soon").path("/soon"))
+            .unwrap();
+        db.content()
+            .schedule(
+                soon,
+                Action::Publish,
+                SystemTime::now() + Duration::from_millis(300),
+            )
+            .unwrap();
+        let draft = db.content().draft(soon).unwrap().unwrap();
+        assert_eq!(draft.scheduled().map(|s| s.0), Some(Action::Publish));
+        assert!(db.content().get(soon).unwrap().is_none());
+        assert!(wait_for(&db, soon, true), "never published");
+        assert!(
+            db.content()
+                .draft(soon)
+                .unwrap()
+                .unwrap()
+                .scheduled()
+                .is_none()
+        );
+        assert!(
+            db.content()
+                .resolve(DEFAULT_SITE, "/soon")
+                .unwrap()
+                .is_some()
+        );
+
+        // Unpublish in the past: at once.
+        db.content()
+            .schedule(
+                soon,
+                Action::Unpublish,
+                SystemTime::now() - Duration::from_secs(5),
+            )
+            .unwrap();
+        assert!(wait_for(&db, soon, false), "never unpublished");
+
+        // Cancelled schedules do nothing; trash drops them.
+        let cancelled = db.content().create(Entity::new("post")).unwrap();
+        let at = SystemTime::now() + Duration::from_millis(200);
+        db.commit(|tx| {
+            tx.content().schedule(cancelled, Action::Publish, at)?;
+            tx.content().cancel_schedule(cancelled).map(|_| ())
+        })
+        .unwrap();
+        // A schedule that cannot run is dropped: its path is taken.
+        let blocked = db
+            .content()
+            .create(Entity::new("post").path("/taken"))
+            .unwrap();
+        let taker = db
+            .content()
+            .create(Entity::new("post").path("/taken-later"))
+            .unwrap();
+        let _ = db.content().publish(taker).unwrap();
+        db.content().set_path(taker, "/taken").unwrap();
+        db.content().schedule(blocked, Action::Publish, at).unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(db.content().get(cancelled).unwrap().is_none());
+        assert!(db.content().get(blocked).unwrap().is_none());
+        assert!(
+            db.content()
+                .draft(blocked)
+                .unwrap()
+                .unwrap()
+                .scheduled()
+                .is_none()
+        );
+
+        // Schedules survive a reopen.
+        let later = db.content().create(Entity::new("post")).unwrap();
+        db.content()
+            .schedule(
+                later,
+                Action::Publish,
+                SystemTime::now() + Duration::from_millis(800),
+            )
+            .unwrap();
+        (later, soon)
+    };
+    let db = Database::open(&dir.0).unwrap();
+    assert!(db.content().get(later).unwrap().is_none());
+    assert!(wait_for(&db, later, true), "never published after reopen");
+    assert!(db.content().get(gone).unwrap().is_none());
+}

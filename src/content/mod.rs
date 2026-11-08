@@ -14,6 +14,7 @@ pub(crate) mod entity;
 pub(crate) mod lists;
 pub(crate) mod locale;
 mod routes;
+pub(crate) mod schedule;
 mod tree;
 pub(crate) mod types;
 
@@ -25,18 +26,20 @@ use std::{
         Mutex, PoisonError, RwLock,
         atomic::{AtomicU64, Ordering},
     },
+    time::SystemTime,
 };
 
 use lsm_db::{Batch, Lsm};
 
 use self::{
     entity::{
-        Body, Entity, Entry, Head, Patch, Published, Revision, RevisionInfo, RouteEntry, RouteKind,
-        Status, Visibility, decode_route, encode_route, ref_set,
+        Action, Body, Entity, Entry, Head, Patch, Published, Revision, RevisionInfo, RouteEntry,
+        RouteKind, Status, Visibility, decode_route, encode_route, ref_set,
     },
     lists::{Cursor, ListIndex, Listing, Page},
     locale::{Locale, SpaceSpec},
     routes::RouteTable,
+    schedule::Schedules,
     tree::Tree,
     types::{Rule, Type, TypeIndex, Types},
 };
@@ -222,6 +225,8 @@ pub(crate) struct ContentEngine {
     lists: ListIndex,
     /// Children by parent.
     tree: Tree,
+    /// Every schedule, earliest first.
+    schedules: Schedules,
     /// The space's default locale and fallback chains.
     space: RwLock<SpaceSpec>,
     /// The space's types, and what they index.
@@ -262,6 +267,7 @@ impl ContentEngine {
         let routes = RouteTable::new();
         let lists = ListIndex::new();
         let tree = Tree::new();
+        let schedules = Schedules::new();
         let types = match store.get(types_key(collection))? {
             Some(bytes) => Types::decode(&bytes, applied)?,
             None => Types::default(),
@@ -279,6 +285,7 @@ impl ContentEngine {
             let head = Head::decode(&value, applied)?;
             lists.update(&head);
             tree.update(&head);
+            schedules.update(&head);
             published_ms = published_ms.max(head.last_published_ms());
             let legacy = Head::is_legacy(&value);
             type_index.update(&types, &head, |locale, n| {
@@ -320,6 +327,7 @@ impl ContentEngine {
             routes,
             lists,
             tree,
+            schedules,
             space: RwLock::new(space),
             types: RwLock::new(types),
             type_index: Mutex::new(type_index),
@@ -720,6 +728,7 @@ impl Engine for ContentEngine {
         for (head, _) in &heads {
             self.lists.update(head);
             self.tree.update(head);
+            self.schedules.update(head);
             let _ = self
                 .published_ms
                 .fetch_max(head.last_published_ms(), Ordering::AcqRel);
@@ -727,6 +736,7 @@ impl Engine for ContentEngine {
         for (rid, kind) in &deleted {
             self.lists.remove(*rid);
             self.tree.remove(*rid);
+            self.schedules.remove(*rid);
             self.type_index().remove(*rid, kind);
         }
         if let Some(space) = space {
@@ -1631,6 +1641,9 @@ impl ContentTx<'_, '_> {
         }
         head.gone.extend(gone);
         head.status = Status::Trashed;
+        for variant in &mut head.variants {
+            variant.schedule = None;
+        }
         self.put_head(head)
     }
 
@@ -1890,6 +1903,119 @@ impl ContentTx<'_, '_> {
         }
         head.authors = list;
         self.put_head(head)
+    }
+
+    /// Schedule `action` for the entity's own locale at `at`. See
+    /// [`schedule_in`](Self::schedule_in).
+    ///
+    /// # Errors
+    ///
+    /// As [`schedule_in`](Self::schedule_in).
+    pub fn schedule(&mut self, rid: Rid, action: Action, at: SystemTime) -> Result<()> {
+        let locale = self.head(rid)?.base().locale;
+        self.schedule_in(rid, locale, action, at)
+    }
+
+    /// Schedule `action` for `locale` of the entity at `at`: the database
+    /// publishes the locale's working draft as it is then
+    /// ([`publish_in`](Self::publish_in)), or unpublishes it, in a commit of
+    /// its own, within moments of `at` (at once for a time already past).
+    /// One schedule per locale: a new one replaces it. A schedule that
+    /// cannot run (the path is taken by then) is dropped and reported to
+    /// the observer ([`Observer::on_error`](crate::Observer::on_error)).
+    /// Trashing the entity drops its schedules.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the entity does not exist, is in the trash,
+    /// has no such translation, or `at` is before 1970.
+    pub fn schedule_in(
+        &mut self,
+        rid: Rid,
+        locale: Locale,
+        action: Action,
+        at: SystemTime,
+    ) -> Result<()> {
+        let at_ms = at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            .map_err(|_| Error::invalid("time", "before 1970"))?;
+        let mut head = self.head(rid)?;
+        if head.status == Status::Trashed {
+            return Err(Error::invalid("entity", "is in the trash"));
+        }
+        head.variant_mut(locale)
+            .ok_or_else(|| Error::invalid("locale", "the entity has no such translation"))?
+            .schedule = Some((action, at_ms));
+        self.put_head(head)
+    }
+
+    /// Drop the schedule of the entity's own locale. See
+    /// [`cancel_schedule_in`](Self::cancel_schedule_in).
+    ///
+    /// # Errors
+    ///
+    /// As [`cancel_schedule_in`](Self::cancel_schedule_in).
+    pub fn cancel_schedule(&mut self, rid: Rid) -> Result<bool> {
+        let locale = self.head(rid)?.base().locale;
+        self.cancel_schedule_in(rid, locale)
+    }
+
+    /// Drop the schedule of `locale`; `false` when it had none.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the entity does not exist.
+    pub fn cancel_schedule_in(&mut self, rid: Rid, locale: Locale) -> Result<bool> {
+        let mut head = self.head(rid)?;
+        let Some(variant) = head.variant_mut(locale) else {
+            return Ok(false);
+        };
+        if variant.schedule.take().is_none() {
+            return Ok(false);
+        }
+        self.put_head(head)?;
+        Ok(true)
+    }
+
+    /// Run the schedule `action` at `at` of `locale` of `rid`, if it is
+    /// still there: drop it, then publish or unpublish.
+    pub(crate) fn fire(&mut self, rid: Rid, locale: Locale, action: Action, at: u64) -> Result<()> {
+        if !self.clear_schedule(rid, locale, action, at)? {
+            return Ok(());
+        }
+        match action {
+            Action::Publish => {
+                let _ = self.publish_in(rid, &[locale])?;
+            }
+            Action::Unpublish => {
+                let _ = self.unpublish_in(rid, &[locale])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop the schedule `action` at `at` of `locale` of `rid`, if it is
+    /// still there; true when it was.
+    pub(crate) fn clear_schedule(
+        &mut self,
+        rid: Rid,
+        locale: Locale,
+        action: Action,
+        at: u64,
+    ) -> Result<bool> {
+        let Ok(mut head) = self.head(rid) else {
+            return Ok(false);
+        };
+        let Some(variant) = head.variant_mut(locale) else {
+            return Ok(false);
+        };
+        if variant.schedule != Some((action, at)) {
+            return Ok(false);
+        }
+        variant.schedule = None;
+        self.put_head(head)?;
+        Ok(true)
     }
 
     /// Replace the space's settings: its default locale and fallback
@@ -2233,6 +2359,50 @@ impl Content<'_> {
             at = engine.head(p)?.and_then(|h| h.parent);
         }
         Ok(out)
+    }
+
+    /// Schedule `action` for the entity's own locale in its own commit.
+    /// See [`ContentTx::schedule_in`].
+    ///
+    /// ```no_run
+    /// # fn main() -> nex_db::Result<()> {
+    /// use std::time::{Duration, SystemTime};
+    /// use nex_db::{Action, Entity};
+    /// let db = nex_db::open("data/site")?;
+    /// let rid = db.content().create(Entity::new("post").path("/launch"))?;
+    /// let monday = SystemTime::now() + Duration::from_secs(3 * 86_400);
+    /// db.content().schedule(rid, Action::Publish, monday)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`ContentTx::schedule_in`], plus the errors of
+    /// [`Database::commit`].
+    pub fn schedule(&self, rid: Rid, action: Action, at: SystemTime) -> Result<()> {
+        self.db.commit(|tx| tx.content().schedule(rid, action, at))
+    }
+
+    /// Fire every schedule due at `now`, each in its own commit; a schedule
+    /// whose commit fails is dropped (the failure goes to the observer).
+    /// False when a schedule could neither run nor be dropped.
+    pub(crate) fn fire_due(&self, now: u64) -> bool {
+        let mut done = true;
+        for (at, rid, locale, action) in self.engine().schedules.due(now) {
+            let fired = self
+                .db
+                .commit(|tx| tx.content().fire(rid, locale, action, at));
+            if fired.is_err()
+                && self
+                    .db
+                    .commit(|tx| tx.content().clear_schedule(rid, locale, action, at))
+                    .is_err()
+            {
+                done = false;
+            }
+        }
+        done
     }
 
     /// Place an entity in the page tree in its own commit. See

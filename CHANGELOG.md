@@ -6,6 +6,10 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-08
+
+Content and adapters.
+
 ### Added
 
 - `Auth::account` and `Account`; `add_identifier` and `remove_identifier` (up to five identifiers per account).
@@ -35,6 +39,7 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 - A log record holds one section per collection (an engine may now have several); records written before still read.
 - A commit that loses to a conflict waits for the winning commit to be visible before it retries.
+- Publication times strictly increase within a database, so listings keep publication order when the system clock steps back.
 - Entity heads are format 5 (the references of published bodies, authors, parent, order, and schedules); formats 2 to 4 still read.
 - Account records are format 3 (further identifiers and roles); format 2 records still read.
 - `create` makes a draft: `get` and `resolve` find an entity only once it is published. Content sections are format 2; stores and logs written by 0.1 to 0.3 still read, their entities published at revision 1.
@@ -105,7 +110,8 @@ The walking skeleton.
 - Repository scaffold: `Cargo.toml` (edition 2024, MSRV 1.85), `src/lib.rs` with `VERSION`, CI on Linux, macOS, and Windows (stable and 1.85), `cargo deny` configuration.
 - `dev/PLAN.md`, `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/nex-db/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jamesgober/nex-db/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/jamesgober/nex-db/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/nex-db/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/nex-db/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/nex-db/releases/tag/v0.1.0

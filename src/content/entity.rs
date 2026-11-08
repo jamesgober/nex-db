@@ -46,6 +46,9 @@ const TAG_INT: u8 = 2;
 const TAG_BOOL: u8 = 3;
 const TAG_ACCOUNT: u8 = 4;
 const TAG_ENTITY: u8 = 5;
+const TAG_LIST: u8 = 6;
+/// Most values one list holds.
+const MAX_LIST: usize = 1000;
 
 /// A field value.
 ///
@@ -69,6 +72,10 @@ pub enum Value {
     Account(AccountId),
     /// A reference to another entity.
     Entity(Rid),
+    /// A list of values, none of them a list, at most 1,000: tags, related
+    /// entities, several accounts. Each [`Value::Entity`] in it is a
+    /// reference.
+    List(Vec<Value>),
 }
 
 impl Value {
@@ -115,6 +122,46 @@ impl Value {
             Value::Entity(v) => Some(*v),
             _ => None,
         }
+    }
+
+    /// The values, when this is [`Value::List`].
+    #[must_use]
+    pub fn as_list(&self) -> Option<&[Value]> {
+        match self {
+            Value::List(values) => Some(values),
+            _ => None,
+        }
+    }
+
+    /// The entities this value refers to: itself, or those in a list.
+    pub(crate) fn refs(&self) -> impl Iterator<Item = Rid> + '_ {
+        let (one, many): (Option<Rid>, &[Value]) = match self {
+            Value::Entity(rid) => (Some(*rid), &[]),
+            Value::List(values) => (None, values),
+            _ => (None, &[]),
+        };
+        one.into_iter()
+            .chain(many.iter().filter_map(Value::as_entity))
+    }
+}
+
+impl From<Vec<Value>> for Value {
+    fn from(v: Vec<Value>) -> Self {
+        Value::List(v)
+    }
+}
+
+impl From<&[Rid]> for Value {
+    /// A list of references.
+    fn from(v: &[Rid]) -> Self {
+        Value::List(v.iter().copied().map(Value::Entity).collect())
+    }
+}
+
+impl<const N: usize> From<[Rid; N]> for Value {
+    /// A list of references.
+    fn from(v: [Rid; N]) -> Self {
+        Value::from(&v[..])
     }
 }
 
@@ -348,30 +395,58 @@ fn check_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Refuse text over 1 MiB, and a list (only where `list` allows one) that
+/// is nested or longer than 1,000.
+fn check_value(value: &Value, list: bool) -> Result<()> {
+    match value {
+        Value::Text(text) if text.len() > MAX_TEXT => {
+            Err(Error::invalid("field value", "text over 1 MiB"))
+        }
+        Value::List(_) if !list => Err(Error::invalid("field value", "a list inside a list")),
+        Value::List(values) if values.len() > MAX_LIST => {
+            Err(Error::invalid("field value", "a list of more than 1,000"))
+        }
+        Value::List(values) => values.iter().try_for_each(|v| check_value(v, false)),
+        _ => Ok(()),
+    }
+}
+
 fn write_fields(w: &mut Writer<'_>, fields: &[(String, Value)]) -> Result<()> {
     w.u16(fields.len() as u16);
     for (name, value) in fields {
         w.str16(name)?;
-        match value {
-            Value::Text(text) => {
-                w.u8(TAG_TEXT);
-                w.bytes32(text.as_bytes())?;
-            }
-            Value::Int(v) => {
-                w.u8(TAG_INT);
-                w.i64(*v);
-            }
-            Value::Bool(v) => {
-                w.u8(TAG_BOOL);
-                w.u8(u8::from(*v));
-            }
-            Value::Account(v) => {
-                w.u8(TAG_ACCOUNT);
-                w.bytes(v.as_bytes());
-            }
-            Value::Entity(v) => {
-                w.u8(TAG_ENTITY);
-                w.bytes(v.as_bytes());
+        write_value(w, value)?;
+    }
+    Ok(())
+}
+
+fn write_value(w: &mut Writer<'_>, value: &Value) -> Result<()> {
+    match value {
+        Value::Text(text) => {
+            w.u8(TAG_TEXT);
+            w.bytes32(text.as_bytes())?;
+        }
+        Value::Int(v) => {
+            w.u8(TAG_INT);
+            w.i64(*v);
+        }
+        Value::Bool(v) => {
+            w.u8(TAG_BOOL);
+            w.u8(u8::from(*v));
+        }
+        Value::Account(v) => {
+            w.u8(TAG_ACCOUNT);
+            w.bytes(v.as_bytes());
+        }
+        Value::Entity(v) => {
+            w.u8(TAG_ENTITY);
+            w.bytes(v.as_bytes());
+        }
+        Value::List(values) => {
+            w.u8(TAG_LIST);
+            w.u16(values.len() as u16);
+            for v in values {
+                write_value(w, v)?;
             }
         }
     }
@@ -383,26 +458,41 @@ fn read_fields(r: &mut Reader<'_>, at: u64) -> Result<Vec<(String, Value)>> {
     let mut fields = Vec::with_capacity(usize::from(count));
     for _ in 0..count {
         let name = r.str16()?.to_owned();
-        let value = match r.u8()? {
-            TAG_TEXT => {
-                let bytes = r.bytes32()?;
-                let text = std::str::from_utf8(bytes)
-                    .map_err(|_| Error::corrupt("an entity text field", at))?;
-                Value::Text(text.to_owned())
-            }
-            TAG_INT => Value::Int(r.i64()?),
-            TAG_BOOL => match r.u8()? {
-                0 => Value::Bool(false),
-                1 => Value::Bool(true),
-                _ => return Err(Error::corrupt("an entity bool field", at)),
-            },
-            TAG_ACCOUNT => Value::Account(AccountId::from_bytes(r.fixed()?)),
-            TAG_ENTITY => Value::Entity(Rid::from_bytes(r.fixed()?)),
-            _ => return Err(Error::corrupt("an entity field type", at)),
-        };
-        fields.push((name, value));
+        fields.push((name, read_value(r, at, true)?));
     }
     Ok(fields)
+}
+
+/// Read one value; a list only where `list` allows one.
+fn read_value(r: &mut Reader<'_>, at: u64, list: bool) -> Result<Value> {
+    Ok(match r.u8()? {
+        TAG_TEXT => {
+            let bytes = r.bytes32()?;
+            let text = std::str::from_utf8(bytes)
+                .map_err(|_| Error::corrupt("an entity text field", at))?;
+            Value::Text(text.to_owned())
+        }
+        TAG_INT => Value::Int(r.i64()?),
+        TAG_BOOL => match r.u8()? {
+            0 => Value::Bool(false),
+            1 => Value::Bool(true),
+            _ => return Err(Error::corrupt("an entity bool field", at)),
+        },
+        TAG_ACCOUNT => Value::Account(AccountId::from_bytes(r.fixed()?)),
+        TAG_ENTITY => Value::Entity(Rid::from_bytes(r.fixed()?)),
+        TAG_LIST if list => {
+            let count = usize::from(r.u16()?);
+            if count > MAX_LIST {
+                return Err(Error::corrupt("an entity list field", at));
+            }
+            let mut values = Vec::with_capacity(count);
+            for _ in 0..count {
+                values.push(read_value(r, at, false)?);
+            }
+            Value::List(values)
+        }
+        _ => return Err(Error::corrupt("an entity field type", at)),
+    })
 }
 
 /// Changes to an entity's working draft, for
@@ -478,24 +568,27 @@ pub(crate) struct Body {
 impl Body {
     /// The entities the body's fields refer to, in field order.
     pub(crate) fn refs(&self) -> impl Iterator<Item = Rid> + '_ {
-        self.fields.iter().filter_map(|(_, v)| match v {
-            Value::Entity(rid) => Some(*rid),
-            _ => None,
-        })
+        self.fields.iter().flat_map(|(_, v)| v.refs())
     }
 
-    /// Drop every field referring to `target`; true when one was dropped.
+    /// Drop every field that is a reference to `target`, and `target` from
+    /// every list; true when anything was dropped.
     pub(crate) fn detach(&mut self, target: Rid) -> bool {
-        let before = self.fields.len();
+        let before = self.fields.clone();
         self.fields.retain(|(_, v)| *v != Value::Entity(target));
-        before != self.fields.len()
+        for (_, value) in &mut self.fields {
+            if let Value::List(values) = value {
+                values.retain(|v| *v != Value::Entity(target));
+            }
+        }
+        before != self.fields
     }
 
-    /// The names of the fields referring to `target`.
+    /// The names of the fields referring to `target`, alone or in a list.
     pub(crate) fn fields_referring(&self, target: Rid) -> impl Iterator<Item = &str> + '_ {
         self.fields
             .iter()
-            .filter(move |(_, v)| *v == Value::Entity(target))
+            .filter(move |(_, v)| v.refs().any(|r| r == target))
             .map(|(n, _)| n.as_str())
     }
 
@@ -512,11 +605,7 @@ impl Body {
             if !names.insert(name.as_str()) {
                 return Err(Error::invalid("field name", "appears twice"));
             }
-            if let Value::Text(text) = value {
-                if text.len() > MAX_TEXT {
-                    return Err(Error::invalid("field value", "text over 1 MiB"));
-                }
-            }
+            check_value(value, true)?;
         }
         Ok(())
     }
@@ -1331,6 +1420,7 @@ mod tests {
             .field("public", true)
             .field("account", account)
             .field("parent", rid())
+            .field("tags", [rid(), Rid::from_bytes([8; 16])])
             .site("example.com")
             .path("/u/ann");
         let mut head = entity.into_head(rid(), 5, Locale::EN).unwrap();
@@ -1368,7 +1458,7 @@ mod tests {
             entry.field("parent").and_then(Value::as_entity),
             Some(rid())
         );
-        assert_eq!(entry.fields().count(), 5);
+        assert_eq!(entry.fields().count(), 6);
         assert_eq!(entry.created_at(), crate::core::time_of(5));
         assert_eq!(entry.published_at(), Some(crate::core::time_of(6)));
     }

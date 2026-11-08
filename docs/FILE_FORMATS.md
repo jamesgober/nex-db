@@ -257,7 +257,7 @@ sessions.
 | `collection, 'b', target rid [16], source rid [16]` | empty: `source` refers to `target` (a draft or published field); `referenced_by` reads the target's prefix |
 | `collection, 'm'` | the space's settings: `format u8 (1)`, `default locale`, `chain count u8`, then per chain `locale`, `count u8`, and that many `locale` |
 
-| `collection, 't'` | the space's types: `format u8 (1)`, `type count u16`, then per type `name str16`, `singleton u8`, `field count u16`, and per field `name str16`, `kind u8` (1 text, 2 int, 3 bool, 4 account, 5 entity), `flags u8` (bit 0 unique; bits 1 and 2 the reference rule of an entity field: 0 none, 1 restrict, 2 detach, 3 cascade) |
+| `collection, 't'` | the space's types: `format u8 (2)`, `type count u16`, then per type `name str16`, `singleton u8`, `field count u16`, per field `name str16`, `kind u8` (1 text, 2 int, 3 bool, 4 account, 5 entity, 6 list, 7 terms), `flags u8` (bit 0 unique; bits 1 and 2 the reference rule of an entity or terms field: 0 none, 1 restrict, 2 detach, 3 cascade), then `taxonomy count u16` and per terms field `name str16`, `taxonomy str16`. Format 1 has no taxonomies |
 
 A locale is stored as `length u8` and its ASCII tag (at most 15 bytes).
 
@@ -349,6 +349,8 @@ field count times:
         3 bool            u8, 0 or 1
         4 account         [16]
         5 entity          [16]
+        6 list            count u16 (at most 1,000), then each value
+                          as tag and value, none a list (0.4)
 ```
 
 ## Ids

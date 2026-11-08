@@ -913,3 +913,104 @@ fn test_page_tree_and_authors() {
         2
     );
 }
+
+#[test]
+fn test_terms_tag_entities_and_list_them() {
+    let dir = TempDir::new("terms");
+    let (rust, post, old) = {
+        let db = Database::open(&dir.0).unwrap();
+        db.content()
+            .define(Type::new("post").terms("tags", "tag"))
+            .unwrap();
+        let tag = |name: &str| {
+            let rid = db
+                .content()
+                .create(
+                    Entity::new("tag")
+                        .field("name", name)
+                        .path(format!("/tags/{name}")),
+                )
+                .unwrap();
+            let _ = db.content().publish(rid).unwrap();
+            rid
+        };
+        let rust = tag("rust");
+        let db_tag = tag("databases");
+        let page = db.content().create(Entity::new("page")).unwrap();
+
+        // Only terms of the field's taxonomy.
+        assert!(matches!(
+            db.content()
+                .create(Entity::new("post").field("tags", [rust, page])),
+            Err(Error::Invalid { .. })
+        ));
+        assert!(
+            db.content()
+                .create(Entity::new("post").field("tags", "rust"))
+                .is_err()
+        );
+
+        let old = db
+            .content()
+            .create(Entity::new("post").field("tags", [rust]))
+            .unwrap();
+        let post = db
+            .content()
+            .create(Entity::new("post").field("tags", [rust, db_tag]))
+            .unwrap();
+        let _ = db.content().publish(old).unwrap();
+        let _ = db.content().publish(post).unwrap();
+        let tagged = |t| {
+            db.content()
+                .list(&Listing::latest("post").term(t))
+                .unwrap()
+                .items()
+                .iter()
+                .map(|e| e.rid())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tagged(rust), vec![post, old]);
+        assert_eq!(tagged(db_tag), vec![post]);
+        assert_eq!(
+            db.content()
+                .get(post)
+                .unwrap()
+                .unwrap()
+                .field("tags")
+                .and_then(Value::as_list)
+                .map(<[Value]>::len),
+            Some(2)
+        );
+
+        // Only published bodies count: a draft change waits for publishing.
+        db.content()
+            .save_draft(old, Patch::new().set("tags", Value::List(Vec::new())))
+            .unwrap();
+        assert_eq!(tagged(rust), vec![post, old]);
+        let _ = db.content().publish(old).unwrap();
+        assert_eq!(tagged(rust), vec![post]);
+
+        // Deleting a term takes it out of every list.
+        db.content().delete(db_tag).unwrap();
+        let tags = db.content().get(post).unwrap().unwrap();
+        assert_eq!(
+            tags.field("tags").and_then(Value::as_list),
+            Some(&[Value::Entity(rust)][..])
+        );
+        assert!(tagged(db_tag).is_empty());
+        (rust, post, old)
+    };
+    // Rebuilt at open.
+    let db = Database::open(&dir.0).unwrap();
+    let page = db
+        .content()
+        .list(&Listing::latest("post").term(rust))
+        .unwrap();
+    assert_eq!(page.items().len(), 1);
+    assert_eq!(page.items()[0].rid(), post);
+    assert!(db.content().get(old).unwrap().is_some());
+    assert_eq!(
+        db.content().type_named("post").unwrap().taxonomy("tags"),
+        Some("tag")
+    );
+}

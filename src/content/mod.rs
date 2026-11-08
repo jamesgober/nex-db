@@ -974,6 +974,7 @@ impl ContentTx<'_, '_> {
             Some(prev) => prev.refs(),
             None => self.stored_refs(head.rid)?,
         };
+        self.check_terms(&types, &head, &old)?;
         self.link(head.rid, &old, &refs)?;
         let key = entity_key(self.staged.engine.collection, head.rid);
         match self.staged.heads.iter_mut().find(|h| h.rid == head.rid) {
@@ -981,6 +982,29 @@ impl ContentTx<'_, '_> {
             None => {
                 self.staged.heads.push(head);
                 self.staged.writes.push(key);
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse a term added to a terms field that is not of the field's
+    /// taxonomy. Terms already there (in `old`) are not read again.
+    fn check_terms(&self, types: &Types, head: &Head, old: &[Rid]) -> Result<()> {
+        for variant in &head.variants {
+            for (name, value) in &variant.draft.fields {
+                let Some(taxonomy) = types.taxonomy(&head.kind, name) else {
+                    continue;
+                };
+                for term in value.refs().filter(|t| !old.contains(t)) {
+                    let kind = match self.staged.heads.iter().find(|h| h.rid == term) {
+                        Some(h) => Some(h.kind.clone()),
+                        None => self.staged.engine.head(term)?.map(|h| h.kind),
+                    };
+                    // A term that does not exist is refused by `link`.
+                    if kind.is_some_and(|k| k != taxonomy) {
+                        return Err(Error::invalid("field value", "a term of another taxonomy"));
+                    }
+                }
             }
         }
         Ok(())

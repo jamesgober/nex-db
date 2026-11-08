@@ -265,6 +265,7 @@ impl Entity {
                 source: 0,
                 published: None,
             }],
+            gone: Vec::new(),
         })
     }
 
@@ -555,6 +556,9 @@ pub(crate) struct Head {
     pub(crate) last_revision: u32,
     pub(crate) first_published_ms: u64,
     pub(crate) variants: Vec<Variant>,
+    /// Paths the entity was served at when it was trashed, now gone (410),
+    /// with the locale each served.
+    pub(crate) gone: Vec<(Locale, String)>,
 }
 
 impl Head {
@@ -632,6 +636,11 @@ impl Head {
             w.str16(v.draft.path.as_deref().unwrap_or(""))?;
             write_fields(&mut w, &v.draft.fields)?;
         }
+        w.u16(self.gone.len() as u16);
+        for (locale, path) in &self.gone {
+            locale.write(&mut w);
+            w.str16(path)?;
+        }
         Ok(out)
     }
 
@@ -670,6 +679,7 @@ impl Head {
                         draft: Body { path, fields },
                         source: 0,
                     }],
+                    gone: Vec::new(),
                 })
             }
             HEAD_FORMAT => {
@@ -709,6 +719,11 @@ impl Head {
                         }),
                     });
                 }
+                let mut gone = Vec::new();
+                for _ in 0..r.u16()? {
+                    let locale = Locale::read(&mut r, at)?;
+                    gone.push((locale, r.str16()?.to_owned()));
+                }
                 r.finish()?;
                 Ok(Head {
                     rid,
@@ -721,6 +736,7 @@ impl Head {
                     last_revision,
                     first_published_ms,
                     variants,
+                    gone,
                 })
             }
             _ => Err(Error::corrupt("an entity record format", at)),

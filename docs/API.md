@@ -599,7 +599,7 @@ assert_eq!(db.content().revisions(rid)?.len(), 2);
 | `unpublish(rid) -> Result<bool>` | P0 | every locale; the paths stop resolving; drafts and revisions stay; `unpublish_in(rid, locales)` for some |
 | `schedule(rid, Action::Publish \| Action::Unpublish, at)` | P1 | fired by the database at `at` |
 | `set_status(rid, Status)`, `set_visibility(rid, Visibility)` | P1 | |
-| `trash(rid)`, `restore(rid)`, `delete(rid)` | P1 | `delete` applies the reference rules |
+| `trash(rid)`, `restore(rid)`, `delete(rid)` | P1 | `trash` takes every locale down and leaves its paths `Gone` (410); `restore` brings it back as a draft and frees them; `delete` removes the entity and its revisions for good, its paths `Gone` until another entity takes them; with references, `delete` applies their rules |
 | `revert(rid, revision)` | P2 | copies an old revision into the draft |
 | `db.content().revisions(rid)`, `revision(rid, n)` | P1 | read |
 

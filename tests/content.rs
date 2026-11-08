@@ -534,3 +534,89 @@ fn test_types_check_kinds_unique_values_and_singletons() {
         .unwrap();
     assert!(db.content().publish(c).is_err());
 }
+
+#[test]
+fn test_trash_restore_and_delete() {
+    let dir = TempDir::new("trash");
+    let (kept, deleted) = {
+        let db = Database::open(&dir.0).unwrap();
+        let kept = db
+            .content()
+            .create(Entity::new("post").field("title", "Kept").path("/kept"))
+            .unwrap();
+        let _ = db.content().publish(kept).unwrap();
+        db.content().trash(kept).unwrap();
+        assert!(db.content().trash(kept).is_err());
+        let gone = db
+            .content()
+            .resolve(DEFAULT_SITE, "/kept")
+            .unwrap()
+            .unwrap();
+        assert_eq!((gone.kind(), gone.entity()), (RouteKind::Gone, kept));
+        assert!(db.content().get(kept).unwrap().is_none());
+        assert!(db.content().publish(kept).is_err());
+        assert_eq!(
+            db.content().draft(kept).unwrap().unwrap().status(),
+            Status::Trashed
+        );
+        assert!(
+            db.content()
+                .list(&Listing::latest("post"))
+                .unwrap()
+                .items()
+                .is_empty()
+        );
+        db.content().restore(kept).unwrap();
+        assert!(
+            db.content()
+                .resolve(DEFAULT_SITE, "/kept")
+                .unwrap()
+                .is_none()
+        );
+        let _ = db.content().publish(kept).unwrap();
+        assert_eq!(
+            db.content()
+                .resolve(DEFAULT_SITE, "/kept")
+                .unwrap()
+                .unwrap()
+                .kind(),
+            RouteKind::Page
+        );
+
+        let deleted = db
+            .content()
+            .create(Entity::new("post").field("title", "Gone").path("/gone"))
+            .unwrap();
+        let _ = db.content().publish(deleted).unwrap();
+        db.content().delete(deleted).unwrap();
+        assert!(db.content().draft(deleted).unwrap().is_none());
+        assert!(db.content().revisions(deleted).unwrap().is_empty());
+        assert!(db.content().delete(deleted).is_err());
+        (kept, deleted)
+    };
+    let db = Database::open(&dir.0).unwrap();
+    let gone = db
+        .content()
+        .resolve(DEFAULT_SITE, "/gone")
+        .unwrap()
+        .unwrap();
+    assert_eq!((gone.kind(), gone.entity()), (RouteKind::Gone, deleted));
+    assert!(db.content().draft(deleted).unwrap().is_none());
+    let list = db.content().list(&Listing::latest("post")).unwrap();
+    assert_eq!(list.items().len(), 1);
+    assert_eq!(list.items()[0].rid(), kept);
+    // Another entity may take a gone path.
+    let next = db
+        .content()
+        .create(Entity::new("post").path("/gone"))
+        .unwrap();
+    let _ = db.content().publish(next).unwrap();
+    assert_eq!(
+        db.content()
+            .resolve(DEFAULT_SITE, "/gone")
+            .unwrap()
+            .unwrap()
+            .entity(),
+        next
+    );
+}

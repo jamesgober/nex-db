@@ -74,6 +74,8 @@ const OP_DELETE_ROUTE: u8 = 5;
 const OP_SET_SPACE: u8 = 6;
 /// Replace the space's types.
 const OP_SET_TYPES: u8 = 7;
+/// Remove an entity and its revisions.
+const OP_DELETE_ENTITY: u8 = 8;
 
 /// The status an entity's old path redirects with when the path changes.
 const MOVED: u16 = 301;
@@ -413,6 +415,7 @@ enum Op<'a> {
     DeleteRoute(&'a str, &'a str),
     SetSpace(&'a [u8]),
     SetTypes(&'a [u8]),
+    DeleteEntity(Rid),
 }
 
 fn decode_ops(seq: Seq, format: u16, body: &[u8]) -> Result<Vec<Op<'_>>> {
@@ -429,6 +432,7 @@ fn decode_ops(seq: Seq, format: u16, body: &[u8]) -> Result<Vec<Op<'_>>> {
             (FORMAT, OP_DELETE_ROUTE) => Op::DeleteRoute(r.str16()?, r.str16()?),
             (FORMAT, OP_SET_SPACE) => Op::SetSpace(r.bytes16()?),
             (FORMAT, OP_SET_TYPES) => Op::SetTypes(r.bytes32()?),
+            (FORMAT, OP_DELETE_ENTITY) => Op::DeleteEntity(Rid::from_bytes(r.fixed()?)),
             _ => return Err(Error::corrupt("a content operation", seq)),
         };
         ops.push(op);
@@ -476,6 +480,7 @@ impl Engine for ContentEngine {
         let mut heads = Vec::new();
         let mut space = None;
         let mut types = None;
+        let mut deleted = Vec::new();
         for op in &ops {
             match op {
                 Op::Create(record) => {
@@ -529,6 +534,23 @@ impl Engine for ContentEngine {
                     types = Some(Types::decode(value, seq)?);
                     batch.put(types_key(self.collection), *value);
                 }
+                Op::DeleteEntity(rid) => {
+                    let key = entity_key(self.collection, *rid);
+                    let old = self.store.get(&key)?;
+                    if let Some(old) = &old {
+                        deleted.push((*rid, Head::decode(old, seq)?.kind));
+                    }
+                    self.versions.record(&key, seq, None, || Ok(old.clone()))?;
+                    batch.delete(key);
+                    let start = revision_prefix(self.collection, *rid);
+                    for (rev, _) in self.store.scan(start.clone()..after(&start))? {
+                        batch.delete(rev);
+                    }
+                    changes.push(Change::EntityChanged {
+                        rid: *rid,
+                        revision: 0,
+                    });
+                }
             }
         }
         batch.put(META_APPLIED, seq.to_le_bytes());
@@ -543,6 +565,10 @@ impl Engine for ContentEngine {
         }
         for head in &heads {
             self.lists.update(head);
+        }
+        for (rid, kind) in &deleted {
+            self.lists.remove(*rid);
+            self.type_index().remove(*rid, kind);
         }
         if let Some(space) = space {
             *self.space.write().unwrap_or_else(PoisonError::into_inner) = space;
@@ -602,6 +628,7 @@ enum StagedOp {
     Route(String, String, Option<RouteEntry>),
     Space(Vec<u8>),
     Types(Vec<u8>),
+    Delete(Rid),
 }
 
 /// One transaction's content work.
@@ -695,6 +722,10 @@ impl Staged for ContentStaged<'_> {
                 StagedOp::Types(value) => {
                     w.u8(OP_SET_TYPES);
                     w.bytes32(value)?;
+                }
+                StagedOp::Delete(rid) => {
+                    w.u8(OP_DELETE_ENTITY);
+                    w.bytes(rid.as_bytes());
                 }
             }
         }
@@ -1241,6 +1272,88 @@ impl ContentTx<'_, '_> {
         Ok(())
     }
 
+    /// Take the entity off the site: every path it is published at answers
+    /// [`RouteKind::Gone`] (410), readers no longer find it, and its status
+    /// becomes [`Status::Trashed`]. Drafts and revisions stay, so
+    /// [`restore`](Self::restore) can bring it back.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the entity does not exist or is already in
+    /// the trash.
+    pub fn trash(&mut self, rid: Rid) -> Result<()> {
+        let mut head = self.head(rid)?;
+        if head.status == Status::Trashed {
+            return Err(Error::invalid("entity", "is in the trash"));
+        }
+        let site = head.site.clone();
+        let mut gone = Vec::new();
+        for variant in &mut head.variants {
+            if let Some(path) = variant.published.take().and_then(|p| p.path) {
+                gone.push((variant.locale, path));
+            }
+        }
+        for (locale, path) in &gone {
+            let entry = RouteEntry {
+                entity: rid,
+                revision: 0,
+                kind: RouteKind::Gone,
+                visibility: head.visibility,
+                locale: *locale,
+            };
+            self.put_route(&site, path, Some(entry));
+        }
+        head.gone.extend(gone);
+        head.status = Status::Trashed;
+        self.put_head(head)
+    }
+
+    /// Bring a trashed entity back as a draft. The paths its trash left
+    /// gone are free again (until it is published).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the entity does not exist or is not in the
+    /// trash.
+    pub fn restore(&mut self, rid: Rid) -> Result<()> {
+        let mut head = self.head(rid)?;
+        if head.status != Status::Trashed {
+            return Err(Error::invalid("entity", "is not in the trash"));
+        }
+        let site = head.site.clone();
+        for (_, path) in std::mem::take(&mut head.gone) {
+            let ours = matches!(
+                self.route(&site, &path),
+                Some(RouteEntry { entity, kind: RouteKind::Gone, .. }) if entity == rid
+            );
+            if ours {
+                self.put_route(&site, &path, None);
+            }
+        }
+        head.status = Status::Draft;
+        self.put_head(head)
+    }
+
+    /// Remove the entity and its revisions for good. The paths it is
+    /// published at, and those its trash left gone, answer
+    /// [`RouteKind::Gone`] (410) until another entity takes them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the entity does not exist.
+    pub fn delete(&mut self, rid: Rid) -> Result<()> {
+        let head = self.head(rid)?;
+        if head.status != Status::Trashed {
+            self.trash(rid)?;
+        }
+        self.staged.heads.retain(|h| h.rid != rid);
+        self.staged.ops.push(StagedOp::Delete(rid));
+        self.staged
+            .writes
+            .push(entity_key(self.staged.engine.collection, rid));
+        Ok(())
+    }
+
     /// Replace the space's settings: its default locale and fallback
     /// chains. Entities keep the locales they were written in; readers who
     /// ask for no locale get the new default.
@@ -1511,6 +1624,33 @@ impl Content<'_> {
     /// As [`ContentTx::unpublish`], plus the errors of [`Database::commit`].
     pub fn unpublish(&self, rid: Rid) -> Result<bool> {
         self.db.commit(|tx| tx.content().unpublish(rid))
+    }
+
+    /// Trash an entity in its own commit. See [`ContentTx::trash`].
+    ///
+    /// # Errors
+    ///
+    /// As [`ContentTx::trash`], plus the errors of [`Database::commit`].
+    pub fn trash(&self, rid: Rid) -> Result<()> {
+        self.db.commit(|tx| tx.content().trash(rid))
+    }
+
+    /// Restore an entity in its own commit. See [`ContentTx::restore`].
+    ///
+    /// # Errors
+    ///
+    /// As [`ContentTx::restore`], plus the errors of [`Database::commit`].
+    pub fn restore(&self, rid: Rid) -> Result<()> {
+        self.db.commit(|tx| tx.content().restore(rid))
+    }
+
+    /// Delete an entity in its own commit. See [`ContentTx::delete`].
+    ///
+    /// # Errors
+    ///
+    /// As [`ContentTx::delete`], plus the errors of [`Database::commit`].
+    pub fn delete(&self, rid: Rid) -> Result<()> {
+        self.db.commit(|tx| tx.content().delete(rid))
     }
 
     /// Move an entity in its own commit. See [`ContentTx::set_path`].

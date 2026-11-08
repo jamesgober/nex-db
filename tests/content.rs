@@ -1091,7 +1091,21 @@ fn test_scheduled_publishing_fires_on_time() {
         let _ = db.content().publish(taker).unwrap();
         db.content().set_path(taker, "/taken").unwrap();
         db.content().schedule(blocked, Action::Publish, at).unwrap();
-        std::thread::sleep(Duration::from_millis(600));
+        // Wait for the blocked schedule to be dropped (a loaded machine's
+        // clock can step, so allow a few seconds).
+        for _ in 0..100 {
+            if db
+                .content()
+                .draft(blocked)
+                .unwrap()
+                .unwrap()
+                .scheduled()
+                .is_none()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
         assert!(db.content().get(cancelled).unwrap().is_none());
         assert!(db.content().get(blocked).unwrap().is_none());
         assert!(

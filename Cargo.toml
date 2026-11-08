@@ -85,6 +85,13 @@ audit-trail = { version = "1.1", default-features = false, features = ["std"], o
 metrics-lib = { version = "2.1", default-features = false, features = ["count", "timer"], optional = true }
 
 
+# The `mfa` feature builds crypt-io's AWS-LC backend; on Windows x86-64 it
+# takes AWS-LC's prebuilt NASM objects, so no NASM is needed. A weak feature:
+# nothing changes unless `mfa` is on.
+[target.'cfg(all(windows, target_arch = "x86_64"))'.dependencies]
+crypt-io = { version = "1.5", default-features = false, features = ["prebuilt-nasm"] }
+
+
 # DEV DEPENDENCIES
 # #################################
 [dev-dependencies]

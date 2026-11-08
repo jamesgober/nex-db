@@ -19,13 +19,14 @@ All notable changes to `nex-db` are documented in this file. The format is based
 - `Database::health` and `Health`; `Builder::observer`, `Observer`, `CommitInfo`, and `SecurityEvent`.
 - `trash`, `restore`, and `delete` (paths of a trashed or deleted entity answer `RouteKind::Gone`).
 - Types: `Content::define`, `type_named`, `Type` (`field`, `unique`, `singleton`), and `FieldType`.
+- Page tree and authors: `Entity::parent`, `order`, and `author`; `set_parent`, `set_order`, `set_authors`; `Content::children` and `ancestors`; `Entry::parent`, `order`, and `authors`; `Listing::by_author`.
 - References: `Type::reference` and `Rule` (`Restrict`, `Detach`, `Cascade`), applied by `delete`; `Content::referenced_by`; `Error::Restricted` (NEX-1010).
 - Locales: `Locale`, `SpaceSpec`, `Content::space` and `set_space`, `Entity::locale`, `translate`, `publish_in`, `unpublish_in`, `set_path_in`, `get_in`, `draft_in`; `Entry::locale` and `fallback`; `RouteEntry::locale`; `RevisionInfo::locale`.
 
 ### Changed
 
 - A commit that loses to a conflict waits for the winning commit to be visible before it retries.
-- Entity heads are format 3 (the references of published bodies); format 2 heads still read.
+- Entity heads are format 4 (the references of published bodies, authors, parent, and order); formats 2 and 3 still read.
 - Account records are format 3 (further identifiers and roles); format 2 records still read.
 - `create` makes a draft: `get` and `resolve` find an entity only once it is published. Content sections are format 2; stores and logs written by 0.1 to 0.3 still read, their entities published at revision 1.
 

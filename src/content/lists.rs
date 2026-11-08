@@ -2,8 +2,9 @@
 //!
 //! Derived, like the route index: rebuilt from the entity heads at open and
 //! updated as commits apply. Two orders per site and type: by first
-//! publication (`latest`) and by the last publish (`updated`). A page is a
-//! range read of an ordered set, so a listing never scans entities.
+//! publication (`latest`) and by the last publish (`updated`), and the same
+//! per author. A page is a range read of an ordered set, so a listing never
+//! scans entities.
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -14,7 +15,7 @@ use std::{
 use super::entity::Head;
 use crate::{
     error::{Error, Result},
-    ids::Rid,
+    ids::{AccountId, Rid},
 };
 
 /// The most entries one page holds.
@@ -39,6 +40,7 @@ pub struct Listing {
     pub(crate) site: String,
     pub(crate) order: u8,
     pub(crate) limit: usize,
+    pub(crate) author: Option<AccountId>,
 }
 
 impl Listing {
@@ -50,7 +52,15 @@ impl Listing {
             site: crate::DEFAULT_SITE.to_owned(),
             order: ORDER_LATEST,
             limit: DEFAULT_PAGE,
+            author: None,
         }
+    }
+
+    /// Only entities `account` is an author of
+    /// ([`Entity::author`](crate::Entity::author)).
+    pub fn by_author(mut self, account: AccountId) -> Listing {
+        self.author = Some(account);
+        self
     }
 
     /// Order by the last publish instead: an edit that is published moves
@@ -101,6 +111,12 @@ impl fmt::Display for Cursor {
         for b in self.listing.kind.as_bytes() {
             write!(f, "{b:02x}")?;
         }
+        if let Some(author) = self.listing.author {
+            f.write_str(".")?;
+            for b in author.as_bytes() {
+                write!(f, "{b:02x}")?;
+            }
+        }
         Ok(())
     }
 }
@@ -124,8 +140,20 @@ impl Cursor {
     pub fn parse(text: &str) -> Result<Cursor> {
         let bad = || Error::invalid("cursor", "not a cursor");
         let parts: Vec<&str> = text.split('.').collect();
-        let [order, limit, inv, rid, site, kind] = parts.as_slice() else {
-            return Err(bad());
+        let (order, limit, inv, rid, site, kind, author) = match parts.as_slice() {
+            [order, limit, inv, rid, site, kind] => (order, limit, inv, rid, site, kind, None),
+            [order, limit, inv, rid, site, kind, author] => {
+                (order, limit, inv, rid, site, kind, Some(author))
+            }
+            _ => return Err(bad()),
+        };
+        let author = match author {
+            Some(text) => Some(AccountId::from_bytes(
+                unhex(text)
+                    .and_then(|b| b.try_into().ok())
+                    .ok_or_else(bad)?,
+            )),
+            None => None,
         };
         let order: u8 = order.parse().map_err(|_| bad())?;
         if order != ORDER_LATEST && order != ORDER_UPDATED {
@@ -142,6 +170,7 @@ impl Cursor {
                 site,
                 order,
                 limit: limit.clamp(1, MAX_PAGE),
+                author,
             },
             after: (inv, rid),
         })
@@ -178,13 +207,23 @@ impl<T> Page<T> {
 /// An entry's place in one order: (group, order, inverted time, id).
 type Row = (u32, u8, u64, [u8; 16]);
 
+/// A group of rows: site, type, and author (none for every entity).
+type Group = (String, String, Option<AccountId>);
+
 #[derive(Debug, Default)]
 struct Inner {
     rows: BTreeSet<Row>,
-    /// The group number of each (site, type).
-    groups: HashMap<(String, String), u32>,
+    /// The group number of each (site, type, author).
+    groups: HashMap<Group, u32>,
     /// Each listed entity's rows, to remove them when it changes.
-    placed: HashMap<Rid, [Row; 2]>,
+    placed: HashMap<Rid, Vec<Row>>,
+}
+
+impl Inner {
+    fn group(&mut self, key: Group) -> u32 {
+        let next = self.groups.len() as u32;
+        *self.groups.entry(key).or_insert(next)
+    }
 }
 
 /// Published entities by site and type.
@@ -215,23 +254,17 @@ impl ListIndex {
         if !head.is_published() {
             return;
         }
-        let next = inner.groups.len() as u32;
-        let group = *inner
-            .groups
-            .entry((head.site.clone(), head.kind.clone()))
-            .or_insert(next);
         let rid = *head.rid.as_bytes();
-        let rows = [
-            (group, ORDER_LATEST, u64::MAX - head.first_published_ms, rid),
-            (
-                group,
-                ORDER_UPDATED,
-                u64::MAX - head.last_published_ms(),
-                rid,
-            ),
-        ];
-        for row in rows {
-            let _ = inner.rows.insert(row);
+        let latest = u64::MAX - head.first_published_ms;
+        let updated = u64::MAX - head.last_published_ms();
+        let mut rows = Vec::with_capacity(2 + 2 * head.authors.len());
+        for author in std::iter::once(None).chain(head.authors.iter().copied().map(Some)) {
+            let group = inner.group((head.site.clone(), head.kind.clone(), author));
+            rows.push((group, ORDER_LATEST, latest, rid));
+            rows.push((group, ORDER_UPDATED, updated, rid));
+        }
+        for row in &rows {
+            let _ = inner.rows.insert(*row);
         }
         let _ = inner.placed.insert(head.rid, rows);
     }
@@ -246,7 +279,7 @@ impl ListIndex {
         let inner = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let Some(group) = inner
             .groups
-            .get(&(listing.site.clone(), listing.kind.clone()))
+            .get(&(listing.site.clone(), listing.kind.clone(), listing.author))
             .copied()
         else {
             return (Vec::new(), None);
@@ -312,6 +345,18 @@ mod tests {
         assert_eq!(n(page), [1]);
         assert!(after.is_none());
 
+        // By author.
+        let ann = AccountId::from_bytes([9; 16]);
+        let mut by_ann = head(4, 40, 40);
+        by_ann.authors = vec![ann];
+        index.update(&by_ann);
+        assert_eq!(n(ids(&Listing::latest("post").by_author(ann))), [4]);
+        assert_eq!(n(ids(&Listing::latest("post"))), [4, 3, 2, 1]);
+        by_ann.authors.clear();
+        index.update(&by_ann);
+        assert!(ids(&Listing::latest("post").by_author(ann)).is_empty());
+        index.remove(by_ann.rid);
+
         let mut gone = head(2, 20, 20);
         gone.variants[0].published = None;
         index.update(&gone);
@@ -325,6 +370,11 @@ mod tests {
             after: (99, [5; 16]),
         };
         assert_eq!(Cursor::parse(&cursor.to_string()).unwrap(), cursor);
+        let by = Cursor {
+            listing: Listing::latest("post").by_author(AccountId::from_bytes([3; 16])),
+            after: (1, [2; 16]),
+        };
+        assert_eq!(Cursor::parse(&by.to_string()).unwrap(), by);
         for junk in ["", "1.2.3", "9.1.0.00.00.00", "x.y.z.w.v.u"] {
             assert!(Cursor::parse(junk).is_err(), "{junk}");
         }

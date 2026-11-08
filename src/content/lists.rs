@@ -198,14 +198,20 @@ impl ListIndex {
         Self::default()
     }
 
-    /// Place `head` as it now is: listed when published, not otherwise.
-    pub(crate) fn update(&self, head: &Head) {
+    /// Drop `rid` from every listing.
+    pub(crate) fn remove(&self, rid: Rid) {
         let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
-        if let Some(rows) = inner.placed.remove(&head.rid) {
+        if let Some(rows) = inner.placed.remove(&rid) {
             for row in rows {
                 let _ = inner.rows.remove(&row);
             }
         }
+    }
+
+    /// Place `head` as it now is: listed when published, not otherwise.
+    pub(crate) fn update(&self, head: &Head) {
+        self.remove(head.rid);
+        let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         if !head.is_published() {
             return;
         }

@@ -284,6 +284,9 @@ locale count times:
     published path str16  empty for none
     draft path str16      empty for none
     draft fields          as in the entity record below
+gone count u16            paths left gone (410) by a trash, then each:
+    locale
+    path str16
 ```
 
 A format 1 record reads as an entity in `en`.

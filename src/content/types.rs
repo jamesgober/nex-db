@@ -336,6 +336,23 @@ impl TypeIndex {
         }
     }
 
+    /// Forget `rid`: it was deleted.
+    pub(crate) fn remove(&mut self, rid: Rid, kind: &str) {
+        for key in self.held.remove(&rid).unwrap_or_default() {
+            if self.unique.get(&key) == Some(&rid) {
+                let _ = self.unique.remove(&key);
+            }
+        }
+        if self.known.remove(&rid) {
+            if let Some(entry) = self.kinds.get_mut(kind) {
+                entry.0 = entry.0.saturating_sub(1);
+                if entry.0 == 0 {
+                    let _ = self.kinds.remove(kind);
+                }
+            }
+        }
+    }
+
     /// The published entity holding unique `key`, if any.
     pub(crate) fn holder(&self, key: &[u8]) -> Option<Rid> {
         self.unique.get(key).copied()

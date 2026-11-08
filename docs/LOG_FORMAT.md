@@ -208,6 +208,7 @@ an Argon2id string in the PHC format.
 | 5 | remove a route | `site str16`, `path str16` |
 | 6 | replace the space's settings | `settings bytes16` (as stored, see `FILE_FORMATS.md`) |
 | 7 | replace the space's types | `types bytes32` (as stored, see `FILE_FORMATS.md`) |
+| 8 | delete an entity | `rid [16]`: its head and every revision |
 
 Heads, revisions, and routes are the records stored in the content store; see
 [FILE_FORMATS.md](./FILE_FORMATS.md#content-store-contentstore). Staging

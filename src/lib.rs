@@ -130,7 +130,7 @@ pub use crate::content::{
     },
     lists::{Cursor, Listing, Page},
     locale::{Locale, SpaceSpec},
-    types::{FieldType, Type},
+    types::{FieldType, Rule, Type},
 };
 pub use crate::{
     core::keys::Keys,

@@ -205,6 +205,19 @@ impl Core {
         self.order.visible()
     }
 
+    /// After a conflict: return once every commit sequenced so far is
+    /// visible, so a retry's snapshot holds the commit it lost to. Without
+    /// this wait a retry can start before the winner is visible and lose
+    /// again on every attempt.
+    pub(crate) fn wait_for_sequenced(&self) {
+        let last = self
+            .commit
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last;
+        self.order.wait_visible(last);
+    }
+
     /// True after a failed write: every later commit is refused.
     pub(crate) fn halted(&self) -> bool {
         self.order.halted()

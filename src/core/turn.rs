@@ -180,6 +180,18 @@ impl<B> Turnstile<B> {
         Ok(())
     }
 
+    /// Return once every item through `seq` is applied and visible, or the
+    /// pipeline halts.
+    pub(crate) fn wait_visible(&self, seq: u64) {
+        let mut applied = self.applied.lock().unwrap_or_else(PoisonError::into_inner);
+        while *applied < seq && !self.halted() {
+            applied = self
+                .turn
+                .wait(applied)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
     /// Stop every later commit and wake every waiting one, so it fails
     /// instead of waiting for an item that will not be written or applied.
     /// Called with neither lock held.

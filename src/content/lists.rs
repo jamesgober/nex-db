@@ -287,6 +287,7 @@ mod tests {
             revision: 1,
             at_ms: last,
             path: None,
+            refs: Vec::new(),
         });
         head
     }

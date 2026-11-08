@@ -20,9 +20,12 @@ const MAX_TEXT: usize = 1024 * 1024;
 
 /// Stored entity record format of 0.1 to 0.3: one published revision.
 const RECORD_FORMAT: u8 = 1;
+/// Stored entity record format of builds before 0.4.0 was released: as
+/// [`HEAD_FORMAT`] without the references of published bodies. Read only.
+const HEAD_FORMAT_2: u8 = 2;
 /// Stored entity record format from 0.4: per locale, the working draft
-/// and what is published.
-const HEAD_FORMAT: u8 = 2;
+/// and what is published, with the entities the published body refers to.
+const HEAD_FORMAT: u8 = 3;
 /// Most locales one entity has.
 const MAX_VARIANTS: usize = 64;
 /// Format of a stored revision.
@@ -427,6 +430,29 @@ pub(crate) struct Body {
 }
 
 impl Body {
+    /// The entities the body's fields refer to, in field order.
+    pub(crate) fn refs(&self) -> impl Iterator<Item = Rid> + '_ {
+        self.fields.iter().filter_map(|(_, v)| match v {
+            Value::Entity(rid) => Some(*rid),
+            _ => None,
+        })
+    }
+
+    /// Drop every field referring to `target`; true when one was dropped.
+    pub(crate) fn detach(&mut self, target: Rid) -> bool {
+        let before = self.fields.len();
+        self.fields.retain(|(_, v)| *v != Value::Entity(target));
+        before != self.fields.len()
+    }
+
+    /// The names of the fields referring to `target`.
+    pub(crate) fn fields_referring(&self, target: Rid) -> impl Iterator<Item = &str> + '_ {
+        self.fields
+            .iter()
+            .filter(move |(_, v)| *v == Value::Entity(target))
+            .map(|(n, _)| n.as_str())
+    }
+
     fn check(&self) -> Result<()> {
         if let Some(path) = &self.path {
             check_path(path)?;
@@ -527,6 +553,16 @@ pub(crate) struct Published {
     pub(crate) revision: u32,
     pub(crate) at_ms: u64,
     pub(crate) path: Option<String>,
+    /// The entities the published body refers to, sorted, each once.
+    pub(crate) refs: Vec<Rid>,
+}
+
+/// `refs` sorted, each once.
+pub(crate) fn ref_set(refs: impl Iterator<Item = Rid>) -> Vec<Rid> {
+    let mut out: Vec<Rid> = refs.collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// One locale of an entity: its working draft and what is published.
@@ -595,6 +631,16 @@ impl Head {
         self.variants.iter().any(|v| v.published.is_some())
     }
 
+    /// Every entity the head refers to: from each locale's draft and
+    /// published body, sorted, each once.
+    pub(crate) fn refs(&self) -> Vec<Rid> {
+        ref_set(self.variants.iter().flat_map(|v| {
+            v.draft
+                .refs()
+                .chain(v.published.iter().flat_map(|p| p.refs.iter().copied()))
+        }))
+    }
+
     /// When any locale was last published; 0 when none is.
     pub(crate) fn last_published_ms(&self) -> u64 {
         self.variants
@@ -626,11 +672,16 @@ impl Head {
                     w.u32(p.revision);
                     w.u64(p.at_ms);
                     w.str16(p.path.as_deref().unwrap_or(""))?;
+                    w.u16(p.refs.len() as u16);
+                    for rid in &p.refs {
+                        w.bytes(rid.as_bytes());
+                    }
                 }
                 None => {
                     w.u32(0);
                     w.u64(0);
                     w.str16("")?;
+                    w.u16(0);
                 }
             }
             w.str16(v.draft.path.as_deref().unwrap_or(""))?;
@@ -675,14 +726,16 @@ impl Head {
                             revision,
                             at_ms: created_ms,
                             path: path.clone(),
+                            refs: Vec::new(),
                         }),
                         draft: Body { path, fields },
                         source: 0,
                     }],
                     gone: Vec::new(),
-                })
+                }
+                .with_draft_refs())
             }
-            HEAD_FORMAT => {
+            format @ (HEAD_FORMAT_2 | HEAD_FORMAT) => {
                 let rid = Rid::from_bytes(r.fixed()?);
                 let created_ms = r.u64()?;
                 let updated_ms = r.u64()?;
@@ -703,6 +756,12 @@ impl Head {
                     let revision = r.u32()?;
                     let published_ms = r.u64()?;
                     let published_path = Some(r.str16()?.to_owned()).filter(|p| !p.is_empty());
+                    let mut refs = Vec::new();
+                    if format == HEAD_FORMAT {
+                        for _ in 0..r.u16()? {
+                            refs.push(Rid::from_bytes(r.fixed()?));
+                        }
+                    }
                     let draft_path = Some(r.str16()?.to_owned()).filter(|p| !p.is_empty());
                     let fields = read_fields(&mut r, at)?;
                     variants.push(Variant {
@@ -716,6 +775,7 @@ impl Head {
                             revision,
                             at_ms: published_ms,
                             path: published_path,
+                            refs,
                         }),
                     });
                 }
@@ -725,7 +785,7 @@ impl Head {
                     gone.push((locale, r.str16()?.to_owned()));
                 }
                 r.finish()?;
-                Ok(Head {
+                let head = Head {
                     rid,
                     kind,
                     site,
@@ -737,16 +797,39 @@ impl Head {
                     first_published_ms,
                     variants,
                     gone,
+                };
+                Ok(if format == HEAD_FORMAT_2 {
+                    head.with_draft_refs()
+                } else {
+                    head
                 })
             }
             _ => Err(Error::corrupt("an entity record format", at)),
         }
     }
 
+    /// For a format that does not store the references of published
+    /// bodies: take them from the drafts.
+    fn with_draft_refs(mut self) -> Head {
+        for v in &mut self.variants {
+            let refs = ref_set(v.draft.refs());
+            if let Some(p) = &mut v.published {
+                p.refs = refs;
+            }
+        }
+        self
+    }
+
     /// True for a record stored by 0.1 to 0.3, whose published body is its
     /// draft (there is no stored revision).
     pub(crate) fn is_legacy(bytes: &[u8]) -> bool {
         bytes.first() == Some(&RECORD_FORMAT)
+    }
+
+    /// True for a record stored in the current format, whose references
+    /// are in the store.
+    pub(crate) fn is_current(bytes: &[u8]) -> bool {
+        bytes.first() == Some(&HEAD_FORMAT)
     }
 
     /// The entry a reader sees for `body` of `locale` at `revision`;
@@ -1138,6 +1221,7 @@ mod tests {
             revision: 2,
             at_ms: 6,
             path: Some("/u/ann".into()),
+            refs: vec![rid()],
         });
         let fr = Locale::new("fr").unwrap();
         head.add_variant(fr, head.variants[0].draft.clone(), 2)

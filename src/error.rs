@@ -73,6 +73,14 @@ pub enum Error {
     /// A [`Database::read`](crate::Database::read) ran longer than the
     /// snapshot age limit (60 seconds). Read again.
     SnapshotTooOld,
+    /// A reference rule (`Rule::Restrict`, the
+    /// rule of a field none is declared for) refuses deleting an entity
+    /// other entities refer to. Remove the references first (see
+    /// `Content::referenced_by`).
+    Restricted {
+        /// What is referred to.
+        what: &'static str,
+    },
     /// A change feed was asked for changes older than it keeps (or than the
     /// last open). Drop what was built from the feed and start again from
     /// [`Database::position`](crate::Database::position).
@@ -100,6 +108,7 @@ impl Error {
             Error::Corrupt { .. } => "NEX-1007",
             Error::Storage { .. } => "NEX-1008",
             Error::SnapshotTooOld => "NEX-1009",
+            Error::Restricted { .. } => "NEX-1010",
             Error::FeedBehind { .. } => "NEX-1012",
         }
     }
@@ -162,6 +171,11 @@ impl fmt::Display for Error {
                 f,
                 "{code}: the read ran past the snapshot age limit; read again"
             ),
+            Error::Restricted { what } => write!(
+                f,
+                "{code}: other entities refer to the {what} and a reference rule keeps it; \
+                 remove the references first"
+            ),
             Error::FeedBehind { oldest } => write!(
                 f,
                 "{code}: the change feed no longer holds changes before position {oldest}; drop \
@@ -212,6 +226,8 @@ mod tests {
             Error::corrupt("x", 0),
             Error::storage("x", "y"),
             Error::SnapshotTooOld,
+            Error::Restricted { what: "entity" },
+            Error::FeedBehind { oldest: 0 },
         ];
         let mut codes: Vec<&str> = all.iter().map(Error::code).collect();
         codes.sort_unstable();

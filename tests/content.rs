@@ -1201,3 +1201,41 @@ fn test_commit_serializable_refuses_write_skew() {
     let (a, b) = go_off_call(true);
     assert!(a != b, "exactly one stays on call: {a} {b}");
 }
+
+#[test]
+fn test_reads_never_see_a_head_before_its_revision() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let dir = TempDir::new("read-race");
+    let db = Arc::new(Database::open(&dir.0).unwrap());
+    let rid = db
+        .content()
+        .create(Entity::new("post").field("n", 0_i64).path("/p"))
+        .unwrap();
+    let _ = db.content().publish(rid).unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let (db, done) = (Arc::clone(&db), Arc::clone(&done));
+        std::thread::spawn(move || {
+            let mut reads = 0u64;
+            while !done.load(Ordering::Acquire) {
+                // Every read either finds the entity or not; never an error.
+                let entry = db.content().get(rid).unwrap().unwrap();
+                assert!(entry.field("n").is_some());
+                reads += 1;
+            }
+            reads
+        })
+    };
+    for n in 1..200_i64 {
+        db.commit(|tx| {
+            tx.content().save_draft(rid, Patch::new().set("n", n))?;
+            tx.content().publish(rid).map(|_| ())
+        })
+        .unwrap();
+    }
+    done.store(true, Ordering::Release);
+    assert!(reader.join().unwrap() > 0);
+}

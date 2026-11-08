@@ -112,6 +112,9 @@ mod observe;
 mod table;
 mod wheel;
 
+#[cfg(feature = "mfa")]
+#[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+pub use crate::auth::totp::TotpEnrollment;
 #[cfg(feature = "auth")]
 #[cfg_attr(docsrs, doc(cfg(feature = "auth")))]
 pub use crate::auth::{
@@ -126,9 +129,6 @@ pub use crate::auth::{
         SignIn, Standing, Validation,
     },
 };
-#[cfg(feature = "mfa")]
-#[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
-pub use crate::auth::totp::TotpEnrollment;
 #[cfg(feature = "content")]
 #[cfg_attr(docsrs, doc(cfg(feature = "content")))]
 pub use crate::content::{

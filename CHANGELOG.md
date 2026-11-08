@@ -6,6 +6,10 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-08
+
+Second factors, and a read fix.
+
 ### Added
 
 - Passkeys (feature `mfa`): `passkey_registration`, `add_passkey`, `passkey_sign_in`, `verify_passkey`, `passkeys`, `remove_passkey`; `RelyingParty`, `PasskeyChallenge`, `PasskeyRegistration`, `PasskeyAssertion`, `PasskeyId`, and `PasskeyInfo`.
@@ -123,7 +127,8 @@ The walking skeleton.
 - Repository scaffold: `Cargo.toml` (edition 2024, MSRV 1.85), `src/lib.rs` with `VERSION`, CI on Linux, macOS, and Windows (stable and 1.85), `cargo deny` configuration.
 - `dev/PLAN.md`, `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/nex-db/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/jamesgober/nex-db/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/jamesgober/nex-db/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/jamesgober/nex-db/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/nex-db/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/nex-db/compare/v0.1.0...v0.2.0

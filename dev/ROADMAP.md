@@ -2,7 +2,7 @@
 
 > One milestone at a time, each ending with something that runs. Work only on the current milestone. Requirements (FR, NFR) are in [`PLAN.md`](./PLAN.md).
 
-**Current milestone: 0.5.0 (feature complete). 0.1.0 to 0.4.0 are released (GitHub pre-releases).**
+**Current milestone: 0.5.0 (feature complete). 0.1.0 to 0.4.1 are released (GitHub pre-releases).**
 
 ---
 
@@ -83,7 +83,7 @@
 ## 0.5.0 Feature complete
 
 - Split auth (FR-11), per-account keys and erasure (FR-12), search (FR-13), backup and restore (FR-14).
-- From 0.4: TOTP and passkeys (crypt-io 1.5).
+- From 0.4: TOTP and passkeys (crypt-io 1.5), released in 0.4.1.
   - [x] TOTP, feature `mfa` (`PLAN.md` D-094).
   - [x] Passkeys, feature `mfa` (`PLAN.md` D-095).
 - **Exit:** every P0 and P1 item in `docs/API.md` exists.

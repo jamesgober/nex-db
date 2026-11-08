@@ -825,6 +825,10 @@ pub(crate) struct ContentStaged<'e> {
     /// Entities this work deleted.
     deleted: HashSet<Rid>,
     writes: Vec<Vec<u8>>,
+    /// Checked at commit as well as the writes: a serializable commit.
+    serializable: bool,
+    /// Conflict keys of what this work read, when serializable.
+    reads: std::sync::Mutex<Vec<Vec<u8>>>,
 }
 
 impl<'e> ContentStaged<'e> {
@@ -840,6 +844,24 @@ impl<'e> ContentStaged<'e> {
             links: HashMap::new(),
             deleted: HashSet::new(),
             writes: Vec::new(),
+            serializable: false,
+            reads: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Make the commit serializable: what this work reads is checked too.
+    pub(crate) fn serializable(mut self, on: bool) -> Self {
+        self.serializable = on;
+        self
+    }
+
+    /// Note that this work read the item conflict key `key` names.
+    fn note(&self, key: Vec<u8>) {
+        if self.serializable {
+            self.reads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(key);
         }
     }
 }
@@ -855,6 +877,22 @@ impl Staged for ContentStaged<'_> {
 
     fn is_empty(&self) -> bool {
         self.heads.is_empty() && self.ops.is_empty() && self.links.is_empty()
+    }
+
+    fn validate_reads(&self, snapshot: Seq) -> std::result::Result<(), Conflict> {
+        let reads = self
+            .reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self
+            .engine
+            .conflicts
+            .conflicts(reads.iter().map(Vec::as_slice), snapshot)
+        {
+            Err(Conflict)
+        } else {
+            Ok(())
+        }
     }
 
     fn validate(&self, snapshot: Seq) -> std::result::Result<(), Conflict> {
@@ -948,6 +986,8 @@ impl fmt::Debug for ContentTx<'_, '_> {
 impl ContentTx<'_, '_> {
     /// The head of `rid` as this transaction sees it.
     fn head(&self, rid: Rid) -> Result<Head> {
+        self.staged
+            .note(entity_key(self.staged.engine.collection, rid));
         if let Some(head) = self.staged.heads.iter().find(|h| h.rid == rid) {
             return Ok(head.clone());
         }
@@ -960,8 +1000,33 @@ impl ContentTx<'_, '_> {
             .ok_or_else(|| Error::invalid("entity", "no such entity"))
     }
 
+    /// The working draft of `rid` in its own locale as this transaction
+    /// sees it (its own changes included), or `None` when it does not
+    /// exist. In [`commit_serializable`](crate::Database::commit_serializable),
+    /// a change to the entity by another commit makes this one run again.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Storage`] or [`Error::Corrupt`] when the store cannot be read.
+    pub fn draft(&self, rid: Rid) -> Result<Option<Entry>> {
+        match self.head(rid) {
+            Ok(head) => {
+                let base = head.base();
+                Ok(Some(head.entry(
+                    base.locale,
+                    head.last_revision,
+                    base.draft.clone(),
+                    None,
+                )))
+            }
+            Err(Error::Invalid { .. }) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
     /// The space's types as this transaction sees them.
     fn types(&self) -> Types {
+        self.staged.note(TYPES_CONFLICT_KEY.to_vec());
         match &self.staged.types {
             Some(types) => types.clone(),
             None => self.staged.engine.types(),
@@ -1006,6 +1071,8 @@ impl ContentTx<'_, '_> {
                     continue;
                 };
                 for term in value.refs().filter(|t| !old.contains(t)) {
+                    self.staged
+                        .note(entity_key(self.staged.engine.collection, term));
                     let kind = match self.staged.heads.iter().find(|h| h.rid == term) {
                         Some(h) => Some(h.kind.clone()),
                         None => self.staged.engine.head(term)?.map(|h| h.kind),
@@ -1064,6 +1131,8 @@ impl ContentTx<'_, '_> {
     }
 
     fn exists(&self, rid: Rid) -> Result<bool> {
+        self.staged
+            .note(entity_key(self.staged.engine.collection, rid));
         if self.staged.heads.iter().any(|h| h.rid == rid) {
             return Ok(true);
         }
@@ -1076,6 +1145,7 @@ impl ContentTx<'_, '_> {
     /// The entities referring to `target` as this transaction sees it,
     /// other than `target` itself.
     fn referrers(&self, target: Rid) -> Result<Vec<Rid>> {
+        self.staged.note(link_conflict(target));
         let mut out: Vec<Rid> = self
             .staged
             .engine
@@ -1177,6 +1247,7 @@ impl ContentTx<'_, '_> {
 
     /// The route at `path` on `site` as this transaction sees it.
     fn route(&self, site: &str, path: &str) -> Option<RouteEntry> {
+        self.staged.note(route_key(site, path));
         match self.staged.routes.get(&(site.to_owned(), path.to_owned())) {
             Some(entry) => *entry,
             None => self.staged.engine.routes.get(site, path),
@@ -1326,6 +1397,7 @@ impl ContentTx<'_, '_> {
                 .writes
                 .push(format!("k{}", entity.kind_name()).into_bytes());
         }
+        self.staged.note(SPACE_CONFLICT_KEY.to_vec());
         let default = engine.space().default_locale;
         let head = entity.into_head(rid, now_ms(), default)?;
         if let Some(parent) = head.parent {

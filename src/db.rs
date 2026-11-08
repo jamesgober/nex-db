@@ -390,21 +390,70 @@ impl Database {
     where
         F: FnMut(&mut Transaction<'_>) -> Result<T>,
     {
+        self.commit_as(false, &mut f)
+    }
+
+    /// Run `f` as one atomic commit, as [`commit`](Self::commit) does, and
+    /// also check what it read: the commit conflicts (and `f` runs again)
+    /// when an item `f` read was changed by a commit after its snapshot.
+    /// The result is as if the commits ran one after another. Checked are
+    /// the items read by key: entities, routes, the space's types and
+    /// settings, references to an entity, accounts, identifiers, sessions,
+    /// and the roles policy. Listings and other index reads are not.
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "content")]
+    /// # fn main() -> nex_db::Result<()> {
+    /// use nex_db::{Entity, Patch};
+    /// let db = nex_db::open("data/site")?;
+    /// # let (from, to) = (nex_db::Rid::from_bytes([1; 16]), nex_db::Rid::from_bytes([2; 16]));
+    /// // Move one seat from `from` to `to`, reading both first.
+    /// db.commit_serializable(|tx| {
+    ///     let seats = |e: Option<nex_db::Entry>| e.and_then(|e| e.field("seats")?.as_int()).unwrap_or(0);
+    ///     let (a, b) = (seats(tx.content().draft(from)?), seats(tx.content().draft(to)?));
+    ///     tx.content().save_draft(from, Patch::new().set("seats", a - 1))?;
+    ///     tx.content().save_draft(to, Patch::new().set("seats", b + 1))
+    /// })?;
+    /// # Ok(())
+    /// # }
+    /// # #[cfg(not(feature = "content"))]
+    /// # fn main() {}
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`commit`](Self::commit).
+    pub fn commit_serializable<T, F>(&self, mut f: F) -> Result<T>
+    where
+        F: FnMut(&mut Transaction<'_>) -> Result<T>,
+    {
+        self.commit_as(true, &mut f)
+    }
+
+    fn commit_as<T, F>(&self, serializable: bool, f: &mut F) -> Result<T>
+    where
+        F: FnMut(&mut Transaction<'_>) -> Result<T>,
+    {
         let started = std::time::Instant::now();
-        let result = self.commit_attempts(&mut f, started);
+        let result = self.commit_attempts(f, started, serializable);
         if let Err(err) = &result {
             self.inner.observers.error(err);
         }
         result
     }
 
-    fn commit_attempts<T, F>(&self, f: &mut F, started: std::time::Instant) -> Result<T>
+    fn commit_attempts<T, F>(
+        &self,
+        f: &mut F,
+        started: std::time::Instant,
+        serializable: bool,
+    ) -> Result<T>
     where
         F: FnMut(&mut Transaction<'_>) -> Result<T>,
     {
         for attempt in 1..=ATTEMPTS {
             let snapshot = self.inner.core.snapshot();
-            let mut tx = Transaction::new(self, snapshot.seq());
+            let mut tx = Transaction::new(self, snapshot.seq(), serializable);
             let value = f(&mut tx)?;
             match self
                 .inner
@@ -545,6 +594,9 @@ pub struct Transaction<'db> {
     #[cfg_attr(not(any(feature = "auth", feature = "content")), allow(dead_code))]
     db: &'db Database,
     snapshot: Seq,
+    /// What the closure reads is checked too.
+    #[cfg_attr(not(any(feature = "auth", feature = "content")), allow(dead_code))]
+    serializable: bool,
     #[cfg(feature = "auth")]
     auth: Option<AuthStaged<'db>>,
     #[cfg(feature = "content")]
@@ -560,10 +612,11 @@ impl fmt::Debug for Transaction<'_> {
 }
 
 impl<'db> Transaction<'db> {
-    fn new(db: &'db Database, snapshot: Seq) -> Self {
+    fn new(db: &'db Database, snapshot: Seq, serializable: bool) -> Self {
         Transaction {
             db,
             snapshot,
+            serializable,
             #[cfg(feature = "auth")]
             auth: None,
             #[cfg(feature = "content")]
@@ -576,10 +629,11 @@ impl<'db> Transaction<'db> {
     #[cfg_attr(docsrs, doc(cfg(feature = "auth")))]
     pub fn auth(&mut self) -> AuthTx<'_, 'db> {
         let db = self.db;
+        let serializable = self.serializable;
         AuthTx {
-            staged: self
-                .auth
-                .get_or_insert_with(|| AuthStaged::new(db.auth_engine())),
+            staged: self.auth.get_or_insert_with(|| {
+                AuthStaged::new(db.auth_engine()).serializable(serializable)
+            }),
         }
     }
 
@@ -588,10 +642,11 @@ impl<'db> Transaction<'db> {
     #[cfg_attr(docsrs, doc(cfg(feature = "content")))]
     pub fn content(&mut self) -> ContentTx<'_, 'db> {
         let db = self.db;
+        let serializable = self.serializable;
         ContentTx {
-            staged: self
-                .content
-                .get_or_insert_with(|| ContentStaged::new(db.content_engine())),
+            staged: self.content.get_or_insert_with(|| {
+                ContentStaged::new(db.content_engine()).serializable(serializable)
+            }),
         }
     }
 

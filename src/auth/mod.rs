@@ -1172,6 +1172,10 @@ pub(crate) struct AuthStaged<'e> {
     removed: HashSet<[u8; 32]>,
     /// The role policy as this work left it.
     policy: Option<Policy>,
+    /// Checked at commit as well as the writes: a serializable commit.
+    serializable: bool,
+    /// Conflict keys of what this work read, when serializable.
+    reads: std::sync::Mutex<Vec<Vec<u8>>>,
 }
 
 impl<'e> AuthStaged<'e> {
@@ -1187,6 +1191,30 @@ impl<'e> AuthStaged<'e> {
             updated: HashMap::new(),
             removed: HashSet::new(),
             policy: None,
+            serializable: false,
+            reads: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Make the commit serializable: what this work reads is checked too.
+    pub(crate) fn serializable(mut self, on: bool) -> Self {
+        self.serializable = on;
+        self
+    }
+
+    /// [`note`](Self::note) `key`, and pass `value` through.
+    fn noted<T>(&self, key: Vec<u8>, value: T) -> T {
+        self.note(key);
+        value
+    }
+
+    /// Note that this work read the item conflict key `key` names.
+    fn note(&self, key: Vec<u8>) {
+        if self.serializable {
+            self.reads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(key);
         }
     }
 }
@@ -1214,6 +1242,22 @@ impl Staged for AuthStaged<'_> {
                     | StagedOp::UpdateAccount { .. }
             )
         })
+    }
+
+    fn validate_reads(&self, snapshot: Seq) -> std::result::Result<(), Conflict> {
+        let reads = self
+            .reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self
+            .engine
+            .conflicts
+            .conflicts(reads.iter().map(Vec::as_slice), snapshot)
+        {
+            Err(Conflict)
+        } else {
+            Ok(())
+        }
     }
 
     fn validate(&self, snapshot: Seq) -> std::result::Result<(), Conflict> {
@@ -1691,7 +1735,12 @@ impl AuthTx<'_, '_> {
         let engine = self.staged.engine;
         let normalized = normalize_identifier(identifier)?;
         let digest = engine.identifier_digest(&normalized);
-        if self.staged.identifiers.contains(&digest) || engine.account_for(&digest)?.is_some() {
+        if self.staged.identifiers.contains(&digest) || {
+            self.staged.note(identifier_key(engine.collection, &digest));
+            engine.account_for(&digest)
+        }?
+        .is_some()
+        {
             return Err(Error::AlreadyExists { what: "identifier" });
         }
         let account = AccountId::generate();
@@ -1729,7 +1778,12 @@ impl AuthTx<'_, '_> {
     /// - [`Error::Busy`] when the session table is full.
     pub fn issue_session(&mut self, account: AccountId, spec: SessionSpec) -> Result<Token> {
         let engine = self.staged.engine;
-        if !self.staged.accounts.contains(&account) && !engine.account_exists(account)? {
+        if !self.staged.accounts.contains(&account)
+            && !{
+                self.staged.note(account_key(engine.collection, account));
+                engine.account_exists(account)
+            }?
+        {
             return Err(Error::invalid("account", "no such account"));
         }
         if engine.sessions.len() + self.staged.issued.len() >= engine.max_sessions {
@@ -1767,7 +1821,12 @@ impl AuthTx<'_, '_> {
         ttl: Duration,
     ) -> Result<Token> {
         let engine = self.staged.engine;
-        if !self.staged.accounts.contains(&account) && !engine.account_exists(account)? {
+        if !self.staged.accounts.contains(&account)
+            && !{
+                self.staged.note(account_key(engine.collection, account));
+                engine.account_exists(account)
+            }?
+        {
             return Err(Error::invalid("account", "no such account"));
         }
         self.stage_single_use(purpose, account, ttl)
@@ -1821,11 +1880,18 @@ impl AuthTx<'_, '_> {
         let digest = engine.single_use_digest(&random);
         // Two redeems of one token conflict on its key: only one lands.
         self.staged.writes.push(session_key(&digest));
-        let account = match engine.sessions.get(&digest) {
+        let account = match self
+            .staged
+            .noted(session_key(&digest), engine.sessions.get(&digest))
+        {
             Some(Slot::Live(session))
                 if now_ms() < session.expires_ms
                     && session.payload.as_bytes() == purpose.payload()
-                    && engine.account_exists(session.account)? =>
+                    && {
+                        self.staged
+                            .note(account_key(engine.collection, session.account));
+                        engine.account_exists(session.account)
+                    }? =>
             {
                 session.account
             }
@@ -1868,7 +1934,10 @@ impl AuthTx<'_, '_> {
             .raised
             .get(&account)
             .copied()
-            .unwrap_or_else(|| self.staged.engine.epochs.get(account))
+            .unwrap_or_else(|| {
+                self.staged.note(epoch_key(&account));
+                self.staged.engine.epochs.get(account)
+            })
     }
 
     /// Sign `account` out everywhere: every session issued before this
@@ -1883,7 +1952,12 @@ impl AuthTx<'_, '_> {
     /// [`Error::Invalid`] when the account does not exist.
     pub fn revoke_all(&mut self, account: AccountId) -> Result<u32> {
         let engine = self.staged.engine;
-        if !self.staged.accounts.contains(&account) && !engine.account_exists(account)? {
+        if !self.staged.accounts.contains(&account)
+            && !{
+                self.staged.note(account_key(engine.collection, account));
+                engine.account_exists(account)
+            }?
+        {
             return Err(Error::invalid("account", "no such account"));
         }
         let epoch = self.epoch(account);
@@ -1917,14 +1991,19 @@ impl AuthTx<'_, '_> {
         let engine = self.staged.engine;
         let session = token::parse(token.as_ref())
             .map(|random| engine.token_digest(&random))
-            .and_then(|digest| match engine.sessions.get(&digest) {
-                Some(Slot::Live(session))
-                    if now_ms() < session.expires_ms
-                        && session.epoch == self.epoch(session.account) =>
+            .and_then(|digest| {
+                match self
+                    .staged
+                    .noted(session_key(&digest), engine.sessions.get(&digest))
                 {
-                    Some((digest, session))
+                    Some(Slot::Live(session))
+                        if now_ms() < session.expires_ms
+                            && session.epoch == self.epoch(session.account) =>
+                    {
+                        Some((digest, session))
+                    }
+                    _ => None,
                 }
-                _ => None,
             });
         let Some((digest, session)) = session else {
             return Err(Error::invalid("token", "names no valid session"));
@@ -1980,7 +2059,11 @@ impl AuthTx<'_, '_> {
         if let Some(record) = self.staged.updated.get(&account) {
             return Ok(Some(record.clone()));
         }
-        self.staged.engine.load_account(account)
+        {
+            self.staged
+                .note(account_key(self.staged.engine.collection, account));
+            self.staged.engine.load_account(account)
+        }
     }
 
     /// Replace the account's record with `change` applied, in this commit;
@@ -2032,7 +2115,10 @@ impl AuthTx<'_, '_> {
     fn policy(&self) -> Policy {
         match &self.staged.policy {
             Some(policy) => policy.clone(),
-            None => (*self.staged.engine.policy()).clone(),
+            None => {
+                self.staged.note(POLICY_CONFLICT_KEY.to_vec());
+                (*self.staged.engine.policy()).clone()
+            }
         }
     }
 
@@ -2068,7 +2154,11 @@ impl AuthTx<'_, '_> {
         let normalized = normalize_identifier(identifier)?;
         let digest = engine.identifier_digest(&normalized);
         let taken = self.staged.identifiers.contains(&digest)
-            || (!self.staged.removed.contains(&digest) && engine.account_for(&digest)?.is_some());
+            || (!self.staged.removed.contains(&digest) && {
+                self.staged.note(identifier_key(engine.collection, &digest));
+                engine.account_for(&digest)
+            }?
+            .is_some());
         if taken {
             return Err(Error::AlreadyExists { what: "identifier" });
         }
@@ -2212,8 +2302,13 @@ impl AuthTx<'_, '_> {
             return Ok(false);
         };
         let digest = engine.token_digest(&random);
-        let live = matches!(engine.sessions.get(&digest), Some(Slot::Live(_)))
-            || self.staged.issued.contains(&digest);
+        let live = matches!(
+            {
+                self.staged.note(session_key(&digest));
+                engine.sessions.get(&digest)
+            },
+            Some(Slot::Live(_))
+        ) || self.staged.issued.contains(&digest);
         if !live {
             return Ok(false);
         }

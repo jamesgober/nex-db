@@ -1119,3 +1119,71 @@ fn test_scheduled_publishing_fires_on_time() {
     assert!(wait_for(&db, later, true), "never published after reopen");
     assert!(db.content().get(gone).unwrap().is_none());
 }
+
+/// Two doctors on call; each goes off call only if the other is still on.
+/// Both read before either commits.
+fn go_off_call(serializable: bool) -> (bool, bool) {
+    use std::sync::{Arc, Barrier};
+    let dir = TempDir::new(if serializable {
+        "skew-serial"
+    } else {
+        "skew-si"
+    });
+    let db = Arc::new(Database::open(&dir.0).unwrap());
+    let doctor = || {
+        db.content()
+            .create(Entity::new("doctor").field("on_call", true))
+            .unwrap()
+    };
+    let (a, b) = (doctor(), doctor());
+    let barrier = Arc::new(Barrier::new(2));
+    let run = |me: nex_db::Rid, other: nex_db::Rid| {
+        let db = Arc::clone(&db);
+        let barrier = Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            let mut first = true;
+            let body = |tx: &mut nex_db::Transaction<'_>| {
+                let on = |e: Option<nex_db::Entry>| {
+                    e.and_then(|e| e.field("on_call").and_then(Value::as_bool))
+                        .unwrap_or(false)
+                };
+                let both = on(tx.content().draft(me)?) && on(tx.content().draft(other)?);
+                if std::mem::take(&mut first) {
+                    barrier.wait();
+                }
+                if both {
+                    tx.content()
+                        .save_draft(me, Patch::new().set("on_call", false))?;
+                }
+                Ok(())
+            };
+            if serializable {
+                db.commit_serializable(body)
+            } else {
+                db.commit(body)
+            }
+        })
+    };
+    let (ta, tb) = (run(a, b), run(b, a));
+    ta.join().unwrap().unwrap();
+    tb.join().unwrap().unwrap();
+    let on = |rid| {
+        db.content()
+            .draft(rid)
+            .unwrap()
+            .unwrap()
+            .field("on_call")
+            .and_then(Value::as_bool)
+            .unwrap()
+    };
+    (on(a), on(b))
+}
+
+#[test]
+fn test_commit_serializable_refuses_write_skew() {
+    // Snapshot isolation lets both go: nobody is left on call.
+    assert_eq!(go_off_call(false), (false, false));
+    // Serializable: the second runs again, sees the first gone, and stays.
+    let (a, b) = go_off_call(true);
+    assert!(a != b, "exactly one stays on call: {a} {b}");
+}

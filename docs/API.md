@@ -62,6 +62,7 @@ nex-db = { git = "https://github.com/jamesgober/nex-db", tag = "v0.4.0" }
 | `content` | yes | the content engine: entities, routes |
 | `split-auth` (0.5) | no | the auth engine in its own process |
 | `metrics` (0.4) | no | an observer that reports into metrics-lib |
+| `mfa` (0.5) | no | TOTP second factors (passkeys to come), through crypt-io's AWS-LC backend: needs a C compiler; on Windows x86-64 no NASM |
 
 The core (commit log, catalog, recovery) is always built. A database that uses
 an engine the build leaves out refuses to open with `Error::Invalid`.
@@ -432,14 +433,20 @@ it.
 
 `SignIn` (non-exhaustive): `Success { account, token }` and `Failed` (0.1);
 `LockedOut { until: Option<SystemTime> }` (0.3) and
-`NeedsSecondFactor { challenge }` (0.4). `LockedOut` covers a lock-out, a
+`NeedsSecondFactor { challenge }` (0.5). `LockedOut` covers a lock-out, a
 suspension, and a ban; `until` is `None` when only an administrator can lift
 it. It is returned only after the password matched. A wrong password on a
 locked-out account, or an unknown identifier, gives `Failed` after the same
 work, so only someone who knows the password learns the account is locked.
 
 `Login` is `SignIn` without the session: `Verified(AccountId)`, `Failed`,
-`LockedOut { until }`, `NeedsSecondFactor { challenge }`.
+`LockedOut { until }`, `NeedsSecondFactor { account }` (0.5: the password
+matched and the account has TOTP on; it is not signed in until
+`check_totp` accepts a code).
+
+An account with TOTP on never signs in on its password alone, in any build:
+one without the `mfa` feature answers `NeedsSecondFactor` too, and cannot
+complete it.
 
 `Standing` (non-exhaustive): `Active`, `PendingVerification`,
 `LockedOut { until }`, `Suspended { until: Option<SystemTime>, reason }`,
@@ -452,8 +459,9 @@ every session of the account in the same commit.
 
 | Operation | Grade | Notes |
 |---|---|---|
-| `add_totp(account) -> Result<TotpEnrollment>`, `confirm_totp(account, code)` | P1 | the secret is sealed; codes are single-use; waits for HMAC-SHA1 in crypt-io (to come) |
-| `verify_totp(challenge, code) -> Result<SignIn>` | P1 | completes `NeedsSecondFactor` |
+| `add_totp(account) -> Result<TotpEnrollment>`, `confirm_totp(account, code) -> Result<bool>`, `remove_totp(account) -> Result<bool>` (0.5, feature `mfa`; also in a transaction) | P1 | a 160-bit secret, sealed; `TotpEnrollment::secret()` (base32) and `uri(issuer, label)` (`otpauth://`, SHA1, six digits, 30 s) shown once; TOTP is on once a code is confirmed |
+| `verify_totp(challenge, code, spec) -> Result<SignIn>` (0.5, feature `mfa`) | P1 | completes `SignIn::NeedsSecondFactor`: the challenge is a single-use token that lasts five minutes; a wrong code counts toward lock-out and leaves the challenge for another try; a code works once (one step of drift either way) |
+| `check_totp(account, code) -> Result<bool>` (0.5, feature `mfa`; also in a transaction) | P1 | after `Login::NeedsSecondFactor`, for an application that issues its own sessions |
 | `new_recovery_codes(account) -> Result<RecoveryCodes>` (tx) | P1 | ten codes, `xxxxx-xxxxx` (Crockford base32, 50 bits each); replaces any earlier codes; shown once (`codes()`); stored as keyed digests |
 | `use_recovery_code(account, code) -> Result<bool>` (tx) | P1 | `true` once per code; dashes, spaces, and case ignored; two uses at once give `true` to one |
 | `add_passkey`, `verify_passkey` | P2 | WebAuthn public keys and counters; waits for ECDSA P-256 in crypt-io (to come) |

@@ -6,6 +6,14 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 ## [Unreleased]
 
+### Added
+
+- TOTP second factors (feature `mfa`): `add_totp`, `confirm_totp`, `check_totp`, `remove_totp`, `verify_totp`, and `TotpEnrollment`; `SignIn::NeedsSecondFactor` and `Login::NeedsSecondFactor`.
+
+### Changed
+
+- crypt-io 1.5.
+
 ## [0.4.0] - 2026-11-08
 
 Content and adapters.

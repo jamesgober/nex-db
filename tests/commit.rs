@@ -1171,3 +1171,126 @@ fn test_recovery_codes_work_once_and_replace_each_other() {
         .count();
     assert_eq!(winners, 1);
 }
+
+/// RFC 4648 base32 without padding, for the test to read the secret.
+#[cfg(feature = "mfa")]
+fn base32_decode(text: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let (mut buffer, mut bits) = (0u32, 0);
+    for c in text.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'2'..=b'7' => c - b'2' + 26,
+            _ => panic!("not base32"),
+        };
+        buffer = (buffer << 5) | u32::from(v);
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    out
+}
+
+#[cfg(feature = "mfa")]
+#[test]
+fn test_totp_second_factor_signs_in_once_per_code() {
+    let dir = TempDir::new("totp");
+    let db = Database::open(&dir.0).unwrap();
+    let password = db.auth().hash_password(PASSWORD).unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    let enrollment = db.auth().add_totp(ann).unwrap();
+    assert!(
+        enrollment
+            .uri("Site", "ann@example.com")
+            .contains("algorithm=SHA1")
+    );
+    let secret = base32_decode(&enrollment.secret());
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    let code = |at: u64| format!("{:06}", crypt_io::otp::totp(&secret, at, 6).unwrap());
+
+    // Not on until confirmed.
+    assert!(matches!(
+        db.auth()
+            .sign_in("ann@example.com", PASSWORD, SessionSpec::web())
+            .unwrap(),
+        SignIn::Success { .. }
+    ));
+    // One start time throughout, so a step boundary mid-test changes
+    // nothing: the window takes a step either way.
+    let t0 = now();
+    if code(t0) != "000000" {
+        assert!(!db.auth().confirm_totp(ann, "000000").unwrap());
+    }
+    assert!(db.auth().confirm_totp(ann, &code(t0)).unwrap());
+
+    // Now a sign-in needs a code, and a password check says so too.
+    assert_eq!(
+        db.auth()
+            .verify_password("ann@example.com", PASSWORD)
+            .unwrap(),
+        Login::NeedsSecondFactor { account: ann }
+    );
+    let SignIn::NeedsSecondFactor { challenge } = db
+        .auth()
+        .sign_in("ann@example.com", PASSWORD, SessionSpec::web())
+        .unwrap()
+    else {
+        panic!("needs a second factor");
+    };
+    // The challenge is not a session.
+    assert_eq!(db.auth().validate(&challenge).unwrap(), Validation::Unknown);
+    // The code used to confirm does not work again.
+    assert!(matches!(
+        db.auth()
+            .verify_totp(&challenge, &code(t0), SessionSpec::web())
+            .unwrap(),
+        SignIn::Failed
+    ));
+    // The next step's code does, once; the challenge is then used up.
+    let next = code(t0 + 30);
+    let SignIn::Success { account, token } = db
+        .auth()
+        .verify_totp(&challenge, &next, SessionSpec::web())
+        .unwrap()
+    else {
+        panic!("signed in");
+    };
+    assert_eq!(account, ann);
+    assert!(matches!(
+        db.auth().validate(&token).unwrap(),
+        Validation::Valid(_)
+    ));
+    assert!(matches!(
+        db.auth()
+            .verify_totp(&challenge, &next, SessionSpec::web())
+            .unwrap(),
+        SignIn::Failed
+    ));
+    assert!(!db.auth().check_totp(ann, &next).unwrap());
+    assert!(matches!(
+        db.auth()
+            .verify_totp("not a token", &next, SessionSpec::web())
+            .unwrap(),
+        SignIn::Failed
+    ));
+
+    // Off again: the password alone signs in.
+    assert!(db.auth().remove_totp(ann).unwrap());
+    assert!(!db.auth().remove_totp(ann).unwrap());
+    assert!(matches!(
+        db.auth()
+            .sign_in("ann@example.com", PASSWORD, SessionSpec::web())
+            .unwrap(),
+        SignIn::Success { .. }
+    ));
+}

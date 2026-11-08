@@ -3,8 +3,8 @@
 //! Derived, like the route index: rebuilt from the entity heads at open and
 //! updated as commits apply. Two orders per site and type: by first
 //! publication (`latest`) and by the last publish (`updated`), and the same
-//! per author. A page is a range read of an ordered set, so a listing never
-//! scans entities.
+//! per author and per entity referred to (a term). A page is a range read of
+//! an ordered set, so a listing never scans entities.
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -40,7 +40,15 @@ pub struct Listing {
     pub(crate) site: String,
     pub(crate) order: u8,
     pub(crate) limit: usize,
-    pub(crate) author: Option<AccountId>,
+    pub(crate) filter: Option<Filter>,
+}
+
+/// What a listing keeps: entities of an author, or entities whose
+/// published body refers to an entity (a term).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Filter {
+    Author(AccountId),
+    Refers(Rid),
 }
 
 impl Listing {
@@ -52,14 +60,24 @@ impl Listing {
             site: crate::DEFAULT_SITE.to_owned(),
             order: ORDER_LATEST,
             limit: DEFAULT_PAGE,
-            author: None,
+            filter: None,
         }
     }
 
     /// Only entities `account` is an author of
-    /// ([`Entity::author`](crate::Entity::author)).
+    /// ([`Entity::author`](crate::Entity::author)). Replaces a
+    /// [`term`](Self::term) filter.
     pub fn by_author(mut self, account: AccountId) -> Listing {
-        self.author = Some(account);
+        self.filter = Some(Filter::Author(account));
+        self
+    }
+
+    /// Only entities whose published body refers to `term`: a term in a
+    /// terms field ([`Type::terms`](crate::Type::terms)), or any entity
+    /// referred to, for "posts in this series". Replaces a
+    /// [`by_author`](Self::by_author) filter.
+    pub fn term(mut self, term: Rid) -> Listing {
+        self.filter = Some(Filter::Refers(term));
         self
     }
 
@@ -111,11 +129,14 @@ impl fmt::Display for Cursor {
         for b in self.listing.kind.as_bytes() {
             write!(f, "{b:02x}")?;
         }
-        if let Some(author) = self.listing.author {
-            f.write_str(".")?;
-            for b in author.as_bytes() {
-                write!(f, "{b:02x}")?;
-            }
+        let (tag, id) = match self.listing.filter {
+            None => return Ok(()),
+            Some(Filter::Author(a)) => ('a', *a.as_bytes()),
+            Some(Filter::Refers(r)) => ('t', *r.as_bytes()),
+        };
+        write!(f, ".{tag}")?;
+        for b in id {
+            write!(f, "{b:02x}")?;
         }
         Ok(())
     }
@@ -140,19 +161,24 @@ impl Cursor {
     pub fn parse(text: &str) -> Result<Cursor> {
         let bad = || Error::invalid("cursor", "not a cursor");
         let parts: Vec<&str> = text.split('.').collect();
-        let (order, limit, inv, rid, site, kind, author) = match parts.as_slice() {
+        let (order, limit, inv, rid, site, kind, filter) = match parts.as_slice() {
             [order, limit, inv, rid, site, kind] => (order, limit, inv, rid, site, kind, None),
-            [order, limit, inv, rid, site, kind, author] => {
-                (order, limit, inv, rid, site, kind, Some(author))
+            [order, limit, inv, rid, site, kind, filter] => {
+                (order, limit, inv, rid, site, kind, Some(filter))
             }
             _ => return Err(bad()),
         };
-        let author = match author {
-            Some(text) => Some(AccountId::from_bytes(
-                unhex(text)
-                    .and_then(|b| b.try_into().ok())
-                    .ok_or_else(bad)?,
-            )),
+        let filter = match filter {
+            Some(text) => {
+                let id = |hex: &str| -> Result<[u8; 16]> {
+                    unhex(hex).and_then(|b| b.try_into().ok()).ok_or_else(bad)
+                };
+                match text.split_at_checked(1) {
+                    Some(("a", hex)) => Some(Filter::Author(AccountId::from_bytes(id(hex)?))),
+                    Some(("t", hex)) => Some(Filter::Refers(Rid::from_bytes(id(hex)?))),
+                    _ => return Err(bad()),
+                }
+            }
             None => None,
         };
         let order: u8 = order.parse().map_err(|_| bad())?;
@@ -170,7 +196,7 @@ impl Cursor {
                 site,
                 order,
                 limit: limit.clamp(1, MAX_PAGE),
-                author,
+                filter,
             },
             after: (inv, rid),
         })
@@ -207,13 +233,13 @@ impl<T> Page<T> {
 /// An entry's place in one order: (group, order, inverted time, id).
 type Row = (u32, u8, u64, [u8; 16]);
 
-/// A group of rows: site, type, and author (none for every entity).
-type Group = (String, String, Option<AccountId>);
+/// A group of rows: site, type, and filter (none for every entity).
+type Group = (String, String, Option<Filter>);
 
 #[derive(Debug, Default)]
 struct Inner {
     rows: BTreeSet<Row>,
-    /// The group number of each (site, type, author).
+    /// The group number of each (site, type, filter).
     groups: HashMap<Group, u32>,
     /// Each listed entity's rows, to remove them when it changes.
     placed: HashMap<Rid, Vec<Row>>,
@@ -257,9 +283,19 @@ impl ListIndex {
         let rid = *head.rid.as_bytes();
         let latest = u64::MAX - head.first_published_ms;
         let updated = u64::MAX - head.last_published_ms();
+        // Every entity a published body refers to.
+        let refers = super::entity::ref_set(
+            head.variants
+                .iter()
+                .filter_map(|v| v.published.as_ref())
+                .flat_map(|p| p.refs.iter().copied()),
+        );
+        let filters = std::iter::once(None)
+            .chain(head.authors.iter().map(|a| Some(Filter::Author(*a))))
+            .chain(refers.into_iter().map(|r| Some(Filter::Refers(r))));
         let mut rows = Vec::with_capacity(2 + 2 * head.authors.len());
-        for author in std::iter::once(None).chain(head.authors.iter().copied().map(Some)) {
-            let group = inner.group((head.site.clone(), head.kind.clone(), author));
+        for filter in filters {
+            let group = inner.group((head.site.clone(), head.kind.clone(), filter));
             rows.push((group, ORDER_LATEST, latest, rid));
             rows.push((group, ORDER_UPDATED, updated, rid));
         }
@@ -279,7 +315,7 @@ impl ListIndex {
         let inner = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let Some(group) = inner
             .groups
-            .get(&(listing.site.clone(), listing.kind.clone(), listing.author))
+            .get(&(listing.site.clone(), listing.kind.clone(), listing.filter))
             .copied()
         else {
             return (Vec::new(), None);
@@ -355,7 +391,15 @@ mod tests {
         by_ann.authors.clear();
         index.update(&by_ann);
         assert!(ids(&Listing::latest("post").by_author(ann)).is_empty());
+        // By an entity a published body refers to.
+        let tag = Rid::from_bytes([7; 16]);
+        if let Some(p) = by_ann.variants[0].published.as_mut() {
+            p.refs = vec![tag];
+        }
+        index.update(&by_ann);
+        assert_eq!(n(ids(&Listing::latest("post").term(tag))), [4]);
         index.remove(by_ann.rid);
+        assert!(ids(&Listing::latest("post").term(tag)).is_empty());
 
         let mut gone = head(2, 20, 20);
         gone.variants[0].published = None;
@@ -375,6 +419,12 @@ mod tests {
             after: (1, [2; 16]),
         };
         assert_eq!(Cursor::parse(&by.to_string()).unwrap(), by);
+        let term = Cursor {
+            listing: Listing::latest("post").term(Rid::from_bytes([4; 16])),
+            after: (1, [2; 16]),
+        };
+        assert_eq!(Cursor::parse(&term.to_string()).unwrap(), term);
+        assert!(Cursor::parse(&format!("{term}").replace(".t", ".x")).is_err());
         for junk in ["", "1.2.3", "9.1.0.00.00.00", "x.y.z.w.v.u"] {
             assert!(Cursor::parse(junk).is_err(), "{junk}");
         }

@@ -19,6 +19,7 @@ All notable changes to `nex-db` are documented in this file. The format is based
 - `Database::health` and `Health`; `Builder::observer`, `Observer`, `CommitInfo`, and `SecurityEvent`.
 - `trash`, `restore`, and `delete` (paths of a trashed or deleted entity answer `RouteKind::Gone`).
 - Types: `Content::define`, `type_named`, `Type` (`field`, `unique`, `singleton`), and `FieldType`.
+- Terms: `Value::List`, `FieldType::List` and `FieldType::Terms`, `Type::terms` and `Type::taxonomy`, and `Listing::term`.
 - Page tree and authors: `Entity::parent`, `order`, and `author`; `set_parent`, `set_order`, `set_authors`; `Content::children` and `ancestors`; `Entry::parent`, `order`, and `authors`; `Listing::by_author`.
 - References: `Type::reference` and `Rule` (`Restrict`, `Detach`, `Cascade`), applied by `delete`; `Content::referenced_by`; `Error::Restricted` (NEX-1010).
 - Locales: `Locale`, `SpaceSpec`, `Content::space` and `set_space`, `Entity::locale`, `translate`, `publish_in`, `unpublish_in`, `set_path_in`, `get_in`, `draft_in`; `Entry::locale` and `fallback`; `RouteEntry::locale`; `RevisionInfo::locale`.

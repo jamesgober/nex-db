@@ -19,8 +19,10 @@ use crate::{
     ids::Rid,
 };
 
-/// Format of the stored types.
-const TYPES_FORMAT: u8 = 1;
+/// Format of the stored types: 2 adds the taxonomy of each terms field.
+const TYPES_FORMAT: u8 = 2;
+/// The format before, read only.
+const TYPES_FORMAT_1: u8 = 1;
 /// Most types a space declares.
 const MAX_TYPES: usize = 256;
 /// Most fields a type declares.
@@ -80,6 +82,11 @@ pub enum FieldType {
     Account,
     /// [`Value::Entity`].
     Entity,
+    /// [`Value::List`].
+    List,
+    /// A [`Value::List`] of [`Value::Entity`] references to terms: entities
+    /// of one taxonomy (declared with [`Type::terms`]).
+    Terms,
 }
 
 impl FieldType {
@@ -90,6 +97,8 @@ impl FieldType {
             FieldType::Bool => 3,
             FieldType::Account => 4,
             FieldType::Entity => 5,
+            FieldType::List => 6,
+            FieldType::Terms => 7,
         }
     }
 
@@ -100,6 +109,8 @@ impl FieldType {
             3 => FieldType::Bool,
             4 => FieldType::Account,
             5 => FieldType::Entity,
+            6 => FieldType::List,
+            7 => FieldType::Terms,
             _ => return Err(Error::corrupt("a field type", at)),
         })
     }
@@ -112,7 +123,13 @@ impl FieldType {
                 | (FieldType::Bool, Value::Bool(_))
                 | (FieldType::Account, Value::Account(_))
                 | (FieldType::Entity, Value::Entity(_))
-        )
+                | (FieldType::List, Value::List(_))
+        ) || match (self, value) {
+            (FieldType::Terms, Value::List(values)) => {
+                values.iter().all(|v| matches!(v, Value::Entity(_)))
+            }
+            _ => false,
+        }
     }
 }
 
@@ -132,6 +149,8 @@ pub struct Type {
     pub(crate) name: String,
     pub(crate) singleton: bool,
     pub(crate) fields: Vec<(String, FieldType, u8)>,
+    /// Each terms field and the taxonomy (a type) its terms are of.
+    pub(crate) taxonomies: Vec<(String, String)>,
 }
 
 impl Type {
@@ -141,7 +160,37 @@ impl Type {
             name: name.into(),
             singleton: false,
             fields: Vec::new(),
+            taxonomies: Vec::new(),
         }
+    }
+
+    /// Declare field `name` as a list of terms of `taxonomy`: references
+    /// to entities of type `taxonomy` (a tag, a category), each checked
+    /// when saved. Deleting a term removes it from the list
+    /// ([`Rule::Detach`]); [`Listing::term`](crate::Listing::term) lists
+    /// the entities with a term.
+    ///
+    /// ```
+    /// use nex_db::Type;
+    /// let post = Type::new("post").terms("tags", "tag");
+    /// assert_eq!(post.taxonomy("tags"), Some("tag"));
+    /// ```
+    pub fn terms(mut self, name: impl Into<String>, taxonomy: impl Into<String>) -> Type {
+        let name = name.into();
+        self.taxonomies.retain(|(n, _)| *n != name);
+        self.taxonomies.push((name.clone(), taxonomy.into()));
+        self.fields
+            .push((name, FieldType::Terms, Rule::Detach.bits()));
+        self
+    }
+
+    /// The taxonomy of terms field `name`, if it is one.
+    #[must_use]
+    pub fn taxonomy(&self, name: &str) -> Option<&str> {
+        self.taxonomies
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, t)| t.as_str())
     }
 
     /// At most one entity of this type in the space: site settings,
@@ -229,9 +278,12 @@ impl Types {
             return Err(Error::invalid("type", "at most 256 fields"));
         }
         let mut names = HashSet::new();
-        for (name, _, _) in &next.fields {
+        for (name, kind, flags) in &next.fields {
             if !names.insert(name.as_str()) {
                 return Err(Error::invalid("type", "declares a field twice"));
+            }
+            if flags & FLAG_UNIQUE != 0 && matches!(kind, FieldType::List | FieldType::Terms) {
+                return Err(Error::invalid("type", "a list field cannot be unique"));
             }
         }
         if let Some(old) = self.get(&next.name) {
@@ -252,6 +304,11 @@ impl Types {
             if old.singleton && !next.singleton {
                 return Err(Error::invalid("type", "stays a singleton"));
             }
+            for (name, taxonomy) in &old.taxonomies {
+                if next.taxonomy(name) != Some(taxonomy.as_str()) {
+                    return Err(Error::invalid("type", "a terms field keeps its taxonomy"));
+                }
+            }
         } else if self.types.len() >= MAX_TYPES {
             return Err(Error::invalid("types", "a space has at most 256"));
         }
@@ -259,6 +316,11 @@ impl Types {
         out.types.retain(|t| t.name != next.name);
         out.types.push(next);
         Ok(out)
+    }
+
+    /// The taxonomy of terms field `field` of type `kind`, if it is one.
+    pub(crate) fn taxonomy(&self, kind: &str, field: &str) -> Option<&str> {
+        self.get(kind).and_then(|t| t.taxonomy(field))
     }
 
     /// What deleting an entity does to field `field` of an entity of
@@ -323,13 +385,19 @@ impl Types {
                 w.u8(kind.code());
                 w.u8(*flags);
             }
+            w.u16(ty.taxonomies.len() as u16);
+            for (name, taxonomy) in &ty.taxonomies {
+                w.str16(name)?;
+                w.str16(taxonomy)?;
+            }
         }
         Ok(out)
     }
 
     pub(crate) fn decode(bytes: &[u8], at: u64) -> Result<Types> {
         let mut r = Reader::new(bytes, "the content types", at);
-        if r.u8()? != TYPES_FORMAT {
+        let format = r.u8()?;
+        if format != TYPES_FORMAT && format != TYPES_FORMAT_1 {
             return Err(Error::corrupt("the content types format", at));
         }
         let mut types = Vec::new();
@@ -341,17 +409,26 @@ impl Types {
                 let field = r.str16()?.to_owned();
                 let kind = FieldType::of(r.u8()?, at)?;
                 let flags = r.u8()?;
+                let referring = matches!(kind, FieldType::Entity | FieldType::Terms);
                 if flags & !(FLAG_UNIQUE | RULE_MASK) != 0
-                    || (Rule::of(flags).is_some() && kind != FieldType::Entity)
+                    || (Rule::of(flags).is_some() && !referring)
                 {
                     return Err(Error::corrupt("a field's flags", at));
                 }
                 fields.push((field, kind, flags));
             }
+            let mut taxonomies = Vec::new();
+            if format == TYPES_FORMAT {
+                for _ in 0..r.u16()? {
+                    let field = r.str16()?.to_owned();
+                    taxonomies.push((field, r.str16()?.to_owned()));
+                }
+            }
             types.push(Type {
                 name,
                 singleton,
                 fields,
+                taxonomies,
             });
         }
         r.finish()?;
@@ -385,6 +462,8 @@ pub(crate) fn unique_key(kind: &str, field: &str, value: &Value) -> Vec<u8> {
             key.push(5);
             key.extend_from_slice(r.as_bytes());
         }
+        // A list field is never unique (refused when declared).
+        Value::List(_) => key.push(6),
     }
     key
 }
@@ -549,6 +628,46 @@ mod tests {
         assert_eq!(changed.rule("post", "author"), Rule::Detach);
         // Dropping the field is still refused.
         assert!(types.with(Type::new("post")).is_err());
+    }
+
+    #[test]
+    fn test_terms_fields_round_trip_and_keep_their_taxonomy() {
+        let types = Types::default()
+            .with(
+                Type::new("post")
+                    .terms("tags", "tag")
+                    .field("links", FieldType::List),
+            )
+            .unwrap();
+        assert_eq!(Types::decode(&types.encode().unwrap(), 0).unwrap(), types);
+        assert_eq!(types.taxonomy("post", "tags"), Some("tag"));
+        assert_eq!(types.rule("post", "tags"), Rule::Detach);
+        assert!(
+            types
+                .with(
+                    Type::new("post")
+                        .terms("tags", "category")
+                        .field("links", FieldType::List)
+                )
+                .is_err()
+        );
+        assert!(
+            Types::default()
+                .with(Type::new("x").field("l", FieldType::List).unique())
+                .is_err()
+        );
+        let body = |v: Value| Body {
+            path: None,
+            fields: vec![("tags".into(), v)],
+        };
+        let rid = Rid::from_bytes([1; 16]);
+        assert!(types.check("post", &body(Value::from([rid]))).is_ok());
+        assert!(
+            types
+                .check("post", &body(Value::List(vec![Value::Int(1)])))
+                .is_err()
+        );
+        assert!(types.check("post", &body(Value::Entity(rid))).is_err());
     }
 
     #[test]

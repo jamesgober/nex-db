@@ -520,8 +520,10 @@ assert_eq!(entry.route(), Some(("example.com", "/blog/hello")));
 ```
 
 `Value` (non-exhaustive): `Text`, `Int`, `Bool`, `Account(AccountId)`,
-`Entity(Rid)` (0.1); `Time`, `Float`, `Bytes`, `Term(TermId)`, `List(..)`,
-`Blob(BlobRef)` (0.4).
+`Entity(Rid)` (0.1); `List(Vec<Value>)` (0.4: at most 1,000 values, none a
+list; `Value::from([rid, ..])` makes a list of references); `Time`, `Float`,
+`Bytes`, `Blob(BlobRef)` (0.4, to come). A term is an entity, so a term
+value is `Value::Entity` in a list.
 
 `Entry` gives `rid()`, `kind()`, `revision()`, `created_at()`, `route()`,
 `field(name)`, `fields()` (0.1), and from 0.4 `locale()`, `fallback()` (the
@@ -551,14 +553,18 @@ a field, a kind, or a flag is refused, so stored values always stay readable.
 
 Built so far: `Type::new`, `.singleton()` (a second entity of the type is
 `AlreadyExists { what: "singleton" }`), `.field(name, FieldType)` with
-`FieldType::Text`, `Int`, `Bool`, `Account`, and `Entity` (a value of another
-kind is refused when saved), and `.unique()` on the field declared last (a
+`FieldType::Text`, `Int`, `Bool`, `Account`, `Entity`, and `List` (a value
+of another kind is refused when saved), `.terms(name, taxonomy)` (a
+`FieldType::Terms` field: a list of references to entities of type
+`taxonomy`, each checked when added; its rule is `Detach`, so deleting a term
+takes it out of the list; `Type::taxonomy(name)` reads it back), and
+`.unique()` on the field declared last, not a list (a
 second published entity with the same value is
 `AlreadyExists { what: "field value" }`; drafts may share it), and
 `.reference(name, Rule)` (a `FieldType::Entity` field; `Type::rule(name)`
 reads the rule back; a redefinition may change a rule). The other
-declarations arrive with what gives them meaning: `Float`, `Time`, `Terms`,
-`Blob`, and `List` with their values, `.indexed`
+declarations arrive with what gives them meaning: `Float`, `Time`, and
+`Blob` with their values, `.indexed`
 with filtered listings, `.translatable` with shared fields, `.searchable`
 with search (0.5), `.revisions` with revision pruning.
 
@@ -739,8 +745,10 @@ or not.
 
 ### Taxonomies, references, assets (0.4)
 
-- **Terms:** `create_term(taxonomy, Term)` with a name, path, and description
-  per locale, a parent, and an order. A term has its own route.
+- **Terms:** a term is an entity of its taxonomy's type (`Entity::new("tag")`)
+  with its name, path, description, translations, parent, and order like any
+  entity, and its own route. A type's `.terms(field, taxonomy)` declares
+  the field that holds a post's terms.
 - **References:** every `Entity`, `Account`, and `Terms` field is indexed both
   ways in the same commit, so "what links here" is one read. References found
   inside a body, which nex-db never parses, are passed with
@@ -768,7 +776,8 @@ or not.
 | `list(&Listing) -> Result<Page<Entry>>`, `next_page(&Cursor)` | 0.4 | P0 |
 | `Listing::latest(kind)`, `.updated()`, `.site(s)`, `.limit(n)` | 0.4 | P0 |
 | `.by_author(a)` | 0.4 | P0 |
-| `.term(t)`, `.sticky_first()` | 0.4 (with terms) | P0 |
+| `.term(t)` | 0.4 | P0 |
+| `.sticky_first()` | 0.4 (to come) | P0 |
 | `children(rid) -> Vec<Rid>`, `ancestors(rid) -> Result<Vec<Rid>>` | 0.4 | P1 |
 | `referenced_by(rid) -> Result<Vec<Rid>>` | 0.4 | P1 |
 | `stream(Listing)` for sitemaps and feeds | 0.4 | P1 |
@@ -777,7 +786,9 @@ or not.
 
 Listings return pages of at most 1,000 (default 100) with an opaque `Cursor`;
 its text form (`to_string()`, `Cursor::parse`) can travel in a URL.
-`by_author(a)` keeps the entities `a` is an author of. Every
+`by_author(a)` keeps the entities `a` is an author of, and `term(t)` those
+whose published body refers to `t` (a term in a terms field, or any
+reference); one filter at a time, the last one set. Every
 listing is answered from an index, never by scanning. `latest` orders by
 first publication, newest first; `updated()` by the last publish. Only
 published entities are listed.

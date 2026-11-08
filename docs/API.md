@@ -365,7 +365,7 @@ opaque to nex-db.
 |---|---|
 | `SessionSpec::web()` (30 days), `SessionSpec::new(ttl)` (up to 400 days) | 0.1 |
 | `.idle(Duration)`, `.recheck_after(Duration)`, `.payload(bytes) -> Result<SessionSpec>` (at most 256 bytes) | 0.3 |
-| `.device(DeviceId)` | 0.4 |
+| `.device(DeviceId)` | 0.5 (moved from 0.4 with devices) |
 
 | Operation | Since | Grade | Notes |
 |---|---|---|---|
@@ -374,8 +374,8 @@ opaque to nex-db.
 | `revoke(token) -> Result<bool>` | 0.1 | P0 | takes effect ahead of ordinary commits; `false` when the token names no session or one already revoked |
 | `rotate(token) -> Result<Token>` | 0.3 | P0 | the old token becomes `Revoked { Rotated }` |
 | `revoke_all(account) -> Result<u32>` | 0.3 | P0 | signs the account out everywhere; returns how many sessions ended |
-| `sessions(account) -> Result<Vec<SessionInfo>>` | 0.4 | P2 | ids, devices, times; never tokens or digests |
-| `revoke_session(account, SessionId) -> Result<bool>` | 0.4 | P2 | for "sign out that device"; a `SessionId` is random and unrelated to the token or its digest |
+| `sessions(account) -> Result<Vec<SessionInfo>>` | 0.4 | P2 | newest first; `SessionInfo`: `id()`, `created_at()`, `expires_at()`, `last_used_at()`, `idle_limit()`; never tokens or digests; single-use tokens are not listed |
+| `revoke_session(account, SessionId) -> Result<bool>` | 0.4 | P2 | for "sign out that device"; a `SessionId` (32 hex digits as text) is a keyed digest of the session's digest: random to anyone without the keys and no way to the token; also in a transaction |
 
 ### Accounts and passwords
 
@@ -452,15 +452,16 @@ every session of the account in the same commit.
 
 | Operation | Grade | Notes |
 |---|---|---|
-| `add_totp(account) -> Result<TotpEnrollment>`, `confirm_totp(account, code)` | P1 | the secret is sealed; codes are single-use |
+| `add_totp(account) -> Result<TotpEnrollment>`, `confirm_totp(account, code)` | P1 | the secret is sealed; codes are single-use; waits for HMAC-SHA1 in crypt-io (to come) |
 | `verify_totp(challenge, code) -> Result<SignIn>` | P1 | completes `NeedsSecondFactor` |
-| `new_recovery_codes(account) -> Result<RecoveryCodes>` (tx) | P1 | replaces any earlier codes; shown once; stored hashed |
-| `add_passkey`, `verify_passkey` | P2 | WebAuthn public keys and counters |
+| `new_recovery_codes(account) -> Result<RecoveryCodes>` (tx) | P1 | ten codes, `xxxxx-xxxxx` (Crockford base32, 50 bits each); replaces any earlier codes; shown once (`codes()`); stored as keyed digests |
+| `use_recovery_code(account, code) -> Result<bool>` (tx) | P1 | `true` once per code; dashes, spaces, and case ignored; two uses at once give `true` to one |
+| `add_passkey`, `verify_passkey` | P2 | WebAuthn public keys and counters; waits for ECDSA P-256 in crypt-io (to come) |
 | `single_use_token(purpose, account, ttl) -> Result<Token>` | P1 | email verification, magic link, preview; `Purpose` (non-exhaustive): `VerifyEmail`, `ResetPassword`, `SignInLink`, `Preview`, `Custom(u16)`; `ttl` at most 30 days; never validates as a session; also in a transaction |
 | `single_use_token_for(identifier, purpose, ttl) -> Result<Option<Token>>` | P1 | password reset by email address; the same work whether the identifier exists or not, so answer the same either way |
 | `redeem(token, purpose) -> Result<Option<AccountId>>` | P1 | works once, for the purpose it was issued for; two redeems at once give the account to one; also in a transaction |
-| `create_api_key(account, scopes, expiry) -> Result<ApiKey>` | P1 | the key text is shown once |
-| `validate_api_key(text) -> Result<ApiKeyCheck>`, `revoke_api_key(id)` | P1 | |
+| `create_api_key(account, scopes: &[&str], expiry: Option<SystemTime>) -> Result<ApiKey>` | P1 | the key text (`as_str()`) is shown once; `id()` to revoke it; at most 32 scopes of 1 to 64 bytes without spaces, stored and returned as given; also in a transaction |
+| `validate_api_key(text) -> Result<ApiKeyCheck>`, `revoke_api_key(id) -> Result<bool>` | P1 | `ApiKeyCheck` (non-exhaustive): `Valid { account, id, scopes }`, `Expired`, `Revoked`, `Unknown`, `Malformed`; one read of the account store; a session token is never a key, nor a key a session |
 | `define_role(Role) -> Result<RoleId>`, `assign_roles(account, &[RoleId])`, `roles(account)`, `role(id)`, `role_named(name)` | P1 | `Role::new(name).permission(p).inherits(id)`; a role inherits only roles already defined; roles are never removed; at most 256 per realm and 16 per account |
 | `allowed(account, permission) -> Result<bool>` | P1 | checks the account's roles against the current policy |
 | `link_external(account, provider, subject)`, `find_external(provider, subject)` | P2 | OAuth and OpenID Connect sign-in |
@@ -488,7 +489,7 @@ Inside `db.commit`, `tx.auth()` stages:
 | `revoke(token) -> Result<bool>` | 0.1 |
 | `revoke_all`, `set_standing`, `rotate` | 0.3 |
 | `add_identifier`, `remove_identifier`, `define_role` | 0.4 |
-| `set_password`, `assign_roles`, `new_recovery_codes` | 0.4 |
+| `set_password`, `assign_roles`, `new_recovery_codes`, `use_recovery_code`, `create_api_key`, `revoke_api_key`, `revoke_session` | 0.4 |
 
 A token staged with `tx.auth().issue_session` is valid only once the commit
 returns `Ok`.

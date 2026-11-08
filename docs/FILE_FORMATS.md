@@ -159,6 +159,9 @@ keys sort together), then a one-byte tag.
 | `collection, 'a', account [16]` | account record, sealed (from 0.3) or plain |
 | `collection, 'i', identifier digest [32]` | `account [16]` |
 | `collection, 'c', account [16]` | credential record, plain accounts only |
+| `collection, 'k', key digest [32]` | an API key record (0.4), sealed as an account record is: `format u8 (1)`, `account [16]`, `id [16]`, `created ms u64`, `expires ms u64` (0 never), `revoked ms u64` (0 live), `scope count u8`, `scope str16` each |
+| `collection, 'K', key id [16]` | the key's digest [32] |
+| `collection, 'r', account [16]` | the account's unused recovery codes (0.4), sealed: `format u8 (1)`, `count u8`, `digest [32]` each |
 | `collection, 'p'` | the realm's roles (0.4), plain: `format u8 (1)`, `role count u16`, then per role `name str16`, `permission count u16`, `permission str16` each, `inherited count u16`, `role id u32` each. A role's id is its position |
 
 A sealed account record (written from 0.3) is

@@ -212,6 +212,88 @@ impl Purpose {
     }
 }
 
+/// The id of a session, as [`Auth::sessions`](crate::Auth::sessions) lists
+/// it: for "sign out that device". Random to anyone without the database's
+/// keys, and unrelated to the token: it cannot be turned into one. Its text
+/// form is 32 hex digits.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SessionId(pub(crate) [u8; 16]);
+
+impl fmt::Debug for SessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SessionId({self})")
+    }
+}
+
+impl fmt::Display for SessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for b in self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::str::FromStr for SessionId {
+    type Err = Error;
+
+    fn from_str(text: &str) -> Result<SessionId> {
+        let bad = || Error::invalid("session id", "not 32 hex digits");
+        if text.len() != 32 {
+            return Err(bad());
+        }
+        let mut id = [0; 16];
+        for (i, byte) in id.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(text.get(i * 2..i * 2 + 2).ok_or_else(bad)?, 16)
+                .map_err(|_| bad())?;
+        }
+        Ok(SessionId(id))
+    }
+}
+
+/// One live session of an account, as [`Auth::sessions`](crate::Auth::sessions)
+/// lists it: never its token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInfo {
+    pub(crate) id: SessionId,
+    pub(crate) created_ms: u64,
+    pub(crate) expires_ms: u64,
+    pub(crate) last_used_ms: u64,
+    pub(crate) idle_ms: u64,
+}
+
+impl SessionInfo {
+    /// The session's id, for [`Auth::revoke_session`](crate::Auth::revoke_session).
+    #[must_use]
+    pub const fn id(&self) -> SessionId {
+        self.id
+    }
+
+    /// When the session was issued.
+    #[must_use]
+    pub fn created_at(&self) -> SystemTime {
+        crate::core::time_of(self.created_ms)
+    }
+
+    /// When it ends at the latest.
+    #[must_use]
+    pub fn expires_at(&self) -> SystemTime {
+        crate::core::time_of(self.expires_ms)
+    }
+
+    /// When it was last used (or issued).
+    #[must_use]
+    pub fn last_used_at(&self) -> SystemTime {
+        crate::core::time_of(self.last_used_ms)
+    }
+
+    /// Its idle limit, if it has one.
+    #[must_use]
+    pub fn idle_limit(&self) -> Option<Duration> {
+        (self.idle_ms != 0).then(|| Duration::from_millis(self.idle_ms))
+    }
+}
+
 /// A valid session, as [`Validation::Valid`] returns it. A `Copy` value of
 /// fixed size, the payload inline: validating allocates nothing.
 #[derive(Clone, Copy, PartialEq, Eq)]

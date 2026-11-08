@@ -138,6 +138,10 @@ fn encode_revoked(account: AccountId, reason: RevokeReason, until_ms: u64) -> Wo
     words
 }
 
+/// The idle limit that marks a single-use token in the session table: never
+/// listed or counted as a session.
+pub(crate) const SINGLE_USE_IDLE: u64 = u64::MAX;
+
 fn decode(words: &Words, ext: Option<&ExtWords>) -> Option<Slot> {
     match kind(words) {
         KIND_LIVE => {
@@ -388,20 +392,41 @@ impl SessionTable {
     /// Live sessions of `account` that are still valid at `now_ms` under
     /// `epoch`, from the per-account index.
     pub(crate) fn live_for(&self, account: AccountId, epoch: u32, now_ms: u64) -> u32 {
+        u32::try_from(self.sessions_of(account, epoch, now_ms).len()).unwrap_or(u32::MAX)
+    }
+
+    /// The live sessions of `account` at `epoch` (not single-use tokens):
+    /// each with its digest and when it was last used.
+    pub(crate) fn sessions_of(
+        &self,
+        account: AccountId,
+        epoch: u32,
+        now_ms: u64,
+    ) -> Vec<([u8; 32], Session, u64)> {
         let w = self.writer();
         let Some(places) = w.accounts.get(&account) else {
-            return 0;
+            return Vec::new();
         };
-        let live = places.iter().filter(|place| {
-            self.table
-                .read_at(At::from_u64(**place))
-                .and_then(|(_, found)| decode(&found.words, found.ext.as_ref()))
-                .is_some_and(|slot| {
-                    matches!(slot, Slot::Live(s)
-                        if s.account == account && s.epoch == epoch && now_ms < s.expires_ms)
-                })
-        });
-        u32::try_from(live.count()).unwrap_or(u32::MAX)
+        places
+            .iter()
+            .filter_map(|place| {
+                let (digest, found) = self.table.read_at(At::from_u64(*place))?;
+                if deadline(&found.words, found.aux) <= now_ms {
+                    return None;
+                }
+                match decode(&found.words, found.ext.as_ref())? {
+                    Slot::Live(s)
+                        if s.account == account
+                            && s.epoch == epoch
+                            && now_ms < s.expires_ms
+                            && s.idle_ms != SINGLE_USE_IDLE =>
+                    {
+                        Some((digest, s, found.aux))
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
     }
 
     /// Number of entries, tombstones included.

@@ -11,7 +11,9 @@
 //! or identifiers. The operations below are the whole surface.
 
 mod audit;
+pub(crate) mod keys;
 pub(crate) mod realm;
+pub(crate) mod recovery;
 pub(crate) mod roles;
 mod sessions;
 pub(crate) mod token;
@@ -96,6 +98,10 @@ const OP_UPDATE_ACCOUNT_AS: u8 = 8;
 const OP_SET_IDENTIFIER: u8 = 9;
 /// Replace the realm's role policy.
 const OP_SET_POLICY: u8 = 10;
+/// Store an API key's record (made, or revoked).
+const OP_PUT_KEY: u8 = 11;
+/// Replace an account's recovery codes (`used` 0), or record one used (1).
+const OP_PUT_RECOVERY: u8 = 12;
 
 /// What an account update changed, for the audit chain.
 const UPDATE_STANDING: u8 = 1;
@@ -168,6 +174,9 @@ const CREDENTIAL_PASSWORD: u8 = 1;
 /// Key labels for the keys derived from the root key.
 const TOKEN_KEY_LABEL: &[u8] = b"nex-db 2026 auth token digest";
 const SINGLE_USE_KEY_LABEL: &[u8] = b"nex-db 2026 auth single-use token digest";
+const SESSION_ID_KEY_LABEL: &[u8] = b"nex-db 2026 auth session id";
+const API_KEY_LABEL: &[u8] = b"nex-db 2026 auth api key digest";
+const RECOVERY_LABEL: &[u8] = b"nex-db 2026 auth recovery code digest";
 
 /// The longest a single-use token lives: 30 days.
 const MAX_SINGLE_USE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
@@ -203,6 +212,34 @@ fn account_key(collection: u32, account: AccountId) -> Vec<u8> {
 
 fn identifier_key(collection: u32, digest: &[u8; 32]) -> Vec<u8> {
     store_key(collection, b'i', digest)
+}
+
+fn api_key_key(collection: u32, digest: &[u8; 32]) -> Vec<u8> {
+    store_key(collection, b'k', digest)
+}
+
+fn api_key_id_key(collection: u32, id: &keys::ApiKeyId) -> Vec<u8> {
+    store_key(collection, b'K', &id.0)
+}
+
+/// Conflict key of an API key.
+fn api_key_conflict(id: &keys::ApiKeyId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(17);
+    key.push(b'k');
+    key.extend_from_slice(&id.0);
+    key
+}
+
+fn recovery_key(collection: u32, account: AccountId) -> Vec<u8> {
+    store_key(collection, b'r', account.as_bytes())
+}
+
+/// Conflict key of an account's recovery codes.
+fn recovery_conflict(account: &AccountId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(17);
+    key.push(b'R');
+    key.extend_from_slice(account.as_bytes());
+    key
 }
 
 fn credential_key(collection: u32, account: AccountId) -> Vec<u8> {
@@ -263,6 +300,12 @@ pub(crate) struct AuthEngine {
     /// Digests single-use tokens, apart from sessions: one is never the
     /// other.
     single_use_key: Zeroizing<[u8; 32]>,
+    /// Makes a session's listed id from its digest.
+    session_id_key: Zeroizing<[u8; 32]>,
+    /// Digests API keys, apart from sessions.
+    api_key_key: Zeroizing<[u8; 32]>,
+    /// Digests recovery codes.
+    recovery_key: Zeroizing<[u8; 32]>,
     identifier_key: Zeroizing<[u8; 32]>,
     /// Seals and opens this engine's log sections.
     seal_key: Zeroizing<[u8; 32]>,
@@ -348,6 +391,9 @@ impl AuthEngine {
             sessions_file,
             token_key: root.derive(TOKEN_KEY_LABEL),
             single_use_key: root.derive(SINGLE_USE_KEY_LABEL),
+            session_id_key: root.derive(SESSION_ID_KEY_LABEL),
+            api_key_key: root.derive(API_KEY_LABEL),
+            recovery_key: root.derive(RECOVERY_LABEL),
             identifier_key: root.derive(IDENTIFIER_KEY_LABEL),
             seal_key: root.derive(SEAL_KEY_LABEL),
             file_key,
@@ -448,6 +494,68 @@ impl AuthEngine {
     /// The realm's roles as last applied.
     fn policy(&self) -> Arc<Policy> {
         Arc::clone(&self.policy.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    fn session_id(&self, digest: &[u8; 32]) -> types::SessionId {
+        let full = mac::blake3_keyed(&self.session_id_key, digest);
+        let mut id = [0; 16];
+        id.copy_from_slice(&full[..16]);
+        types::SessionId(id)
+    }
+
+    fn recovery_digest(&self, account: AccountId, symbols: &[u8]) -> [u8; 32] {
+        let mut input = Zeroizing::new(Vec::with_capacity(16 + symbols.len()));
+        input.extend_from_slice(account.as_bytes());
+        input.extend_from_slice(symbols);
+        mac::blake3_keyed(&self.recovery_key, &input)
+    }
+
+    /// The digests of `account`'s unused recovery codes.
+    fn recovery_digests(&self, account: AccountId) -> Result<Vec<[u8; 32]>> {
+        let key = recovery_key(self.collection, account);
+        match self.accounts.get(&key)? {
+            Some(value) => recovery::decode(&open_value(&self.file_key, &key, &value)?),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn api_key_digest(&self, random: &[u8; 32]) -> [u8; 32] {
+        mac::blake3_keyed(&self.api_key_key, random)
+    }
+
+    /// An API key's id: from its digest, and no way back.
+    fn api_key_id(&self, digest: &[u8; 32]) -> keys::ApiKeyId {
+        let mut input = [0; 34];
+        input[..32].copy_from_slice(digest);
+        input[32..].copy_from_slice(b"id");
+        let full = mac::blake3_keyed(&self.api_key_key, &input);
+        let mut id = [0; 16];
+        id.copy_from_slice(&full[..16]);
+        keys::ApiKeyId(id)
+    }
+
+    /// The record of the API key with `digest`.
+    fn api_key_record(&self, digest: &[u8; 32]) -> Result<Option<keys::KeyRecord>> {
+        let key = api_key_key(self.collection, digest);
+        match self.accounts.get(&key)? {
+            Some(value) => Ok(Some(keys::KeyRecord::decode(&open_value(
+                &self.file_key,
+                &key,
+                &value,
+            )?)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The digest of the API key with `id`.
+    fn api_key_digest_of(&self, id: &keys::ApiKeyId) -> Result<Option<[u8; 32]>> {
+        match self.accounts.get(api_key_id_key(self.collection, id))? {
+            Some(bytes) => Ok(Some(
+                <[u8; 32]>::try_from(bytes.as_slice())
+                    .map_err(|_| Error::corrupt("an api key index", 0))?,
+            )),
+            None => Ok(None),
+        }
     }
 
     fn single_use_digest(&self, random: &[u8; 32]) -> [u8; 32] {
@@ -608,6 +716,34 @@ impl AuthEngine {
                 None => (*at_ms, "identifier.removed", "identifier".to_owned()),
             },
             Op::SetPolicy { at_ms, .. } => (*at_ms, "policy.changed", "roles".to_owned()),
+            Op::PutRecovery {
+                account: a,
+                used,
+                at_ms,
+                ..
+            } => (
+                *at_ms,
+                if *used {
+                    "account.recovery_code_used"
+                } else {
+                    "account.recovery_codes_set"
+                },
+                account(*a),
+            ),
+            Op::PutKey {
+                account: a,
+                revoked,
+                at_ms,
+                ..
+            } => (
+                *at_ms,
+                if *revoked {
+                    "api_key.revoked"
+                } else {
+                    "api_key.created"
+                },
+                account(*a),
+            ),
         };
         self.audit.append(seq, n, at_ms, action, &target)
     }
@@ -635,7 +771,11 @@ impl AuthEngine {
                 ..
             } => Change::StandingChanged { account: *account },
             Op::UpdateAccount { account, .. } => Change::AccountChanged { account: *account },
-            Op::IssueSession { .. } | Op::SetIdentifier { .. } | Op::SetPolicy { .. } => {
+            Op::IssueSession { .. }
+            | Op::SetIdentifier { .. }
+            | Op::SetPolicy { .. }
+            | Op::PutKey { .. }
+            | Op::PutRecovery { .. } => {
                 return None;
             }
         })
@@ -829,6 +969,20 @@ enum Op<'a> {
         value: &'a [u8],
         at_ms: u64,
     },
+    PutKey {
+        id: [u8; 16],
+        digest: [u8; 32],
+        account: AccountId,
+        revoked: bool,
+        value: &'a [u8],
+        at_ms: u64,
+    },
+    PutRecovery {
+        account: AccountId,
+        used: bool,
+        value: &'a [u8],
+        at_ms: u64,
+    },
 }
 
 fn decode_ops(seq: Seq, body: &[u8]) -> Result<Vec<Op<'_>>> {
@@ -923,6 +1077,28 @@ fn decode_ops(seq: Seq, body: &[u8]) -> Result<Vec<Op<'_>>> {
                 value: r.bytes32()?,
                 at_ms: r.u64()?,
             },
+            OP_PUT_RECOVERY => Op::PutRecovery {
+                account: AccountId::from_bytes(r.fixed()?),
+                used: match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(Error::corrupt("a recovery code operation", seq)),
+                },
+                value: r.bytes32()?,
+                at_ms: r.u64()?,
+            },
+            OP_PUT_KEY => Op::PutKey {
+                id: r.fixed()?,
+                digest: r.fixed()?,
+                account: AccountId::from_bytes(r.fixed()?),
+                revoked: match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(Error::corrupt("an api key operation", seq)),
+                },
+                value: r.bytes32()?,
+                at_ms: r.u64()?,
+            },
             OP_REVOKE_SESSION => {
                 let digest = r.fixed()?;
                 let reason = match r.u8()? {
@@ -996,6 +1172,19 @@ impl Engine for AuthEngine {
                 if let Op::SetPolicy { value, .. } = op {
                     policy = Some(Policy::decode(value, seq)?);
                     batch.put(policy_key(self.collection), *value);
+                }
+                if let Op::PutRecovery { account, value, .. } = op {
+                    batch.put(recovery_key(self.collection, *account), *value);
+                }
+                if let Op::PutKey {
+                    id, digest, value, ..
+                } = op
+                {
+                    batch.put(api_key_key(self.collection, digest), *value);
+                    batch.put(
+                        api_key_id_key(self.collection, &keys::ApiKeyId(*id)),
+                        digest,
+                    );
                 }
                 if let Op::UpdateAccount { account, value, .. } = op {
                     let key = account_key(self.collection, *account);
@@ -1086,7 +1275,9 @@ impl Engine for AuthEngine {
                 | Op::CreateSealedAccount { .. }
                 | Op::UpdateAccount { .. }
                 | Op::SetIdentifier { .. }
-                | Op::SetPolicy { .. } => {}
+                | Op::SetPolicy { .. }
+                | Op::PutKey { .. }
+                | Op::PutRecovery { .. } => {}
             }
         }
         Ok(())
@@ -1159,6 +1350,22 @@ enum StagedOp {
         at_ms: u64,
     },
     SetPolicy {
+        value: Vec<u8>,
+        at_ms: u64,
+    },
+    PutKey {
+        id: keys::ApiKeyId,
+        digest: [u8; 32],
+        account: AccountId,
+        revoked: bool,
+        /// The key record, sealed while staging.
+        value: Vec<u8>,
+        at_ms: u64,
+    },
+    PutRecovery {
+        account: AccountId,
+        used: bool,
+        /// The digests, sealed while staging.
         value: Vec<u8>,
         at_ms: u64,
     },
@@ -1249,6 +1456,7 @@ impl Staged for AuthStaged<'_> {
                 StagedOp::RevokeSession { .. }
                     | StagedOp::RaiseEpoch { .. }
                     | StagedOp::UpdateAccount { .. }
+                    | StagedOp::PutKey { revoked: true, .. }
             )
         })
     }
@@ -1375,6 +1583,34 @@ fn write_ops(ops: &[StagedOp], out: &mut Vec<u8>) -> Result<()> {
             }
             StagedOp::SetPolicy { value, at_ms } => {
                 w.u8(OP_SET_POLICY);
+                w.bytes32(value)?;
+                w.u64(*at_ms);
+            }
+            StagedOp::PutRecovery {
+                account,
+                used,
+                value,
+                at_ms,
+            } => {
+                w.u8(OP_PUT_RECOVERY);
+                w.bytes(account.as_bytes());
+                w.u8(u8::from(*used));
+                w.bytes32(value)?;
+                w.u64(*at_ms);
+            }
+            StagedOp::PutKey {
+                id,
+                digest,
+                account,
+                revoked,
+                value,
+                at_ms,
+            } => {
+                w.u8(OP_PUT_KEY);
+                w.bytes(&id.0);
+                w.bytes(digest);
+                w.bytes(account.as_bytes());
+                w.u8(u8::from(*revoked));
                 w.bytes32(value)?;
                 w.u64(*at_ms);
             }
@@ -1868,7 +2104,7 @@ impl AuthTx<'_, '_> {
             created_ms,
             expires_ms: created_ms.saturating_add(ttl_ms),
             epoch: 0,
-            idle_ms: 0,
+            idle_ms: sessions::SINGLE_USE_IDLE,
             recheck_ms: 0,
             payload: Payload::new(&purpose.payload())?,
         };
@@ -2303,6 +2539,211 @@ impl AuthTx<'_, '_> {
         }
     }
 
+    /// Make ten new recovery codes for `account`, replacing any it had:
+    /// one-time codes the account holder keeps on paper, for when other
+    /// ways to sign in are lost. They are shown here only; nex-db keeps
+    /// keyed digests of them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the account does not exist.
+    pub fn new_recovery_codes(&mut self, account: AccountId) -> Result<recovery::RecoveryCodes> {
+        let engine = self.staged.engine;
+        if !self.staged.accounts.contains(&account) && !engine.account_exists(account)? {
+            return Err(Error::invalid("account", "no such account"));
+        }
+        let mut codes = Vec::with_capacity(recovery::COUNT);
+        let mut digests = Vec::with_capacity(recovery::COUNT);
+        for _ in 0..recovery::COUNT {
+            let (text, symbols) = recovery::generate()?;
+            digests.push(engine.recovery_digest(account, &symbols[..]));
+            codes.push(text);
+        }
+        self.stage_recovery(account, &digests, false)?;
+        Ok(recovery::RecoveryCodes { codes })
+    }
+
+    /// Use one of `account`'s recovery codes: `true`, once, for a code it
+    /// holds (typed with or without its dash, in either case); `false`
+    /// otherwise. Two uses of one code at once give `true` to one. Sign the
+    /// account in, or let it set a new password, only on `true`.
+    ///
+    /// # Errors
+    ///
+    /// Only storage errors.
+    pub fn use_recovery_code(&mut self, account: AccountId, code: &str) -> Result<bool> {
+        let engine = self.staged.engine;
+        let Some(symbols) = recovery::normalize(code) else {
+            return Ok(false);
+        };
+        let digest = engine.recovery_digest(account, &symbols[..]);
+        // Two uses at once conflict on the account's codes: one lands.
+        self.staged.note(recovery_conflict(&account));
+        let mut digests = match self.staged.ops.iter().rev().find_map(|op| match op {
+            StagedOp::PutRecovery {
+                account: a, value, ..
+            } if *a == account => Some(value.clone()),
+            _ => None,
+        }) {
+            Some(sealed) => recovery::decode(&open_value(
+                &engine.file_key,
+                &recovery_key(engine.collection, account),
+                &sealed,
+            )?)?,
+            None => engine.recovery_digests(account)?,
+        };
+        let before = digests.len();
+        // Keyed digests: comparing them reveals nothing of the code.
+        digests.retain(|d| *d != digest);
+        if digests.len() == before {
+            self.staged.writes.push(recovery_conflict(&account));
+            return Ok(false);
+        }
+        self.stage_recovery(account, &digests, true)?;
+        Ok(true)
+    }
+
+    fn stage_recovery(
+        &mut self,
+        account: AccountId,
+        digests: &[[u8; 32]],
+        used: bool,
+    ) -> Result<()> {
+        let engine = self.staged.engine;
+        let value = seal_value(
+            &engine.file_key,
+            &recovery_key(engine.collection, account),
+            &recovery::encode(digests),
+        )?;
+        self.staged.writes.push(recovery_conflict(&account));
+        self.staged.ops.push(StagedOp::PutRecovery {
+            account,
+            used,
+            value,
+            at_ms: now_ms(),
+        });
+        Ok(())
+    }
+
+    /// Make an API key for `account`: a credential for a program, with
+    /// `scopes` (at most 32, each 1 to 64 bytes without spaces; nex-db
+    /// stores them and returns them on each check, the application decides
+    /// what they allow) and an optional `expiry`. The key's text is in the
+    /// result only: show it once.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the account does not exist, a scope breaks
+    /// its rule, or `expiry` has passed.
+    pub fn create_api_key(
+        &mut self,
+        account: AccountId,
+        scopes: &[&str],
+        expiry: Option<SystemTime>,
+    ) -> Result<keys::ApiKey> {
+        let engine = self.staged.engine;
+        if !self.staged.accounts.contains(&account) && !engine.account_exists(account)? {
+            return Err(Error::invalid("account", "no such account"));
+        }
+        let scopes = keys::check_scopes(scopes)?;
+        let now = now_ms();
+        let expires_ms = match expiry {
+            Some(at) => {
+                let at = keys::ms_since_epoch(at)?;
+                if at <= now {
+                    return Err(Error::invalid("expiry", "has passed"));
+                }
+                at
+            }
+            None => 0,
+        };
+        let (token, random) = Token::generate()?;
+        let digest = engine.api_key_digest(&random);
+        let id = engine.api_key_id(&digest);
+        let record = keys::KeyRecord {
+            account,
+            id,
+            created_ms: now,
+            expires_ms,
+            revoked_ms: 0,
+            scopes,
+        };
+        self.stage_key(digest, &record)?;
+        Ok(keys::ApiKey { id, token })
+    }
+
+    /// Revoke the API key with `id`: it answers
+    /// [`ApiKeyCheck::Revoked`](keys::ApiKeyCheck::Revoked) from now on.
+    /// `false` when there is no such key or it was revoked before.
+    ///
+    /// # Errors
+    ///
+    /// Only storage errors.
+    pub fn revoke_api_key(&mut self, id: keys::ApiKeyId) -> Result<bool> {
+        let engine = self.staged.engine;
+        self.staged.note(api_key_conflict(&id));
+        let Some(digest) = engine.api_key_digest_of(&id)? else {
+            return Ok(false);
+        };
+        let Some(mut record) = engine.api_key_record(&digest)? else {
+            return Ok(false);
+        };
+        if record.revoked_ms != 0 {
+            return Ok(false);
+        }
+        record.revoked_ms = now_ms();
+        self.stage_key(digest, &record)?;
+        Ok(true)
+    }
+
+    fn stage_key(&mut self, digest: [u8; 32], record: &keys::KeyRecord) -> Result<()> {
+        let engine = self.staged.engine;
+        let value = seal_value(
+            &engine.file_key,
+            &api_key_key(engine.collection, &digest),
+            &record.encode()?,
+        )?;
+        self.staged.writes.push(api_key_conflict(&record.id));
+        self.staged.ops.push(StagedOp::PutKey {
+            id: record.id,
+            digest,
+            account: record.account,
+            revoked: record.revoked_ms != 0,
+            value,
+            at_ms: now_ms(),
+        });
+        Ok(())
+    }
+
+    /// End the session of `account` with id `id` (from
+    /// [`Auth::sessions`]): "sign out that device". `false` when the
+    /// account has no such live session.
+    ///
+    /// # Errors
+    ///
+    /// Only storage errors.
+    pub fn revoke_session(&mut self, account: AccountId, id: types::SessionId) -> Result<bool> {
+        let engine = self.staged.engine;
+        let epoch = self.epoch(account);
+        let found = engine
+            .sessions
+            .sessions_of(account, epoch, now_ms())
+            .into_iter()
+            .map(|(digest, ..)| digest)
+            .find(|digest| engine.session_id(digest) == id);
+        let Some(digest) = found else {
+            return Ok(false);
+        };
+        self.staged.note(session_key(&digest));
+        self.staged.writes.push(session_key(&digest));
+        self.staged.ops.push(StagedOp::RevokeSession {
+            digest,
+            reason: RevokeReason::Revoked,
+            at_ms: now_ms(),
+        });
+        Ok(true)
+    }
+
     /// Revoke the session `token` names. Returns `true` when a session was
     /// revoked, `false` when the token names no session or one already
     /// revoked. A revoked session never validates again.
@@ -2435,6 +2876,136 @@ impl Auth<'_> {
         let token = token.as_ref();
         self.db
             .commit(|tx| tx.auth_of(self.engine.collection).revoke(token))
+    }
+
+    /// Make new recovery codes in their own commit. See
+    /// [`AuthTx::new_recovery_codes`].
+    ///
+    /// # Errors
+    ///
+    /// As [`AuthTx::new_recovery_codes`], plus the errors of
+    /// [`Database::commit`].
+    pub fn new_recovery_codes(&self, account: AccountId) -> Result<recovery::RecoveryCodes> {
+        self.db.commit(|tx| {
+            tx.auth_of(self.engine.collection)
+                .new_recovery_codes(account)
+        })
+    }
+
+    /// Use a recovery code in its own commit. See
+    /// [`AuthTx::use_recovery_code`].
+    ///
+    /// # Errors
+    ///
+    /// As [`AuthTx::use_recovery_code`], plus the errors of
+    /// [`Database::commit`].
+    pub fn use_recovery_code(&self, account: AccountId, code: &str) -> Result<bool> {
+        self.db.commit(|tx| {
+            tx.auth_of(self.engine.collection)
+                .use_recovery_code(account, code)
+        })
+    }
+
+    /// Make an API key in its own commit. See [`AuthTx::create_api_key`].
+    ///
+    /// ```no_run
+    /// # fn main() -> nex_db::Result<()> {
+    /// use nex_db::ApiKeyCheck;
+    /// let db = nex_db::open("data/site")?;
+    /// # let account = nex_db::AccountId::from_bytes([1; 16]);
+    /// let key = db.auth().create_api_key(account, &["posts:read"], None)?;
+    /// // Hand `key.as_str()` to the program; on each request:
+    /// if let ApiKeyCheck::Valid { account, scopes, .. } = db.auth().validate_api_key(key.as_str())? {
+    /// #   let _ = (account, scopes);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`AuthTx::create_api_key`], plus the errors of
+    /// [`Database::commit`].
+    pub fn create_api_key(
+        &self,
+        account: AccountId,
+        scopes: &[&str],
+        expiry: Option<SystemTime>,
+    ) -> Result<keys::ApiKey> {
+        self.db.commit(|tx| {
+            tx.auth_of(self.engine.collection)
+                .create_api_key(account, scopes, expiry)
+        })
+    }
+
+    /// Check an API key's text: its account and scopes, or why it does not
+    /// count. One read of the account store and one decryption.
+    ///
+    /// # Errors
+    ///
+    /// Only storage errors; a malformed key gives
+    /// [`ApiKeyCheck::Malformed`](keys::ApiKeyCheck::Malformed).
+    pub fn validate_api_key(&self, text: impl AsRef<str>) -> Result<keys::ApiKeyCheck> {
+        let Some(random) = token::parse(text.as_ref()) else {
+            return Ok(keys::ApiKeyCheck::Malformed);
+        };
+        let engine = self.engine;
+        Ok(
+            match engine.api_key_record(&engine.api_key_digest(&random))? {
+                Some(record) => record.check(now_ms()),
+                None => keys::ApiKeyCheck::Unknown,
+            },
+        )
+    }
+
+    /// Revoke an API key in its own commit. See [`AuthTx::revoke_api_key`].
+    ///
+    /// # Errors
+    ///
+    /// As [`AuthTx::revoke_api_key`], plus the errors of
+    /// [`Database::commit`].
+    pub fn revoke_api_key(&self, id: keys::ApiKeyId) -> Result<bool> {
+        self.db
+            .commit(|tx| tx.auth_of(self.engine.collection).revoke_api_key(id))
+    }
+
+    /// The live sessions of `account`, newest first: ids, times, never
+    /// tokens or digests. For a "your devices" page.
+    ///
+    /// # Errors
+    ///
+    /// Never in this version.
+    pub fn sessions(&self, account: AccountId) -> Result<Vec<types::SessionInfo>> {
+        let engine = self.engine;
+        let epoch = engine.epochs.get(account);
+        let mut out: Vec<types::SessionInfo> = engine
+            .sessions
+            .sessions_of(account, epoch, now_ms())
+            .into_iter()
+            .map(|(digest, session, seen)| types::SessionInfo {
+                id: engine.session_id(&digest),
+                created_ms: session.created_ms,
+                expires_ms: session.expires_ms,
+                last_used_ms: seen.max(session.created_ms),
+                idle_ms: session.idle_ms,
+            })
+            .collect();
+        out.sort_by(|a, b| b.created_ms.cmp(&a.created_ms).then(a.id.cmp(&b.id)));
+        Ok(out)
+    }
+
+    /// End one session of `account` in its own commit. See
+    /// [`AuthTx::revoke_session`].
+    ///
+    /// # Errors
+    ///
+    /// As [`AuthTx::revoke_session`], plus the errors of
+    /// [`Database::commit`].
+    pub fn revoke_session(&self, account: AccountId, id: types::SessionId) -> Result<bool> {
+        self.db.commit(|tx| {
+            tx.auth_of(self.engine.collection)
+                .revoke_session(account, id)
+        })
     }
 
     /// Sign an account out everywhere in its own commit. See

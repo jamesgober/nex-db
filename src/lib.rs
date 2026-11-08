@@ -113,12 +113,14 @@ mod wheel;
 #[cfg_attr(docsrs, doc(cfg(feature = "auth")))]
 pub use crate::auth::{
     Auth, AuthRead, AuthTx,
+    keys::{ApiKey, ApiKeyCheck, ApiKeyId},
     realm::RealmPolicy,
+    recovery::RecoveryCodes,
     roles::{Account, Role, RoleId},
     token::Token,
     types::{
-        HashedPassword, Login, Purpose, RevokeReason, Session, SessionSpec, SignIn, Standing,
-        Validation,
+        HashedPassword, Login, Purpose, RevokeReason, Session, SessionId, SessionInfo, SessionSpec,
+        SignIn, Standing, Validation,
     },
 };
 #[cfg(feature = "content")]

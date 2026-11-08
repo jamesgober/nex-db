@@ -19,6 +19,9 @@ All notable changes to `nex-db` are documented in this file. The format is based
 - `Database::health` and `Health`; `Builder::observer`, `Observer`, `CommitInfo`, and `SecurityEvent`.
 - `trash`, `restore`, and `delete` (paths of a trashed or deleted entity answer `RouteKind::Gone`).
 - Types: `Content::define`, `type_named`, `Type` (`field`, `unique`, `singleton`), and `FieldType`.
+- Session listing: `Auth::sessions`, `SessionInfo`, `SessionId`, and `revoke_session`.
+- API keys: `create_api_key`, `validate_api_key`, `revoke_api_key`, `ApiKey`, `ApiKeyId`, and `ApiKeyCheck`.
+- Recovery codes: `new_recovery_codes`, `use_recovery_code`, and `RecoveryCodes`.
 - Named realms and spaces: `Database::define_realm`, `auth_realm`, `set_realm_policy`, `define_space`, `content_space`, and `collections`; `RealmPolicy`, `CollectionInfo`, and `CollectionKind`; `Transaction::auth_realm` and `content_space`.
 - `Database::commit_serializable`, and `ContentTx::draft` to read inside a transaction.
 - Scheduled publishing: `Action`, `schedule`, `schedule_in`, `cancel_schedule`, `cancel_schedule_in`, and `Entry::scheduled`; a thread of the database fires them.

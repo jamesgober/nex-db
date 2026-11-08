@@ -12,6 +12,8 @@
 
 mod audit;
 pub(crate) mod keys;
+#[cfg(feature = "mfa")]
+pub(crate) mod passkey;
 pub(crate) mod realm;
 pub(crate) mod recovery;
 pub(crate) mod roles;
@@ -113,6 +115,18 @@ const TOTP_REMOVED: u8 = 4;
 /// The payload of a second-factor challenge: a single-use token no
 /// [`Purpose`] makes, so only `verify_totp` redeems it.
 const CHALLENGE_PAYLOAD: [u8; 4] = [b'S', 0xF0, 0, 0];
+/// Store a passkey (`what`: 1 added, 2 used), or remove it (3).
+const OP_PUT_PASSKEY: u8 = 14;
+#[cfg_attr(not(feature = "mfa"), allow(dead_code))]
+const PASSKEY_ADDED: u8 = 1;
+#[cfg_attr(not(feature = "mfa"), allow(dead_code))]
+const PASSKEY_USED: u8 = 2;
+const PASSKEY_REMOVED: u8 = 3;
+/// Payloads of passkey challenges: single-use tokens no [`Purpose`] makes.
+#[cfg(feature = "mfa")]
+const PASSKEY_REGISTRATION_PAYLOAD: [u8; 4] = [b'S', 0xF1, 0, 0];
+#[cfg(feature = "mfa")]
+const PASSKEY_SIGN_IN_PAYLOAD: [u8; 4] = [b'S', 0xF2, 0, 0];
 /// How long a second-factor challenge lasts: five minutes.
 const CHALLENGE_MS: u64 = 5 * 60 * 1000;
 
@@ -190,6 +204,7 @@ const SINGLE_USE_KEY_LABEL: &[u8] = b"nex-db 2026 auth single-use token digest";
 const SESSION_ID_KEY_LABEL: &[u8] = b"nex-db 2026 auth session id";
 const API_KEY_LABEL: &[u8] = b"nex-db 2026 auth api key digest";
 const RECOVERY_LABEL: &[u8] = b"nex-db 2026 auth recovery code digest";
+const PASSKEY_LABEL: &[u8] = b"nex-db 2026 auth passkey credential digest";
 
 /// The longest a single-use token lives: 30 days.
 const MAX_SINGLE_USE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
@@ -253,6 +268,39 @@ fn recovery_conflict(account: &AccountId) -> Vec<u8> {
     key.push(b'R');
     key.extend_from_slice(account.as_bytes());
     key
+}
+
+fn passkey_key(collection: u32, digest: &[u8; 32]) -> Vec<u8> {
+    store_key(collection, b'w', digest)
+}
+
+/// The account's index of its passkeys: one key per passkey.
+fn passkey_index_key(collection: u32, account: AccountId, digest: &[u8; 32]) -> Vec<u8> {
+    let mut key = store_key(collection, b'W', account.as_bytes());
+    key.extend_from_slice(digest);
+    key
+}
+
+/// Conflict key of a passkey.
+#[cfg_attr(not(feature = "mfa"), allow(dead_code))]
+fn passkey_conflict(digest: &[u8; 32]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(33);
+    key.push(b'w');
+    key.extend_from_slice(digest);
+    key
+}
+
+/// A passkey sign-in that held: the account and its new session, or the
+/// block on the account (`until`, `None` for an administrator's).
+#[cfg(feature = "mfa")]
+type PasskeyOutcome = std::result::Result<(AccountId, Token), Option<SystemTime>>;
+
+/// A passkey's listed id: the first half of its credential digest.
+#[cfg(feature = "mfa")]
+fn passkey_id(digest: &[u8; 32]) -> passkey::PasskeyId {
+    let mut id = [0; 16];
+    id.copy_from_slice(&digest[..16]);
+    passkey::PasskeyId(id)
 }
 
 fn totp_key(collection: u32, account: AccountId) -> Vec<u8> {
@@ -332,6 +380,9 @@ pub(crate) struct AuthEngine {
     api_key_key: Zeroizing<[u8; 32]>,
     /// Digests recovery codes.
     recovery_key: Zeroizing<[u8; 32]>,
+    /// Digests passkey credential ids.
+    #[cfg_attr(not(feature = "mfa"), allow(dead_code))]
+    passkey_key: Zeroizing<[u8; 32]>,
     identifier_key: Zeroizing<[u8; 32]>,
     /// Seals and opens this engine's log sections.
     seal_key: Zeroizing<[u8; 32]>,
@@ -420,6 +471,7 @@ impl AuthEngine {
             session_id_key: root.derive(SESSION_ID_KEY_LABEL),
             api_key_key: root.derive(API_KEY_LABEL),
             recovery_key: root.derive(RECOVERY_LABEL),
+            passkey_key: root.derive(PASSKEY_LABEL),
             identifier_key: root.derive(IDENTIFIER_KEY_LABEL),
             seal_key: root.derive(SEAL_KEY_LABEL),
             file_key,
@@ -527,6 +579,46 @@ impl AuthEngine {
         let mut id = [0; 16];
         id.copy_from_slice(&full[..16]);
         types::SessionId(id)
+    }
+
+    #[cfg(feature = "mfa")]
+    fn passkey_digest(&self, credential_id: &[u8]) -> [u8; 32] {
+        mac::blake3_keyed(&self.passkey_key, credential_id)
+    }
+
+    /// The passkey with credential digest `digest`, if one is stored.
+    #[cfg(feature = "mfa")]
+    fn passkey_record(&self, digest: &[u8; 32]) -> Result<Option<passkey::PasskeyRecord>> {
+        let key = passkey_key(self.collection, digest);
+        match self.accounts.get(&key)? {
+            Some(value) => Ok(Some(passkey::PasskeyRecord::decode(&open_value(
+                &self.file_key,
+                &key,
+                &value,
+            )?)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The credential digests of `account`'s passkeys.
+    #[cfg(feature = "mfa")]
+    fn passkeys_of(&self, account: AccountId) -> Result<Vec<[u8; 32]>> {
+        let start = store_key(self.collection, b'W', account.as_bytes());
+        let mut end = start.clone();
+        while let Some(last) = end.pop() {
+            if last < u8::MAX {
+                end.push(last + 1);
+                break;
+            }
+        }
+        self.accounts
+            .scan(start.clone()..end)?
+            .map(|(key, _)| {
+                key.get(start.len()..)
+                    .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                    .ok_or_else(|| Error::corrupt("a passkey index key", 0))
+            })
+            .collect()
     }
 
     /// `account`'s TOTP record, if it has one.
@@ -762,6 +854,20 @@ impl AuthEngine {
                 None => (*at_ms, "identifier.removed", "identifier".to_owned()),
             },
             Op::SetPolicy { at_ms, .. } => (*at_ms, "policy.changed", "roles".to_owned()),
+            Op::PutPasskey {
+                account: a,
+                what,
+                at_ms,
+                ..
+            } => (
+                *at_ms,
+                match *what {
+                    1 => "account.passkey_added",
+                    2 => "account.passkey_used",
+                    _ => "account.passkey_removed",
+                },
+                account(*a),
+            ),
             Op::PutTotp {
                 account: a,
                 what,
@@ -837,7 +943,8 @@ impl AuthEngine {
             | Op::SetPolicy { .. }
             | Op::PutKey { .. }
             | Op::PutRecovery { .. }
-            | Op::PutTotp { .. } => {
+            | Op::PutTotp { .. }
+            | Op::PutPasskey { .. } => {
                 return None;
             }
         })
@@ -1051,6 +1158,13 @@ enum Op<'a> {
         value: &'a [u8],
         at_ms: u64,
     },
+    PutPasskey {
+        digest: [u8; 32],
+        account: AccountId,
+        what: u8,
+        value: &'a [u8],
+        at_ms: u64,
+    },
 }
 
 fn decode_ops(seq: Seq, body: &[u8]) -> Result<Vec<Op<'_>>> {
@@ -1142,6 +1256,16 @@ fn decode_ops(seq: Seq, body: &[u8]) -> Result<Vec<Op<'_>>> {
                 }
             }
             OP_SET_POLICY => Op::SetPolicy {
+                value: r.bytes32()?,
+                at_ms: r.u64()?,
+            },
+            OP_PUT_PASSKEY => Op::PutPasskey {
+                digest: r.fixed()?,
+                account: AccountId::from_bytes(r.fixed()?),
+                what: match r.u8()? {
+                    w @ 1..=PASSKEY_REMOVED => w,
+                    _ => return Err(Error::corrupt("a passkey operation", seq)),
+                },
                 value: r.bytes32()?,
                 at_ms: r.u64()?,
             },
@@ -1249,6 +1373,24 @@ impl Engine for AuthEngine {
                 if let Op::SetPolicy { value, .. } = op {
                     policy = Some(Policy::decode(value, seq)?);
                     batch.put(policy_key(self.collection), *value);
+                }
+                if let Op::PutPasskey {
+                    digest,
+                    account,
+                    what,
+                    value,
+                    ..
+                } = op
+                {
+                    let key = passkey_key(self.collection, digest);
+                    let index = passkey_index_key(self.collection, *account, digest);
+                    if *what == PASSKEY_REMOVED {
+                        batch.delete(key);
+                        batch.delete(index);
+                    } else {
+                        batch.put(key, *value);
+                        batch.put(index, []);
+                    }
                 }
                 if let Op::PutTotp {
                     account,
@@ -1369,7 +1511,8 @@ impl Engine for AuthEngine {
                 | Op::SetPolicy { .. }
                 | Op::PutKey { .. }
                 | Op::PutRecovery { .. }
-                | Op::PutTotp { .. } => {}
+                | Op::PutTotp { .. }
+                | Op::PutPasskey { .. } => {}
             }
         }
         Ok(())
@@ -1458,6 +1601,15 @@ enum StagedOp {
         account: AccountId,
         used: bool,
         /// The digests, sealed while staging.
+        value: Vec<u8>,
+        at_ms: u64,
+    },
+    #[cfg_attr(not(feature = "mfa"), allow(dead_code))]
+    PutPasskey {
+        digest: [u8; 32],
+        account: AccountId,
+        what: u8,
+        /// The record, sealed while staging; empty when removed.
         value: Vec<u8>,
         at_ms: u64,
     },
@@ -1683,6 +1835,20 @@ fn write_ops(ops: &[StagedOp], out: &mut Vec<u8>) -> Result<()> {
             }
             StagedOp::SetPolicy { value, at_ms } => {
                 w.u8(OP_SET_POLICY);
+                w.bytes32(value)?;
+                w.u64(*at_ms);
+            }
+            StagedOp::PutPasskey {
+                digest,
+                account,
+                what,
+                value,
+                at_ms,
+            } => {
+                w.u8(OP_PUT_PASSKEY);
+                w.bytes(digest);
+                w.bytes(account.as_bytes());
+                w.u8(*what);
                 w.bytes32(value)?;
                 w.u64(*at_ms);
             }
@@ -2793,6 +2959,261 @@ impl AuthTx<'_, '_> {
         Ok(())
     }
 
+    /// A passkey challenge with `payload`, for `account` (zeros for a
+    /// sign-in, where the passkey names the account).
+    #[cfg(feature = "mfa")]
+    fn passkey_challenge(
+        &mut self,
+        payload: [u8; 4],
+        account: AccountId,
+    ) -> Result<passkey::PasskeyChallenge> {
+        let token =
+            self.stage_single_use_payload(payload, account, Duration::from_millis(CHALLENGE_MS))?;
+        let bytes = token::parse(token.as_str())
+            .ok_or_else(|| Error::corrupt("a challenge just made", 0))?;
+        Ok(passkey::PasskeyChallenge { bytes })
+    }
+
+    /// Make a challenge to register a passkey for `account`: give it to
+    /// `navigator.credentials.create` (with the account's id as the user
+    /// id, so the passkey can sign in without an identifier), then pass
+    /// what it returns to [`add_passkey`](Self::add_passkey).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the account does not exist; [`Error::Busy`]
+    /// when the session table is full.
+    #[cfg(feature = "mfa")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+    pub fn passkey_registration(
+        &mut self,
+        account: AccountId,
+    ) -> Result<passkey::PasskeyChallenge> {
+        let engine = self.staged.engine;
+        if !self.staged.accounts.contains(&account) && !engine.account_exists(account)? {
+            return Err(Error::invalid("account", "no such account"));
+        }
+        self.passkey_challenge(PASSKEY_REGISTRATION_PAYLOAD, account)
+    }
+
+    /// Make a challenge to sign in with a passkey: give it to
+    /// `navigator.credentials.get`, then pass what it returns to
+    /// [`Auth::verify_passkey`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Busy`] when the session table is full.
+    #[cfg(feature = "mfa")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+    pub fn passkey_sign_in(&mut self) -> Result<passkey::PasskeyChallenge> {
+        self.passkey_challenge(PASSKEY_SIGN_IN_PAYLOAD, AccountId::from_bytes([0; 16]))
+    }
+
+    /// The account a live, unused passkey challenge for `payload` was
+    /// made for, redeeming it; `None` otherwise.
+    #[cfg(feature = "mfa")]
+    fn redeem_passkey_challenge(
+        &mut self,
+        challenge: &[u8; 32],
+        payload: [u8; 4],
+    ) -> Option<AccountId> {
+        let engine = self.staged.engine;
+        let digest = engine.single_use_digest(challenge);
+        self.staged.note(session_key(&digest));
+        let account = match engine.sessions.get(&digest) {
+            Some(Slot::Live(session))
+                if now_ms() < session.expires_ms && session.payload.as_bytes() == payload =>
+            {
+                session.account
+            }
+            _ => return None,
+        };
+        self.staged.writes.push(session_key(&digest));
+        self.staged.ops.push(StagedOp::RevokeSession {
+            digest,
+            reason: RevokeReason::Revoked,
+            at_ms: now_ms(),
+        });
+        Some(account)
+    }
+
+    /// Register a passkey for `account` from what
+    /// `navigator.credentials.create` returned for a
+    /// [`passkey_registration`](Self::passkey_registration) challenge.
+    /// Checks the client data (type, challenge, origin), the RP ID, the
+    /// user's presence (and verification, when `rp` requires it), and that
+    /// the key is one crypt-io checks (`ES256`, `EdDSA`, `RS256`).
+    /// Attestation is not checked: the passkey is trusted as the account's
+    /// because the account asked for it.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Invalid`] when any check fails or the challenge is
+    ///   unknown, used, expired, or another account's.
+    /// - [`Error::AlreadyExists`] (`what = "passkey"`) when the credential
+    ///   is registered already.
+    #[cfg(feature = "mfa")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+    pub fn add_passkey(
+        &mut self,
+        account: AccountId,
+        rp: &passkey::RelyingParty,
+        registration: &passkey::PasskeyRegistration<'_>,
+    ) -> Result<passkey::PasskeyId> {
+        let engine = self.staged.engine;
+        let bad = |reason| Error::invalid("passkey registration", reason);
+        let challenge =
+            passkey::check_client_data(rp, registration.client_data_json, "webauthn.create")
+                .ok_or_else(|| bad("client data"))?;
+        let data = passkey::parse_auth_data(registration.authenticator_data)
+            .ok_or_else(|| bad("authenticator data"))?;
+        if data.rp_id_hash != crypt_io::hash::sha256(rp.id.as_bytes()) {
+            return Err(bad("another relying party"));
+        }
+        if !passkey::flags_ok(rp, &data) {
+            return Err(bad("the user was not present or not verified"));
+        }
+        let (credential_id, cose_key) = data.credential.ok_or_else(|| bad("no credential"))?;
+        crypt_io::sign::CosePublicKey::from_cose_key(cose_key)
+            .map_err(|_| bad("a key of another algorithm"))?;
+        if self.redeem_passkey_challenge(&challenge, PASSKEY_REGISTRATION_PAYLOAD) != Some(account)
+        {
+            return Err(bad("challenge unknown, used, or expired"));
+        }
+        let digest = engine.passkey_digest(credential_id);
+        self.staged.note(passkey_conflict(&digest));
+        if engine.passkey_record(&digest)?.is_some() {
+            return Err(Error::AlreadyExists { what: "passkey" });
+        }
+        let record = passkey::PasskeyRecord {
+            account,
+            cose_key: cose_key.to_vec(),
+            sign_count: data.sign_count,
+            created_ms: now_ms(),
+            last_used_ms: 0,
+        };
+        self.stage_passkey(digest, &record, PASSKEY_ADDED)?;
+        Ok(passkey_id(&digest))
+    }
+
+    /// Remove the passkey of `account` with `id`; `false` when it has no
+    /// such passkey.
+    ///
+    /// # Errors
+    ///
+    /// Only storage errors.
+    #[cfg(feature = "mfa")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+    pub fn remove_passkey(&mut self, account: AccountId, id: passkey::PasskeyId) -> Result<bool> {
+        let engine = self.staged.engine;
+        let Some(digest) = engine
+            .passkeys_of(account)?
+            .into_iter()
+            .find(|d| passkey_id(d) == id)
+        else {
+            return Ok(false);
+        };
+        self.staged.note(passkey_conflict(&digest));
+        self.staged.writes.push(passkey_conflict(&digest));
+        self.staged.ops.push(StagedOp::PutPasskey {
+            digest,
+            account,
+            what: PASSKEY_REMOVED,
+            value: Vec::new(),
+            at_ms: now_ms(),
+        });
+        Ok(true)
+    }
+
+    #[cfg(feature = "mfa")]
+    fn stage_passkey(
+        &mut self,
+        digest: [u8; 32],
+        record: &passkey::PasskeyRecord,
+        what: u8,
+    ) -> Result<()> {
+        let engine = self.staged.engine;
+        let value = seal_value(
+            &engine.file_key,
+            &passkey_key(engine.collection, &digest),
+            &record.encode(),
+        )?;
+        self.staged.writes.push(passkey_conflict(&digest));
+        self.staged.ops.push(StagedOp::PutPasskey {
+            digest,
+            account: record.account,
+            what,
+            value,
+            at_ms: now_ms(),
+        });
+        Ok(())
+    }
+
+    /// Check a passkey assertion and, when it holds, redeem its challenge,
+    /// record the use, and issue a session. `Ok(None)` when it does not
+    /// hold; `Err` only for storage. A blocked account gives its block.
+    #[cfg(feature = "mfa")]
+    fn complete_passkey(
+        &mut self,
+        rp: &passkey::RelyingParty,
+        assertion: &passkey::PasskeyAssertion<'_>,
+        spec: SessionSpec,
+    ) -> Result<Option<PasskeyOutcome>> {
+        let engine = self.staged.engine;
+        let Some(challenge) =
+            passkey::check_client_data(rp, assertion.client_data_json, "webauthn.get")
+        else {
+            return Ok(None);
+        };
+        let Some(data) = passkey::parse_auth_data(assertion.authenticator_data) else {
+            return Ok(None);
+        };
+        if data.rp_id_hash != crypt_io::hash::sha256(rp.id.as_bytes())
+            || !passkey::flags_ok(rp, &data)
+            || data.credential.is_some()
+        {
+            return Ok(None);
+        }
+        let digest = engine.passkey_digest(assertion.credential_id);
+        self.staged.note(passkey_conflict(&digest));
+        let Some(mut record) = engine.passkey_record(&digest)? else {
+            return Ok(None);
+        };
+        let Ok(key) = crypt_io::sign::CosePublicKey::from_cose_key(&record.cose_key) else {
+            return Ok(None);
+        };
+        let mut signed = assertion.authenticator_data.to_vec();
+        signed.extend_from_slice(&crypt_io::hash::sha256(assertion.client_data_json));
+        if key.check(&signed, assertion.signature).is_err() {
+            return Ok(None);
+        }
+        // A counter that does not rise means a cloned authenticator; one
+        // that stays at zero is an authenticator without a counter.
+        if (data.sign_count != 0 || record.sign_count != 0) && data.sign_count <= record.sign_count
+        {
+            return Ok(None);
+        }
+        if self
+            .redeem_passkey_challenge(&challenge, PASSKEY_SIGN_IN_PAYLOAD)
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let account = record.account;
+        if let Some(stored) = engine.load_account(account)? {
+            if let Some(until) = stored.standing.blocked_until(now_ms()) {
+                return Ok(Some(Err(until)));
+            }
+        } else {
+            return Ok(None);
+        }
+        record.sign_count = data.sign_count;
+        record.last_used_ms = now_ms();
+        self.stage_passkey(digest, &record, PASSKEY_USED)?;
+        let token = self.issue_session(account, spec)?;
+        Ok(Some(Ok((account, token))))
+    }
+
     /// Complete a sign-in that answered [`SignIn::NeedsSecondFactor`]:
     /// redeem `challenge` and issue a session, when `code` is a fresh TOTP
     /// code of its account. `None` when the challenge is unknown, used, or
@@ -3418,6 +3839,132 @@ impl Auth<'_> {
             }
             None => Ok(SignIn::Failed),
         }
+    }
+
+    /// Make a passkey registration challenge in its own commit. See
+    /// [`AuthTx::passkey_registration`].
+    ///
+    /// # Errors
+    ///
+    /// As [`AuthTx::passkey_registration`], plus the errors of
+    /// [`Database::commit`].
+    #[cfg(feature = "mfa")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+    pub fn passkey_registration(&self, account: AccountId) -> Result<passkey::PasskeyChallenge> {
+        self.db.commit(|tx| {
+            tx.auth_of(self.engine.collection)
+                .passkey_registration(account)
+        })
+    }
+
+    /// Register a passkey in its own commit. See [`AuthTx::add_passkey`].
+    ///
+    /// # Errors
+    ///
+    /// As [`AuthTx::add_passkey`], plus the errors of [`Database::commit`].
+    #[cfg(feature = "mfa")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+    pub fn add_passkey(
+        &self,
+        account: AccountId,
+        rp: &passkey::RelyingParty,
+        registration: &passkey::PasskeyRegistration<'_>,
+    ) -> Result<passkey::PasskeyId> {
+        self.db.commit(|tx| {
+            tx.auth_of(self.engine.collection)
+                .add_passkey(account, rp, registration)
+        })
+    }
+
+    /// Make a passkey sign-in challenge in its own commit. See
+    /// [`AuthTx::passkey_sign_in`].
+    ///
+    /// # Errors
+    ///
+    /// As [`AuthTx::passkey_sign_in`], plus the errors of
+    /// [`Database::commit`].
+    #[cfg(feature = "mfa")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+    pub fn passkey_sign_in(&self) -> Result<passkey::PasskeyChallenge> {
+        self.db
+            .commit(|tx| tx.auth_of(self.engine.collection).passkey_sign_in())
+    }
+
+    /// Sign in with a passkey: check what `navigator.credentials.get`
+    /// returned for a [`passkey_sign_in`](Self::passkey_sign_in) challenge
+    /// (the client data's type, challenge, and origin; the RP ID; the
+    /// user's presence, and verification when `rp` requires it; the
+    /// signature; and a rising signature counter) and issue a session.
+    /// A passkey is a sign-in of its own: no password, no TOTP code. Any
+    /// failed check gives [`SignIn::Failed`]; a blocked account
+    /// [`SignIn::LockedOut`].
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Database::commit`].
+    #[cfg(feature = "mfa")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+    pub fn verify_passkey(
+        &self,
+        rp: &passkey::RelyingParty,
+        assertion: &passkey::PasskeyAssertion<'_>,
+        spec: SessionSpec,
+    ) -> Result<SignIn> {
+        let outcome = self.db.commit(|tx| {
+            tx.auth_of(self.engine.collection)
+                .complete_passkey(rp, assertion, spec)
+        })?;
+        Ok(match outcome {
+            Some(Ok((account, token))) => SignIn::Success { account, token },
+            Some(Err(until)) => {
+                self.db.observers().security(SecurityEvent::SignInBlocked);
+                SignIn::LockedOut { until }
+            }
+            None => {
+                self.db
+                    .observers()
+                    .security(SecurityEvent::SignInFailed { account: None });
+                SignIn::Failed
+            }
+        })
+    }
+
+    /// The passkeys of `account`, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Only storage errors.
+    #[cfg(feature = "mfa")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+    pub fn passkeys(&self, account: AccountId) -> Result<Vec<passkey::PasskeyInfo>> {
+        let engine = self.engine;
+        let mut out = Vec::new();
+        for digest in engine.passkeys_of(account)? {
+            if let Some(record) = engine.passkey_record(&digest)? {
+                out.push(passkey::PasskeyInfo {
+                    id: passkey_id(&digest),
+                    created_ms: record.created_ms,
+                    last_used_ms: record.last_used_ms,
+                });
+            }
+        }
+        out.sort_by_key(|p| (p.created_ms, p.id));
+        Ok(out)
+    }
+
+    /// Remove a passkey in its own commit. See [`AuthTx::remove_passkey`].
+    ///
+    /// # Errors
+    ///
+    /// As [`AuthTx::remove_passkey`], plus the errors of
+    /// [`Database::commit`].
+    #[cfg(feature = "mfa")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+    pub fn remove_passkey(&self, account: AccountId, id: passkey::PasskeyId) -> Result<bool> {
+        self.db.commit(|tx| {
+            tx.auth_of(self.engine.collection)
+                .remove_passkey(account, id)
+        })
     }
 
     /// Start TOTP in its own commit. See [`AuthTx::add_totp`].

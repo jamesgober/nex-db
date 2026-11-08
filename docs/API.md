@@ -62,7 +62,7 @@ nex-db = { git = "https://github.com/jamesgober/nex-db", tag = "v0.4.0" }
 | `content` | yes | the content engine: entities, routes |
 | `split-auth` (0.5) | no | the auth engine in its own process |
 | `metrics` (0.4) | no | an observer that reports into metrics-lib |
-| `mfa` (0.5) | no | TOTP second factors (passkeys to come), through crypt-io's AWS-LC backend: needs a C compiler; on Windows x86-64 no NASM |
+| `mfa` (0.5) | no | TOTP and passkeys, through crypt-io's AWS-LC backend: needs a C compiler; on Windows x86-64 no NASM |
 
 The core (commit log, catalog, recovery) is always built. A database that uses
 an engine the build leaves out refuses to open with `Error::Invalid`.
@@ -464,7 +464,9 @@ every session of the account in the same commit.
 | `check_totp(account, code) -> Result<bool>` (0.5, feature `mfa`; also in a transaction) | P1 | after `Login::NeedsSecondFactor`, for an application that issues its own sessions |
 | `new_recovery_codes(account) -> Result<RecoveryCodes>` (tx) | P1 | ten codes, `xxxxx-xxxxx` (Crockford base32, 50 bits each); replaces any earlier codes; shown once (`codes()`); stored as keyed digests |
 | `use_recovery_code(account, code) -> Result<bool>` (tx) | P1 | `true` once per code; dashes, spaces, and case ignored; two uses at once give `true` to one |
-| `add_passkey`, `verify_passkey` | P2 | WebAuthn public keys and counters; waits for ECDSA P-256 in crypt-io (to come) |
+| `passkey_registration(account) -> Result<PasskeyChallenge>`, `add_passkey(account, &RelyingParty, &PasskeyRegistration) -> Result<PasskeyId>` (0.5, feature `mfa`; also in a transaction) | P2 | the challenge's bytes go to `navigator.credentials.create` (`as_bytes()`, `to_base64url()`), the account's id as the user id; checks the client data (type, challenge, origin, not cross-origin), the RP ID hash, user presence (and verification with `RelyingParty::require_user_verification`), and that the key is `ES256`, `EdDSA`, or `RS256`; attestation is not checked; `PasskeyRegistration::new(client_data_json, authenticator_data)` |
+| `passkey_sign_in() -> Result<PasskeyChallenge>`, `verify_passkey(&RelyingParty, &PasskeyAssertion, spec) -> Result<SignIn>` (0.5, feature `mfa`) | P2 | a sign-in of its own (no password, no TOTP); the same checks, the signature, and a rising signature counter (an authenticator that keeps it at zero is allowed); `PasskeyAssertion::new(credential_id, client_data_json, authenticator_data, signature)`; challenges work once, within five minutes |
+| `passkeys(account) -> Result<Vec<PasskeyInfo>>`, `remove_passkey(account, PasskeyId) -> Result<bool>` (0.5, feature `mfa`) | P2 | `PasskeyInfo`: `id()`, `created_at()`, `last_used_at()` |
 | `single_use_token(purpose, account, ttl) -> Result<Token>` | P1 | email verification, magic link, preview; `Purpose` (non-exhaustive): `VerifyEmail`, `ResetPassword`, `SignInLink`, `Preview`, `Custom(u16)`; `ttl` at most 30 days; never validates as a session; also in a transaction |
 | `single_use_token_for(identifier, purpose, ttl) -> Result<Option<Token>>` | P1 | password reset by email address; the same work whether the identifier exists or not, so answer the same either way |
 | `redeem(token, purpose) -> Result<Option<AccountId>>` | P1 | works once, for the purpose it was issued for; two redeems at once give the account to one; also in a transaction |

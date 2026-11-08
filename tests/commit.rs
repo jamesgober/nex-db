@@ -1294,3 +1294,195 @@ fn test_totp_second_factor_signs_in_once_per_code() {
         SignIn::Success { .. }
     ));
 }
+
+/// A software authenticator holding one Ed25519 passkey.
+#[cfg(feature = "mfa")]
+struct Authenticator {
+    key: crypt_io::sign::Ed25519SigningKey,
+    id: Vec<u8>,
+    rp_hash: [u8; 32],
+    count: u32,
+}
+
+#[cfg(feature = "mfa")]
+impl Authenticator {
+    fn new(rp_id: &str) -> Self {
+        Authenticator {
+            key: crypt_io::sign::Ed25519SigningKey::from_seed(&[7; 32]).unwrap(),
+            id: b"credential-1".to_vec(),
+            rp_hash: crypt_io::hash::sha256(rp_id.as_bytes()),
+            count: 0,
+        }
+    }
+
+    fn client_data(kind: &str, challenge: &nex_db::PasskeyChallenge, origin: &str) -> Vec<u8> {
+        format!(
+            r#"{{"type":"{kind}","challenge":"{}","origin":"{origin}","crossOrigin":false}}"#,
+            challenge.to_base64url()
+        )
+        .into_bytes()
+    }
+
+    /// `authenticatorData` and `clientDataJSON` of a registration.
+    fn register(&self, challenge: &nex_db::PasskeyChallenge, origin: &str) -> (Vec<u8>, Vec<u8>) {
+        // COSE_Key: {1: 1 (OKP), 3: -8 (EdDSA), -1: 6 (Ed25519), -2: x}.
+        let mut cose = vec![0xa4, 0x01, 0x01, 0x03, 0x27, 0x20, 0x06, 0x21, 0x58, 0x20];
+        cose.extend_from_slice(&self.key.public_key());
+        let mut data = self.rp_hash.to_vec();
+        data.push(0x45); // user present, user verified, attested credential
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(&[0; 16]);
+        data.extend_from_slice(&(self.id.len() as u16).to_be_bytes());
+        data.extend_from_slice(&self.id);
+        data.extend_from_slice(&cose);
+        (
+            data,
+            Self::client_data("webauthn.create", challenge, origin),
+        )
+    }
+
+    /// `authenticatorData`, `clientDataJSON`, and `signature` of a sign-in.
+    fn assert(
+        &mut self,
+        challenge: &nex_db::PasskeyChallenge,
+        origin: &str,
+        flags: u8,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        self.count += 1;
+        let mut data = self.rp_hash.to_vec();
+        data.push(flags);
+        data.extend_from_slice(&self.count.to_be_bytes());
+        let client = Self::client_data("webauthn.get", challenge, origin);
+        let mut signed = data.clone();
+        signed.extend_from_slice(&crypt_io::hash::sha256(&client));
+        (data, client, self.key.sign(&signed).to_vec())
+    }
+}
+
+#[cfg(feature = "mfa")]
+#[test]
+fn test_passkeys_register_sign_in_and_refuse_replays() {
+    use nex_db::{PasskeyAssertion, PasskeyRegistration, RelyingParty};
+    let dir = TempDir::new("passkeys");
+    let db = Database::open(&dir.0).unwrap();
+    let password = db.auth().hash_password(PASSWORD).unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    let origin = "https://example.com";
+    let rp = RelyingParty::new("example.com", origin);
+    let mut device = Authenticator::new("example.com");
+
+    // Registration: the challenge is checked, and works once.
+    let challenge = db.auth().passkey_registration(ann).unwrap();
+    let (data, client) = device.register(&challenge, origin);
+    let wrong_origin =
+        Authenticator::client_data("webauthn.create", &challenge, "https://evil.example");
+    assert!(
+        db.auth()
+            .add_passkey(ann, &rp, &PasskeyRegistration::new(&wrong_origin, &data))
+            .is_err()
+    );
+    let id = db
+        .auth()
+        .add_passkey(ann, &rp, &PasskeyRegistration::new(&client, &data))
+        .unwrap();
+    assert!(
+        db.auth()
+            .add_passkey(ann, &rp, &PasskeyRegistration::new(&client, &data))
+            .is_err()
+    );
+    let again = db.auth().passkey_registration(ann).unwrap();
+    let (data2, client2) = device.register(&again, origin);
+    assert!(matches!(
+        db.auth()
+            .add_passkey(ann, &rp, &PasskeyRegistration::new(&client2, &data2)),
+        Err(Error::AlreadyExists { what: "passkey" })
+    ));
+    assert_eq!(db.auth().passkeys(ann).unwrap().len(), 1);
+
+    // Sign-in.
+    let challenge = db.auth().passkey_sign_in().unwrap();
+    let (data, client, sig) = device.assert(&challenge, origin, 0x05);
+    let assertion = PasskeyAssertion::new(&device.id, &client, &data, &sig);
+    let SignIn::Success { account, token } = db
+        .auth()
+        .verify_passkey(&rp, &assertion, SessionSpec::web())
+        .unwrap()
+    else {
+        panic!("signed in");
+    };
+    assert_eq!(account, ann);
+    assert!(matches!(
+        db.auth().validate(&token).unwrap(),
+        Validation::Valid(_)
+    ));
+    // The same assertion again: its challenge is used.
+    assert!(matches!(
+        db.auth()
+            .verify_passkey(&rp, &assertion, SessionSpec::web())
+            .unwrap(),
+        SignIn::Failed
+    ));
+    assert!(db.auth().passkeys(ann).unwrap()[0].last_used_at().is_some());
+
+    // A counter that does not rise (a cloned authenticator) fails.
+    let challenge = db.auth().passkey_sign_in().unwrap();
+    device.count -= 1;
+    let (data, client, sig) = device.assert(&challenge, origin, 0x05);
+    assert!(matches!(
+        db.auth()
+            .verify_passkey(
+                &rp,
+                &PasskeyAssertion::new(&device.id, &client, &data, &sig),
+                SessionSpec::web()
+            )
+            .unwrap(),
+        SignIn::Failed
+    ));
+    // A forged signature fails; so does presence alone when verification is required.
+    let challenge = db.auth().passkey_sign_in().unwrap();
+    let (data, client, mut sig) = device.assert(&challenge, origin, 0x05);
+    sig[0] ^= 1;
+    assert!(matches!(
+        db.auth()
+            .verify_passkey(
+                &rp,
+                &PasskeyAssertion::new(&device.id, &client, &data, &sig),
+                SessionSpec::web()
+            )
+            .unwrap(),
+        SignIn::Failed
+    ));
+    let strict = rp.clone().require_user_verification();
+    let challenge = db.auth().passkey_sign_in().unwrap();
+    let (data, client, sig) = device.assert(&challenge, origin, 0x01);
+    assert!(matches!(
+        db.auth()
+            .verify_passkey(
+                &strict,
+                &PasskeyAssertion::new(&device.id, &client, &data, &sig),
+                SessionSpec::web()
+            )
+            .unwrap(),
+        SignIn::Failed
+    ));
+
+    // Removed: it signs in no more.
+    assert!(db.auth().remove_passkey(ann, id).unwrap());
+    assert!(!db.auth().remove_passkey(ann, id).unwrap());
+    let challenge = db.auth().passkey_sign_in().unwrap();
+    let (data, client, sig) = device.assert(&challenge, origin, 0x05);
+    assert!(matches!(
+        db.auth()
+            .verify_passkey(
+                &rp,
+                &PasskeyAssertion::new(&device.id, &client, &data, &sig),
+                SessionSpec::web()
+            )
+            .unwrap(),
+        SignIn::Failed
+    ));
+    assert!(db.auth().passkeys(ann).unwrap().is_empty());
+}

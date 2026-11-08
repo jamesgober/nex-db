@@ -112,9 +112,6 @@ mod observe;
 mod table;
 mod wheel;
 
-#[cfg(feature = "mfa")]
-#[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
-pub use crate::auth::totp::TotpEnrollment;
 #[cfg(feature = "auth")]
 #[cfg_attr(docsrs, doc(cfg(feature = "auth")))]
 pub use crate::auth::{
@@ -128,6 +125,15 @@ pub use crate::auth::{
         HashedPassword, Login, Purpose, RevokeReason, Session, SessionId, SessionInfo, SessionSpec,
         SignIn, Standing, Validation,
     },
+};
+#[cfg(feature = "mfa")]
+#[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+pub use crate::auth::{
+    passkey::{
+        PasskeyAssertion, PasskeyChallenge, PasskeyId, PasskeyInfo, PasskeyRegistration,
+        RelyingParty,
+    },
+    totp::TotpEnrollment,
 };
 #[cfg(feature = "content")]
 #[cfg_attr(docsrs, doc(cfg(feature = "content")))]

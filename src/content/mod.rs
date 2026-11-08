@@ -213,6 +213,10 @@ pub(crate) struct ContentEngine {
     /// Entity head versions kept for running snapshots.
     versions: Versions,
     conflicts: ConflictTable,
+    /// The latest publication time given out or stored: each publication
+    /// is later than it, so listings follow publication order even when
+    /// the system clock steps back.
+    published_ms: AtomicU64,
 }
 
 impl fmt::Debug for ContentEngine {
@@ -251,11 +255,16 @@ impl ContentEngine {
         // records: those are written now, from the heads.
         let mut links = Batch::new();
         let mut any_links = false;
+        let mut published_ms = 0;
         let start = entity_prefix(collection);
         for (_, value) in store.scan(start.clone()..after(&start))? {
             let head = Head::decode(&value, applied)?;
             lists.update(&head);
-            type_index.update(&types, &head);
+            published_ms = published_ms.max(head.last_published_ms());
+            let legacy = Head::is_legacy(&value);
+            type_index.update(&types, &head, |locale, n| {
+                published_body(&store, collection, &head, legacy, locale, n)
+            })?;
             if !Head::is_current(&value) {
                 for target in head.refs() {
                     links.put(link_key(collection, target, head.rid), []);
@@ -296,7 +305,27 @@ impl ContentEngine {
             type_index: Mutex::new(type_index),
             versions: Versions::new(),
             conflicts: ConflictTable::new(),
+            published_ms: AtomicU64::new(published_ms),
         })
+    }
+
+    /// A publication time: now, or a millisecond after the latest one when
+    /// the clock reads earlier.
+    fn publish_ms(&self) -> u64 {
+        let now = now_ms();
+        let mut last = self.published_ms.load(Ordering::Acquire);
+        loop {
+            let next = now.max(last.saturating_add(1));
+            match self.published_ms.compare_exchange_weak(
+                last,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return next,
+                Err(seen) => last = seen,
+            }
+        }
     }
 
     /// The stored head bytes of `rid` as a snapshot at `at` sees them.
@@ -352,12 +381,13 @@ impl ContentEngine {
             .collect()
     }
 
-    /// Every head in the store.
-    fn all_heads(&self) -> Result<Vec<Head>> {
+    /// Every head in the store, each with whether it is a record from 0.1
+    /// to 0.3.
+    fn all_heads(&self) -> Result<Vec<(Head, bool)>> {
         let start = entity_prefix(self.collection);
         self.store
             .scan(start.clone()..after(&start))?
-            .map(|(_, value)| Head::decode(&value, 0))
+            .map(|(_, value)| Ok((Head::decode(&value, 0)?, Head::is_legacy(&value))))
             .collect()
     }
 
@@ -451,6 +481,28 @@ fn split_route(name: &[u8], at: Seq) -> Result<(&str, &str)> {
     let site = std::str::from_utf8(&name[..zero]).map_err(|_| corrupt())?;
     let path = std::str::from_utf8(&name[zero + 1..]).map_err(|_| corrupt())?;
     Ok((site, path))
+}
+
+/// The body of revision `n`, published in `locale` of `head`: the stored
+/// revision, or for a record from 0.1 to 0.3 (`legacy`), its draft.
+fn published_body(
+    store: &Lsm,
+    collection: u32,
+    head: &Head,
+    legacy: bool,
+    locale: Locale,
+    n: u32,
+) -> Result<Body> {
+    if legacy {
+        return head
+            .variant(locale)
+            .map(|v| v.draft.clone())
+            .ok_or_else(|| Error::corrupt("an entity record", 0));
+    }
+    match store.get(revision_key(collection, head.rid, n))? {
+        Some(bytes) => Ok(Revision::decode(&bytes, 0)?.body),
+        None => Err(Error::corrupt("an entity without its revision", 0)),
+    }
 }
 
 /// The page route of `head` in `locale` at `revision`.
@@ -569,7 +621,7 @@ impl Engine for ContentEngine {
                         batch.put(stored, encode_route(&entry));
                         routes.push((head.site.clone(), path.to_owned(), Some(entry)));
                     }
-                    heads.push(head);
+                    heads.push((head, true));
                 }
                 Op::PutHead(rid, value) => {
                     let key = entity_key(self.collection, *rid);
@@ -588,7 +640,7 @@ impl Engine for ContentEngine {
                         rid: *rid,
                         revision: head.base().published.as_ref().map_or(0, |p| p.revision),
                     });
-                    heads.push(head);
+                    heads.push((head, false));
                 }
                 Op::PutRevision(rid, n, value) => {
                     batch.put(revision_key(self.collection, *rid, *n), *value);
@@ -645,8 +697,11 @@ impl Engine for ContentEngine {
             self.routes.set(&site, &path, seq, entry);
             changes.push(Change::RouteChanged { site, path });
         }
-        for head in &heads {
+        for (head, _) in &heads {
             self.lists.update(head);
+            let _ = self
+                .published_ms
+                .fetch_max(head.last_published_ms(), Ordering::AcqRel);
         }
         for (rid, kind) in &deleted {
             self.lists.remove(*rid);
@@ -658,16 +713,21 @@ impl Engine for ContentEngine {
         if let Some(types) = types {
             // New unique fields index entities already stored.
             let mut index = TypeIndex::default();
-            for head in self.all_heads()? {
-                index.update(&types, &head);
+            for (head, legacy) in self.all_heads()? {
+                index.update(&types, &head, |locale, n| {
+                    published_body(&self.store, self.collection, &head, legacy, locale, n)
+                })?;
             }
             *self.type_index() = index;
             *self.types.write().unwrap_or_else(PoisonError::into_inner) = types;
         } else if !heads.is_empty() {
+            // After the write: a revision this commit published is stored.
             let types = self.types();
             let mut index = self.type_index();
-            for head in &heads {
-                index.update(&types, head);
+            for (head, legacy) in &heads {
+                index.update(&types, head, |locale, n| {
+                    published_body(&self.store, self.collection, head, *legacy, locale, n)
+                })?;
             }
         }
         Ok(())
@@ -977,10 +1037,18 @@ impl ContentTx<'_, '_> {
         Ok(out)
     }
 
-    /// Refuse publishing `head` when another entity's published value
-    /// takes one of its unique values.
-    fn claim_unique(&mut self, head: &Head) -> Result<()> {
-        for key in self.types().unique_keys(head) {
+    /// Refuse publishing `locales` of `head` when another entity's
+    /// published value takes one of their unique values. The body each
+    /// publishes is its draft; locales published before keep the keys they
+    /// hold.
+    fn claim_unique(&mut self, head: &Head, locales: &[Locale]) -> Result<()> {
+        let types = self.types();
+        let keys: Vec<Vec<u8>> = locales
+            .iter()
+            .filter_map(|l| head.variant(*l))
+            .flat_map(|v| types.unique_keys(&head.kind, &v.draft))
+            .collect();
+        for key in keys {
             let holder = match self.staged.unique.get(&key) {
                 Some(rid) => Some(*rid),
                 None => self.staged.engine.type_index().holder(&key),
@@ -1016,13 +1084,29 @@ impl ContentTx<'_, '_> {
             return Err(Error::invalid("type", "has more than one entity"));
         }
         let mut seen = HashMap::new();
-        for head in engine.all_heads()? {
-            for key in next.unique_keys(&head) {
-                if seen.insert(key, head.rid).is_some_and(|r| r != head.rid) {
-                    return Err(Error::invalid(
-                        "type",
-                        "published entities share a value of a unique field",
-                    ));
+        for (head, legacy) in engine.all_heads()? {
+            if !next.has_unique(&head.kind) {
+                continue;
+            }
+            for variant in &head.variants {
+                let Some(p) = &variant.published else {
+                    continue;
+                };
+                let body = published_body(
+                    &engine.store,
+                    engine.collection,
+                    &head,
+                    legacy,
+                    variant.locale,
+                    p.revision,
+                )?;
+                for key in next.unique_keys(&head.kind, &body) {
+                    if seen.insert(key, head.rid).is_some_and(|r| r != head.rid) {
+                        return Err(Error::invalid(
+                            "type",
+                            "published entities share a value of a unique field",
+                        ));
+                    }
                 }
             }
         }
@@ -1311,7 +1395,7 @@ impl ContentTx<'_, '_> {
                 Some(n) => n,
                 None => self.record_revision(&mut head, locale, "")?,
             };
-            let now = now_ms();
+            let now = self.staged.engine.publish_ms();
             let Some(variant) = head.variant_mut(locale) else {
                 continue;
             };
@@ -1329,7 +1413,7 @@ impl ContentTx<'_, '_> {
             self.route_published(&head, locale, old.as_deref())?;
             newest = newest.max(n);
         }
-        self.claim_unique(&head)?;
+        self.claim_unique(&head, locales)?;
         self.put_head(head)?;
         Ok(newest)
     }
@@ -1651,7 +1735,7 @@ impl ContentTx<'_, '_> {
             let n = self.record_body(&mut head, locale, body, "")?;
             if let Some(p) = head.variant_mut(locale).and_then(|v| v.published.as_mut()) {
                 p.revision = n;
-                p.at_ms = now_ms();
+                p.at_ms = self.staged.engine.publish_ms();
                 p.refs = refs;
             }
             self.route_published(&head, locale, None)?;

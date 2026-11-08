@@ -62,7 +62,7 @@
   - [x] Change feed (`PLAN.md` D-071).
   - [x] Listings by site and type, two orders, cursors (`PLAN.md` D-072).
   - [x] Locales: per-locale drafts, publishing, and paths, fallback chains (`PLAN.md` D-074).
-  - [x] Types: declared field kinds, unique fields, singletons (`PLAN.md` D-075).
+  - [x] Types: declared field kinds, unique fields, singletons (`PLAN.md` D-075, fixed in D-081).
   - [x] Trash, restore, delete with gone routes (`PLAN.md` D-076).
   - [x] References of entity fields, `referenced_by`, and their rules on delete (`PLAN.md` D-078).
   - Blocker recorded: lsm-db 1.1 scans materialize the whole range, so derived indexes stay in memory and are rebuilt at open; a lazy, bounded scan is requested from lsm-db.

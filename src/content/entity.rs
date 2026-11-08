@@ -23,9 +23,15 @@ const RECORD_FORMAT: u8 = 1;
 /// Stored entity record format of builds before 0.4.0 was released: as
 /// [`HEAD_FORMAT`] without the references of published bodies. Read only.
 const HEAD_FORMAT_2: u8 = 2;
+/// As [`HEAD_FORMAT`] without authors, parent, and order: builds before
+/// 0.4.0 was released. Read only.
+const HEAD_FORMAT_3: u8 = 3;
 /// Stored entity record format from 0.4: per locale, the working draft
-/// and what is published, with the entities the published body refers to.
-const HEAD_FORMAT: u8 = 3;
+/// and what is published, with the entities the published body refers to;
+/// then the authors, the parent, and the order among its siblings.
+const HEAD_FORMAT: u8 = 4;
+/// Most authors one entity has.
+pub(crate) const MAX_AUTHORS: usize = 16;
 /// Most locales one entity has.
 const MAX_VARIANTS: usize = 64;
 /// Format of a stored revision.
@@ -173,6 +179,9 @@ pub struct Entity {
     path: Option<String>,
     locale: Option<Locale>,
     fields: Vec<(String, Value)>,
+    authors: Vec<AccountId>,
+    parent: Option<Rid>,
+    order: i64,
 }
 
 impl Entity {
@@ -185,7 +194,38 @@ impl Entity {
             path: None,
             locale: None,
             fields: Vec::new(),
+            authors: Vec::new(),
+            parent: None,
+            order: 0,
         }
+    }
+
+    /// Add `account` to the entity's authors, in order (at most 16).
+    /// Authors are shared by every locale; listings filter by them
+    /// ([`Listing::by_author`](crate::Listing::by_author)).
+    #[must_use]
+    pub fn author(mut self, account: AccountId) -> Self {
+        if !self.authors.contains(&account) {
+            self.authors.push(account);
+        }
+        self
+    }
+
+    /// The entity's parent, for page trees and menus
+    /// ([`Content::children`](crate::Content::children)). The parent is a
+    /// reference: it cannot be deleted while it has children.
+    #[must_use]
+    pub fn parent(mut self, parent: Rid) -> Self {
+        self.parent = Some(parent);
+        self
+    }
+
+    /// The entity's place among its parent's children, lowest first
+    /// (default 0; ties go by record id).
+    #[must_use]
+    pub fn order(mut self, order: i64) -> Self {
+        self.order = order;
+        self
     }
 
     /// The locale the entity is written in (default: the space's default
@@ -247,12 +287,18 @@ impl Entity {
                 "must be 1 to 253 bytes without spaces",
             ));
         }
+        if self.authors.len() > MAX_AUTHORS {
+            return Err(Error::invalid("authors", "at most 16"));
+        }
         let body = Body {
             path: self.path,
             fields: self.fields,
         };
         body.check()?;
         Ok(Head {
+            authors: self.authors,
+            parent: self.parent,
+            order: self.order,
             rid,
             kind: self.kind,
             site,
@@ -595,6 +641,12 @@ pub(crate) struct Head {
     /// Paths the entity was served at when it was trashed, now gone (410),
     /// with the locale each served.
     pub(crate) gone: Vec<(Locale, String)>,
+    /// Its authors, in order, shared by every locale.
+    pub(crate) authors: Vec<AccountId>,
+    /// Its parent in the page tree.
+    pub(crate) parent: Option<Rid>,
+    /// Its place among its parent's children.
+    pub(crate) order: i64,
 }
 
 impl Head {
@@ -634,11 +686,16 @@ impl Head {
     /// Every entity the head refers to: from each locale's draft and
     /// published body, sorted, each once.
     pub(crate) fn refs(&self) -> Vec<Rid> {
-        ref_set(self.variants.iter().flat_map(|v| {
-            v.draft
-                .refs()
-                .chain(v.published.iter().flat_map(|p| p.refs.iter().copied()))
-        }))
+        ref_set(
+            self.variants
+                .iter()
+                .flat_map(|v| {
+                    v.draft
+                        .refs()
+                        .chain(v.published.iter().flat_map(|p| p.refs.iter().copied()))
+                })
+                .chain(self.parent),
+        )
     }
 
     /// When any locale was last published; 0 when none is.
@@ -692,6 +749,18 @@ impl Head {
             locale.write(&mut w);
             w.str16(path)?;
         }
+        w.u8(self.authors.len() as u8);
+        for account in &self.authors {
+            w.bytes(account.as_bytes());
+        }
+        match self.parent {
+            Some(parent) => {
+                w.u8(1);
+                w.bytes(parent.as_bytes());
+            }
+            None => w.u8(0),
+        }
+        w.i64(self.order);
         Ok(out)
     }
 
@@ -732,10 +801,13 @@ impl Head {
                         source: 0,
                     }],
                     gone: Vec::new(),
+                    authors: Vec::new(),
+                    parent: None,
+                    order: 0,
                 }
                 .with_draft_refs())
             }
-            format @ (HEAD_FORMAT_2 | HEAD_FORMAT) => {
+            format @ (HEAD_FORMAT_2 | HEAD_FORMAT_3 | HEAD_FORMAT) => {
                 let rid = Rid::from_bytes(r.fixed()?);
                 let created_ms = r.u64()?;
                 let updated_ms = r.u64()?;
@@ -757,7 +829,7 @@ impl Head {
                     let published_ms = r.u64()?;
                     let published_path = Some(r.str16()?.to_owned()).filter(|p| !p.is_empty());
                     let mut refs = Vec::new();
-                    if format == HEAD_FORMAT {
+                    if format != HEAD_FORMAT_2 {
                         for _ in 0..r.u16()? {
                             refs.push(Rid::from_bytes(r.fixed()?));
                         }
@@ -784,8 +856,29 @@ impl Head {
                     let locale = Locale::read(&mut r, at)?;
                     gone.push((locale, r.str16()?.to_owned()));
                 }
+                let mut authors = Vec::new();
+                let mut parent = None;
+                let mut order = 0;
+                if format == HEAD_FORMAT {
+                    let count = usize::from(r.u8()?);
+                    if count > MAX_AUTHORS {
+                        return Err(Error::corrupt("an entity's authors", at));
+                    }
+                    for _ in 0..count {
+                        authors.push(AccountId::from_bytes(r.fixed()?));
+                    }
+                    parent = match r.u8()? {
+                        0 => None,
+                        1 => Some(Rid::from_bytes(r.fixed()?)),
+                        _ => return Err(Error::corrupt("an entity's parent", at)),
+                    };
+                    order = r.i64()?;
+                }
                 r.finish()?;
                 let head = Head {
+                    authors,
+                    parent,
+                    order,
                     rid,
                     kind,
                     site,
@@ -826,10 +919,10 @@ impl Head {
         bytes.first() == Some(&RECORD_FORMAT)
     }
 
-    /// True for a record stored in the current format, whose references
-    /// are in the store.
+    /// True for a record of a format whose references are in the store
+    /// (format 3 on).
     pub(crate) fn is_current(bytes: &[u8]) -> bool {
-        bytes.first() == Some(&HEAD_FORMAT)
+        matches!(bytes.first(), Some(&(HEAD_FORMAT_3 | HEAD_FORMAT)))
     }
 
     /// The entry a reader sees for `body` of `locale` at `revision`;
@@ -860,6 +953,9 @@ impl Head {
             first_published_ms: self.first_published_ms,
             locale,
             fallback: asked.filter(|a| *a != locale),
+            authors: self.authors.clone(),
+            parent: self.parent,
+            order: self.order,
         }
     }
 }
@@ -1045,9 +1141,30 @@ pub struct Entry {
     first_published_ms: u64,
     locale: Locale,
     fallback: Option<Locale>,
+    authors: Vec<AccountId>,
+    parent: Option<Rid>,
+    order: i64,
 }
 
 impl Entry {
+    /// The entity's authors, in order.
+    #[must_use]
+    pub fn authors(&self) -> &[AccountId] {
+        &self.authors
+    }
+
+    /// The entity's parent in the page tree, if it has one.
+    #[must_use]
+    pub const fn parent(&self) -> Option<Rid> {
+        self.parent
+    }
+
+    /// The entity's place among its parent's children.
+    #[must_use]
+    pub const fn order(&self) -> i64 {
+        self.order
+    }
+
     /// The locale of this entry.
     #[must_use]
     pub const fn locale(&self) -> Locale {
@@ -1227,6 +1344,9 @@ mod tests {
         head.add_variant(fr, head.variants[0].draft.clone(), 2)
             .unwrap();
         head.last_revision = 3;
+        head.authors = vec![account];
+        head.parent = Some(Rid::from_bytes([4; 16]));
+        head.order = -7;
         head.first_published_ms = 4;
         let back = Head::decode(&head.encode().unwrap(), 0).unwrap();
         assert_eq!(back, head);

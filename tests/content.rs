@@ -809,3 +809,107 @@ fn test_a_reference_to_an_entity_deleted_concurrently_never_lands() {
         }
     }
 }
+
+#[test]
+fn test_page_tree_and_authors() {
+    use nex_db::AccountId;
+    let dir = TempDir::new("tree");
+    let ann = AccountId::from_bytes([1; 16]);
+    let bob = AccountId::from_bytes([2; 16]);
+    let (root, docs, intro) = {
+        let db = Database::open(&dir.0).unwrap();
+        let root = db.content().create(Entity::new("page").path("/")).unwrap();
+        let docs = db
+            .content()
+            .create(Entity::new("page").path("/docs").parent(root).order(2))
+            .unwrap();
+        let about = db
+            .content()
+            .create(Entity::new("page").path("/about").parent(root).order(1))
+            .unwrap();
+        let intro = db
+            .content()
+            .create(Entity::new("page").path("/docs/intro").parent(docs))
+            .unwrap();
+        assert_eq!(db.content().children(root), vec![about, docs]);
+        assert_eq!(db.content().ancestors(intro).unwrap(), vec![docs, root]);
+        assert!(db.content().ancestors(root).unwrap().is_empty());
+        assert_eq!(
+            db.content().draft(intro).unwrap().unwrap().parent(),
+            Some(docs)
+        );
+
+        // No cycles, no parent that does not exist.
+        assert!(db.content().set_parent(root, Some(intro)).is_err());
+        assert!(db.content().set_parent(docs, Some(docs)).is_err());
+        assert!(
+            db.content()
+                .set_parent(docs, Some(nex_db::Rid::from_bytes([9; 16])))
+                .is_err()
+        );
+        // Reorder and move.
+        db.commit(|tx| tx.content().set_order(docs, 0)).unwrap();
+        assert_eq!(db.content().children(root), vec![docs, about]);
+        db.content().set_parent(about, Some(docs)).unwrap();
+        assert_eq!(db.content().children(root), vec![docs]);
+        assert_eq!(db.content().children(docs), vec![intro, about]);
+        db.content().set_parent(about, None).unwrap();
+
+        // A parent stays while it has children.
+        assert!(matches!(
+            db.content().delete(docs),
+            Err(Error::Restricted { .. })
+        ));
+        db.content().delete(about).unwrap();
+
+        // Authors: listings per author, shared by every locale.
+        let post = db
+            .content()
+            .create(Entity::new("post").author(ann).author(bob))
+            .unwrap();
+        let other = db
+            .content()
+            .create(Entity::new("post").author(bob))
+            .unwrap();
+        let _ = db.content().publish(post).unwrap();
+        let _ = db.content().publish(other).unwrap();
+        let by = |a| {
+            db.content()
+                .list(&Listing::latest("post").by_author(a))
+                .unwrap()
+                .items()
+                .iter()
+                .map(|e| e.rid())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(by(ann), vec![post]);
+        assert_eq!(by(bob), vec![other, post]);
+        assert_eq!(
+            db.content().get(post).unwrap().unwrap().authors(),
+            &[ann, bob]
+        );
+        db.content().set_authors(post, &[bob]).unwrap();
+        assert!(by(ann).is_empty());
+        // The author filter travels in the cursor.
+        let first = db
+            .content()
+            .list(&Listing::latest("post").by_author(bob).limit(1))
+            .unwrap();
+        let cursor = Cursor::parse(&first.next().unwrap().to_string()).unwrap();
+        let second = db.content().next_page(&cursor).unwrap();
+        assert_eq!(second.items()[0].rid(), post);
+        (root, docs, intro)
+    };
+    // Rebuilt at open.
+    let db = Database::open(&dir.0).unwrap();
+    assert_eq!(db.content().children(root), vec![docs]);
+    assert_eq!(db.content().ancestors(intro).unwrap(), vec![docs, root]);
+    assert_eq!(
+        db.content()
+            .list(&Listing::latest("post").by_author(bob))
+            .unwrap()
+            .items()
+            .len(),
+        2
+    );
+}

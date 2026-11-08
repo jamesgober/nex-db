@@ -65,6 +65,7 @@
   - [x] Types: declared field kinds, unique fields, singletons (`PLAN.md` D-075, fixed in D-081).
   - [x] Trash, restore, delete with gone routes (`PLAN.md` D-076).
   - [x] References of entity fields, `referenced_by`, and their rules on delete (`PLAN.md` D-078).
+  - [x] Page tree (`children`, `ancestors`) and authors with `by_author` listings (`PLAN.md` D-083); descendant paths following a move still to come.
   - Blocker recorded: lsm-db 1.1 scans materialize the whole range, so derived indexes stay in memory and are rebuilt at open; a lazy, bounded scan is requested from lsm-db.
 - Auth extras (FR-8). Metrics and health hooks.
   - [x] Health and observers (`PLAN.md` D-073); `metrics` still to come.

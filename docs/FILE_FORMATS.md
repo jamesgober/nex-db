@@ -251,7 +251,7 @@ sessions.
 
 | Key | Value |
 |---|---|
-| `collection, 'e', rid [16]` | entity head (format 3; format 2 from builds before 0.4.0 still reads), or a 0.1 to 0.3 entity record (format 1) |
+| `collection, 'e', rid [16]` | entity head (format 4; formats 2 and 3 from builds before 0.4.0 still read), or a 0.1 to 0.3 entity record (format 1) |
 | `collection, 'v', rid [16], number u32 (big-endian)` | a fixed revision |
 | `collection, 'r', site, 0, path` | a route |
 | `collection, 'b', target rid [16], source rid [16]` | empty: `source` refers to `target` (a draft or published field); `referenced_by` reads the target's prefix |
@@ -266,10 +266,10 @@ paths of format 1 entity records, which have none. Reference records of
 format 1 and format 2 heads, which have none, are written at open from the
 heads (format 2 published references taken from the drafts).
 
-### Entity head (format 3)
+### Entity head (format 4)
 
 ```text
-format u8                 3
+format u8                 4
 rid [16]
 created ms u64
 updated ms u64
@@ -293,7 +293,12 @@ locale count times:
 gone count u16            paths left gone (410) by a trash, then each:
     locale
     path str16
+author count u8           at most 16, then each account [16], in order
+has parent u8             1, then parent rid [16]; 0 for none
+order i64                 its place among its parent's children
 ```
+
+Format 3 ends after the gone paths (no authors, no parent, order 0).
 
 A format 1 record reads as an entity in `en`. When one is first rewritten,
 its body is stored as the revision its head points at.

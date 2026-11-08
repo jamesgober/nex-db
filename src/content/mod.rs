@@ -14,6 +14,7 @@ pub(crate) mod entity;
 pub(crate) mod lists;
 pub(crate) mod locale;
 mod routes;
+mod tree;
 pub(crate) mod types;
 
 use std::{
@@ -36,6 +37,7 @@ use self::{
     lists::{Cursor, ListIndex, Listing, Page},
     locale::{Locale, SpaceSpec},
     routes::RouteTable,
+    tree::Tree,
     types::{Rule, Type, TypeIndex, Types},
 };
 use crate::{
@@ -51,8 +53,21 @@ use crate::{
     engine::{Conflict, Engine, EngineId, Staged},
     error::{Error, Result},
     feed::Change,
-    ids::Rid,
+    ids::{AccountId, Rid},
 };
+
+/// Deepest a page tree goes: an entity has at most 64 ancestors.
+const MAX_DEPTH: usize = 64;
+
+/// Conflict key of an entity's place in the page tree: written by a parent
+/// change for the entity and each ancestor of its new parent, so two
+/// concurrent changes that together make a cycle never both land.
+fn tree_conflict(rid: Rid) -> Vec<u8> {
+    let mut key = Vec::with_capacity(17);
+    key.push(b'p');
+    key.extend_from_slice(rid.as_bytes());
+    key
+}
 
 /// Section format 1 (0.1 to 0.3): create operations only. Read, never
 /// written.
@@ -205,6 +220,8 @@ pub(crate) struct ContentEngine {
     routes: RouteTable,
     /// Published entities by site and type.
     lists: ListIndex,
+    /// Children by parent.
+    tree: Tree,
     /// The space's default locale and fallback chains.
     space: RwLock<SpaceSpec>,
     /// The space's types, and what they index.
@@ -244,6 +261,7 @@ impl ContentEngine {
         };
         let routes = RouteTable::new();
         let lists = ListIndex::new();
+        let tree = Tree::new();
         let types = match store.get(types_key(collection))? {
             Some(bytes) => Types::decode(&bytes, applied)?,
             None => Types::default(),
@@ -260,6 +278,7 @@ impl ContentEngine {
         for (_, value) in store.scan(start.clone()..after(&start))? {
             let head = Head::decode(&value, applied)?;
             lists.update(&head);
+            tree.update(&head);
             published_ms = published_ms.max(head.last_published_ms());
             let legacy = Head::is_legacy(&value);
             type_index.update(&types, &head, |locale, n| {
@@ -300,6 +319,7 @@ impl ContentEngine {
             writing: Mutex::new(()),
             routes,
             lists,
+            tree,
             space: RwLock::new(space),
             types: RwLock::new(types),
             type_index: Mutex::new(type_index),
@@ -699,12 +719,14 @@ impl Engine for ContentEngine {
         }
         for (head, _) in &heads {
             self.lists.update(head);
+            self.tree.update(head);
             let _ = self
                 .published_ms
                 .fetch_max(head.last_published_ms(), Ordering::AcqRel);
         }
         for (rid, kind) in &deleted {
             self.lists.remove(*rid);
+            self.tree.remove(*rid);
             self.type_index().remove(*rid, kind);
         }
         if let Some(space) = space {
@@ -1272,6 +1294,9 @@ impl ContentTx<'_, '_> {
         }
         let default = engine.space().default_locale;
         let head = entity.into_head(rid, now_ms(), default)?;
+        if let Some(parent) = head.parent {
+            let _ = self.check_parent(rid, parent)?;
+        }
         let base = head.base();
         if let Some(path) = base.draft.path.as_deref() {
             self.check_free(&head.site, path, rid, base.locale)?;
@@ -1680,6 +1705,10 @@ impl ContentTx<'_, '_> {
     /// The strongest rule of the fields of `head` that refer to `target`:
     /// restrict, then cascade, then detach. `None` when no field does.
     fn rule_for(&self, types: &Types, head: &Head, target: Rid) -> Result<Option<Rule>> {
+        // A parent keeps its children: move or delete them first.
+        if head.parent == Some(target) {
+            return Ok(Some(Rule::Restrict));
+        }
         let mut names: Vec<String> = Vec::new();
         for variant in &head.variants {
             names.extend(variant.draft.fields_referring(target).map(str::to_owned));
@@ -1764,6 +1793,79 @@ impl ContentTx<'_, '_> {
             .push(entity_key(self.staged.engine.collection, rid));
         self.staged.writes.push(link_conflict(rid));
         Ok(())
+    }
+
+    /// Walk up from `parent`: refuse it when `rid` is among its ancestors
+    /// (a cycle) or the tree would be deeper than 64. Returns `parent` and
+    /// its ancestors.
+    fn check_parent(&self, rid: Rid, parent: Rid) -> Result<Vec<Rid>> {
+        let mut line = Vec::new();
+        let mut at = Some(parent);
+        while let Some(p) = at {
+            if p == rid {
+                return Err(Error::invalid("parent", "would make a cycle"));
+            }
+            if line.len() >= MAX_DEPTH {
+                return Err(Error::invalid("parent", "the tree is deeper than 64"));
+            }
+            line.push(p);
+            at = self.head(p)?.parent;
+        }
+        Ok(line)
+    }
+
+    /// Place the entity under `parent` in the page tree, or at its root
+    /// with `None`. Takes effect at once, published or not.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the entity or the parent does not exist, the
+    /// parent is the entity or one of its descendants, or the tree would be
+    /// deeper than 64.
+    pub fn set_parent(&mut self, rid: Rid, parent: Option<Rid>) -> Result<()> {
+        let mut head = self.head(rid)?;
+        if let Some(parent) = parent {
+            let line = self.check_parent(rid, parent)?;
+            self.staged
+                .writes
+                .extend(line.into_iter().map(tree_conflict));
+        }
+        self.staged.writes.push(tree_conflict(rid));
+        head.parent = parent;
+        self.put_head(head)
+    }
+
+    /// Set the entity's place among its parent's children, lowest first.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the entity does not exist.
+    pub fn set_order(&mut self, rid: Rid, order: i64) -> Result<()> {
+        let mut head = self.head(rid)?;
+        head.order = order;
+        self.put_head(head)
+    }
+
+    /// Replace the entity's authors, in order (at most 16; a repeat counts
+    /// once). Takes effect at once, published or not.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the entity does not exist or there are more
+    /// than 16 authors.
+    pub fn set_authors(&mut self, rid: Rid, authors: &[AccountId]) -> Result<()> {
+        let mut head = self.head(rid)?;
+        let mut list = Vec::with_capacity(authors.len());
+        for author in authors {
+            if !list.contains(author) {
+                list.push(*author);
+            }
+        }
+        if list.len() > entity::MAX_AUTHORS {
+            return Err(Error::invalid("authors", "at most 16"));
+        }
+        head.authors = list;
+        self.put_head(head)
     }
 
     /// Replace the space's settings: its default locale and fallback
@@ -2077,6 +2179,58 @@ impl Content<'_> {
         let mut out = self.engine().stored_referrers(rid)?;
         out.retain(|s| *s != rid);
         Ok(out)
+    }
+
+    /// The children of `rid` in the page tree, in any status, lowest
+    /// [`order`](crate::Entry::order) first (ties by record id): for menus
+    /// and section pages. An index read; read each with
+    /// [`get`](Self::get) to serve only published ones.
+    #[must_use]
+    pub fn children(&self, rid: Rid) -> Vec<Rid> {
+        self.engine().tree.children(rid)
+    }
+
+    /// The ancestors of `rid`, its parent first and the root last: for
+    /// breadcrumbs. Empty for an entity at the root or one that does not
+    /// exist.
+    ///
+    /// # Errors
+    ///
+    /// As [`get`](Self::get).
+    pub fn ancestors(&self, rid: Rid) -> Result<Vec<Rid>> {
+        let engine = self.engine();
+        let mut out = Vec::new();
+        let mut at = engine.head(rid)?.and_then(|h| h.parent);
+        while let Some(p) = at {
+            if out.len() >= MAX_DEPTH || out.contains(&p) {
+                break;
+            }
+            out.push(p);
+            at = engine.head(p)?.and_then(|h| h.parent);
+        }
+        Ok(out)
+    }
+
+    /// Place an entity in the page tree in its own commit. See
+    /// [`ContentTx::set_parent`].
+    ///
+    /// # Errors
+    ///
+    /// As [`ContentTx::set_parent`], plus the errors of
+    /// [`Database::commit`].
+    pub fn set_parent(&self, rid: Rid, parent: Option<Rid>) -> Result<()> {
+        self.db.commit(|tx| tx.content().set_parent(rid, parent))
+    }
+
+    /// Replace an entity's authors in its own commit. See
+    /// [`ContentTx::set_authors`].
+    ///
+    /// # Errors
+    ///
+    /// As [`ContentTx::set_authors`], plus the errors of
+    /// [`Database::commit`].
+    pub fn set_authors(&self, rid: Rid, authors: &[AccountId]) -> Result<()> {
+        self.db.commit(|tx| tx.content().set_authors(rid, authors))
     }
 
     /// Move an entity in its own commit. See [`ContentTx::set_path`].

@@ -721,6 +721,22 @@ preview link, the application redeems a single-use token
 (`db.auth().redeem(token, Purpose::Preview)`) and then calls `resolve_draft`;
 the content engine never checks auth data itself.
 
+### Page tree and authors (0.4)
+
+An entity has an optional parent and an order among its parent's children,
+set with `Entity::parent(rid)` and `Entity::order(i64)`, or later with
+`set_parent(rid, Option<Rid>)` and `set_order(rid, i64)` (tx). `children(rid)`
+lists the children in any status, lowest order first, ties by record id;
+`ancestors(rid)` gives the parent first and the root last. A parent is a
+reference that restricts: it cannot be deleted while it has children. A
+parent that would make a cycle, or a tree deeper than 64, is `Invalid`. The
+paths of descendants do not yet follow a move of their parent.
+
+Authors are an ordered list of up to 16 accounts shared by every locale:
+`Entity::author(account)`, `set_authors(rid, &[AccountId])` (tx), and
+`Entry::authors()`. The tree and the authors take effect at once, published
+or not.
+
 ### Taxonomies, references, assets (0.4)
 
 - **Terms:** `create_term(taxonomy, Term)` with a name, path, and description
@@ -751,15 +767,17 @@ the content engine never checks auth data itself.
 |---|---|---|
 | `list(&Listing) -> Result<Page<Entry>>`, `next_page(&Cursor)` | 0.4 | P0 |
 | `Listing::latest(kind)`, `.updated()`, `.site(s)`, `.limit(n)` | 0.4 | P0 |
-| `.term(t)`, `.by_author(a)`, `.sticky_first()` | 0.4 (with terms and authors) | P0 |
-| `children(rid)`, `ancestors(rid)` | 0.4 | P1 |
+| `.by_author(a)` | 0.4 | P0 |
+| `.term(t)`, `.sticky_first()` | 0.4 (with terms) | P0 |
+| `children(rid) -> Vec<Rid>`, `ancestors(rid) -> Result<Vec<Rid>>` | 0.4 | P1 |
 | `referenced_by(rid) -> Result<Vec<Rid>>` | 0.4 | P1 |
 | `stream(Listing)` for sitemaps and feeds | 0.4 | P1 |
 | `search(locale, query) -> Result<Page<Hit>>` | 0.5 | P1 |
 | `related(rid, limit)` | 0.5 | P2 |
 
 Listings return pages of at most 1,000 (default 100) with an opaque `Cursor`;
-its text form (`to_string()`, `Cursor::parse`) can travel in a URL. Every
+its text form (`to_string()`, `Cursor::parse`) can travel in a URL.
+`by_author(a)` keeps the entities `a` is an author of. Every
 listing is answered from an index, never by scanning. `latest` orders by
 first publication, newest first; `updated()` by the last publish. Only
 published entities are listed.

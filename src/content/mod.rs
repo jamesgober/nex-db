@@ -387,8 +387,16 @@ impl ContentEngine {
             .transpose()
     }
 
+    /// The head of `rid` as the store holds it. A head an apply in
+    /// progress recorded for snapshots, but has not written yet, is not
+    /// seen: its revision may not be in the store yet.
     fn head(&self, rid: Rid) -> Result<Option<Head>> {
-        self.head_at(rid, Seq::MAX)
+        self.head_at(rid, self.latest())
+    }
+
+    /// The newest commit the store holds.
+    fn latest(&self) -> Seq {
+        self.applied.load(Ordering::Acquire)
     }
 
     fn revision(&self, rid: Rid, n: u32) -> Result<Option<Revision>> {
@@ -469,6 +477,11 @@ impl ContentEngine {
         } else {
             match self.revision(rid, published.revision)? {
                 Some(revision) => revision.body,
+                // A delete that applied after the snapshot's head was read
+                // removes the revisions with the head.
+                None if self.store.get(entity_key(self.collection, rid))?.is_none() => {
+                    return Ok(None);
+                }
                 None => return Err(Error::corrupt("an entity without its revision", at)),
             }
         };
@@ -1105,7 +1118,8 @@ impl ContentTx<'_, '_> {
     /// rewrites it. A head stored by 0.1 to 0.3 is its own published body:
     /// that body is kept as the revision the rewritten head points at.
     fn stored_refs(&mut self, rid: Rid) -> Result<Vec<Rid>> {
-        let Some(bytes) = self.staged.engine.head_bytes_at(rid, Seq::MAX)? else {
+        let engine = self.staged.engine;
+        let Some(bytes) = engine.head_bytes_at(rid, engine.latest())? else {
             return Ok(Vec::new());
         };
         let stored = Head::decode(&bytes, 0)?;
@@ -1153,7 +1167,8 @@ impl ContentTx<'_, '_> {
         if self.staged.deleted.contains(&rid) {
             return Ok(false);
         }
-        Ok(self.staged.engine.head_bytes_at(rid, Seq::MAX)?.is_some())
+        let engine = self.staged.engine;
+        Ok(engine.head_bytes_at(rid, engine.latest())?.is_some())
     }
 
     /// The entities referring to `target` as this transaction sees it,
@@ -2143,7 +2158,7 @@ impl Content<'_> {
     /// [`Error::Storage`] when the store cannot be read, [`Error::Corrupt`]
     /// when a stored record fails its checks.
     pub fn get(&self, rid: Rid) -> Result<Option<Entry>> {
-        self.engine().published_in(rid, None, Seq::MAX)
+        self.engine().published_in(rid, None, self.db.visible())
     }
 
     /// The published revision of `rid` in `locale`, else along the space's
@@ -2154,7 +2169,8 @@ impl Content<'_> {
     ///
     /// As [`get`](Self::get).
     pub fn get_in(&self, rid: Rid, locale: Locale) -> Result<Option<Entry>> {
-        self.engine().published_in(rid, Some(locale), Seq::MAX)
+        self.engine()
+            .published_in(rid, Some(locale), self.db.visible())
     }
 
     /// The working draft of `rid` in `locale`, or `None` when it has no
@@ -2164,7 +2180,7 @@ impl Content<'_> {
     ///
     /// As [`get`](Self::get).
     pub fn draft_in(&self, rid: Rid, locale: Locale) -> Result<Option<Entry>> {
-        self.engine().draft_in(rid, Some(locale), Seq::MAX)
+        self.engine().draft_in(rid, Some(locale), self.db.visible())
     }
 
     /// Define or extend a type in its own commit. See
@@ -2227,7 +2243,7 @@ impl Content<'_> {
     ///
     /// As [`get`](Self::get).
     pub fn draft(&self, rid: Rid) -> Result<Option<Entry>> {
-        self.engine().draft_in(rid, None, Seq::MAX)
+        self.engine().draft_in(rid, None, self.db.visible())
     }
 
     /// Every revision of `rid`, oldest first.
@@ -2321,7 +2337,7 @@ impl Content<'_> {
         let mut items = Vec::with_capacity(ids.len());
         for rid in ids {
             // Unpublished since the index was read: left out.
-            if let Some(entry) = engine.published_in(rid, None, Seq::MAX)? {
+            if let Some(entry) = engine.published_in(rid, None, self.db.visible())? {
                 items.push(entry);
             }
         }

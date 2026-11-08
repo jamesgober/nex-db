@@ -6,6 +6,10 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 ## [Unreleased]
 
+### Fixed
+
+- A content read could fail with `Error::Corrupt` while a commit publishing the same entity applied, and could see that commit before it was visible.
+
 ## [0.4.0] - 2026-11-08
 
 Content and adapters.

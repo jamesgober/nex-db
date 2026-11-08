@@ -186,6 +186,8 @@ The operations:
 | 8 | replace an account's record (0.4) | `account [16]`, `what u8` (1 standing, 2 password, 3 identifiers, 4 roles, 5 more than one), `record bytes32`, `at ms u64` |
 | 9 | set an identifier | `identifier digest [32]`, `present u8` (1: points at the account, 0: removed), `account [16]` (zeros when removed), `at ms u64` |
 | 10 | replace the realm's roles | `policy bytes32` (as stored, see `FILE_FORMATS.md`), `at ms u64` |
+| 11 | store an API key (made or revoked) | `id [16]`, `key digest [32]`, `account [16]`, `revoked u8`, `record bytes32` (sealed, as stored), `at ms u64` |
+| 12 | store an account's recovery codes | `account [16]`, `used u8` (0 new codes, 1 one used), `record bytes32` (sealed, as stored), `at ms u64` |
 
 A session is valid only while its epoch equals the account's current epoch
 (0 until the first raise), so operation 6 ends every older session of the

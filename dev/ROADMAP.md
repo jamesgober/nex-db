@@ -75,6 +75,8 @@
   - [x] Health and observers (`PLAN.md` D-073); `metrics` still to come.
   - [x] `account`, `add_identifier`, `remove_identifier` (from 0.3, `PLAN.md` D-066), roles (D-067), `set_password` (D-068).
   - [x] Single-use tokens (`PLAN.md` D-077).
+  - [x] Session listing and `revoke_session` (`PLAN.md` D-089), API keys (D-090), recovery codes (D-091).
+  - Waiting: TOTP and passkeys need crypt-io 1.5 (HMAC-SHA1, ES256 and RS256 verification); in 0.4 if it is out first, else 0.5 (`PLAN.md` D-092).
 - **Exit:** James's site serves its pages from nex-db.
 
 ## 0.5.0 Feature complete

@@ -989,3 +989,185 @@ fn test_single_use_tokens_redeem_once_for_their_purpose_only() {
             .all(|r| matches!(r, Ok(_) | Err(Error::Conflict)))
     );
 }
+
+#[test]
+fn test_sessions_list_and_sign_out_one_device() {
+    use nex_db::Purpose;
+    let dir = TempDir::new("session-list");
+    let db = Database::open(&dir.0).unwrap();
+    let password = db.auth().hash_password(PASSWORD).unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    let bob = db
+        .auth()
+        .create_account("bob@example.com", &password)
+        .unwrap();
+    let phone = db.auth().issue_session(ann, SessionSpec::web()).unwrap();
+    let laptop = db.auth().issue_session(ann, SessionSpec::web()).unwrap();
+    let _bobs = db.auth().issue_session(bob, SessionSpec::web()).unwrap();
+    // A single-use token is not a session.
+    let _link = db
+        .auth()
+        .single_use_token(Purpose::VerifyEmail, ann, Duration::from_secs(60))
+        .unwrap();
+    let list = db.auth().sessions(ann).unwrap();
+    assert_eq!(list.len(), 2);
+    assert_ne!(list[0].id(), list[1].id());
+    // Ids have a text form that round-trips, and say nothing of the token.
+    let id = list[0].id();
+    assert_eq!(id.to_string().parse::<nex_db::SessionId>().unwrap(), id);
+    assert!(!phone.as_str().contains(&id.to_string()));
+    assert!("xyz".parse::<nex_db::SessionId>().is_err());
+
+    // Another account cannot end it.
+    assert!(!db.auth().revoke_session(bob, id).unwrap());
+    assert!(db.auth().revoke_session(ann, id).unwrap());
+    assert!(!db.auth().revoke_session(ann, id).unwrap());
+    let left = db.auth().sessions(ann).unwrap();
+    assert_eq!(left.len(), 1);
+    let revoked = [&phone, &laptop]
+        .iter()
+        .filter(|t| {
+            matches!(
+                db.auth().validate(t.as_str()).unwrap(),
+                Validation::Revoked { .. }
+            )
+        })
+        .count();
+    assert_eq!(revoked, 1);
+    // Signing out everywhere empties the list.
+    assert_eq!(db.auth().revoke_all(ann).unwrap(), 1);
+    assert!(db.auth().sessions(ann).unwrap().is_empty());
+    assert_eq!(db.auth().sessions(bob).unwrap().len(), 1);
+}
+
+#[test]
+fn test_api_keys_check_scope_expire_revoke_and_survive_reopen() {
+    use nex_db::ApiKeyCheck;
+    use std::time::SystemTime;
+    let dir = TempDir::new("api-keys");
+    let (text, id, account) = {
+        let db = Database::open(&dir.0).unwrap();
+        let password = db.auth().hash_password(PASSWORD).unwrap();
+        let ann = db
+            .auth()
+            .create_account("ann@example.com", &password)
+            .unwrap();
+        let key = db
+            .auth()
+            .create_api_key(ann, &["posts:read", "posts:write"], None)
+            .unwrap();
+        assert!(!format!("{key:?}").contains(key.as_str()));
+        let ApiKeyCheck::Valid {
+            account,
+            id,
+            scopes,
+        } = db.auth().validate_api_key(key.as_str()).unwrap()
+        else {
+            panic!("valid");
+        };
+        assert_eq!((account, id), (ann, key.id()));
+        assert_eq!(scopes, ["posts:read", "posts:write"]);
+        // Not a session, and a session is not a key.
+        assert_eq!(
+            db.auth().validate(key.as_str()).unwrap(),
+            Validation::Unknown
+        );
+        let session = db.auth().issue_session(ann, SessionSpec::web()).unwrap();
+        assert_eq!(
+            db.auth().validate_api_key(&session).unwrap(),
+            ApiKeyCheck::Unknown
+        );
+        assert_eq!(
+            db.auth().validate_api_key("junk").unwrap(),
+            ApiKeyCheck::Malformed
+        );
+        // Expiry, and its rules.
+        let short = db
+            .auth()
+            .create_api_key(
+                ann,
+                &[],
+                Some(SystemTime::now() + Duration::from_millis(200)),
+            )
+            .unwrap();
+        assert!(
+            db.auth()
+                .create_api_key(ann, &[], Some(SystemTime::now() - Duration::from_secs(1)))
+                .is_err()
+        );
+        assert!(db.auth().create_api_key(ann, &["a b"], None).is_err());
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            db.auth().validate_api_key(short.as_str()).unwrap(),
+            ApiKeyCheck::Expired
+        );
+        // Revoke by id.
+        let other = db.auth().create_api_key(ann, &[], None).unwrap();
+        assert!(db.auth().revoke_api_key(other.id()).unwrap());
+        assert!(!db.auth().revoke_api_key(other.id()).unwrap());
+        assert_eq!(
+            db.auth().validate_api_key(other.as_str()).unwrap(),
+            ApiKeyCheck::Revoked
+        );
+        assert!(
+            !db.auth()
+                .revoke_api_key("00000000000000000000000000000000".parse().unwrap())
+                .unwrap()
+        );
+        (key.as_str().to_owned(), other.id(), ann)
+    };
+    let db = Database::open(&dir.0).unwrap();
+    assert!(matches!(
+        db.auth().validate_api_key(&text).unwrap(),
+        ApiKeyCheck::Valid { account: a, .. } if a == account
+    ));
+    let _ = id;
+}
+
+#[test]
+fn test_recovery_codes_work_once_and_replace_each_other() {
+    let dir = TempDir::new("recovery");
+    let db = Database::open(&dir.0).unwrap();
+    let password = db.auth().hash_password(PASSWORD).unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    let bob = db
+        .auth()
+        .create_account("bob@example.com", &password)
+        .unwrap();
+    let codes = db.auth().new_recovery_codes(ann).unwrap();
+    let list: Vec<String> = codes.codes().map(str::to_owned).collect();
+    assert_eq!(list.len(), 10);
+    assert!(!format!("{codes:?}").contains(&list[0]));
+    // Not another account's.
+    assert!(!db.auth().use_recovery_code(bob, &list[0]).unwrap());
+    // Typed in capitals, without the dash: once.
+    let typed = list[0].replace('-', "").to_uppercase();
+    assert!(db.auth().use_recovery_code(ann, &typed).unwrap());
+    assert!(!db.auth().use_recovery_code(ann, &list[0]).unwrap());
+    assert!(db.auth().use_recovery_code(ann, &list[1]).unwrap());
+    assert!(!db.auth().use_recovery_code(ann, "nonsense").unwrap());
+    // New codes replace the old.
+    let fresh = db.auth().new_recovery_codes(ann).unwrap();
+    assert!(!db.auth().use_recovery_code(ann, &list[2]).unwrap());
+    let first = fresh.codes().next().unwrap().to_owned();
+    // Two uses at once: one wins.
+    let db = Arc::new(db);
+    let winners = (0..4)
+        .map(|_| {
+            let db = Arc::clone(&db);
+            let code = first.clone();
+            thread::spawn(move || db.auth().use_recovery_code(ann, &code))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|h| h.join().unwrap())
+        .filter(|r| matches!(r, Ok(true)))
+        .count();
+    assert_eq!(winners, 1);
+}

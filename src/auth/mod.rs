@@ -24,7 +24,7 @@ use std::{
         Arc, Mutex, OnceLock, PoisonError, RwLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use crypt_io::{Crypt, Zeroizing, kdf, mac};
@@ -36,8 +36,8 @@ use self::{
     sessions::{EpochTable, SessionTable, Slot},
     token::Token,
     types::{
-        HashedPassword, Login, Payload, RevokeReason, Session, SessionSpec, SignIn, Standing,
-        Validation, ms_of, time_of,
+        HashedPassword, Login, Payload, Purpose, RevokeReason, Session, SessionSpec, SignIn,
+        Standing, Validation, ms_of, time_of,
     },
 };
 use crate::{
@@ -172,6 +172,10 @@ const CREDENTIAL_PASSWORD: u8 = 1;
 
 /// Key labels for the keys derived from the root key.
 const TOKEN_KEY_LABEL: &[u8] = b"nex-db 2026 auth token digest";
+const SINGLE_USE_KEY_LABEL: &[u8] = b"nex-db 2026 auth single-use token digest";
+
+/// The longest a single-use token lives: 30 days.
+const MAX_SINGLE_USE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const IDENTIFIER_KEY_LABEL: &[u8] = b"nex-db 2026 auth identifier digest";
 const SEAL_KEY_LABEL: &[u8] = b"nex-db 2026 auth log seal";
 const FILE_KEY_LABEL: &[u8] = b"nex-db 2026 auth file";
@@ -261,6 +265,9 @@ pub(crate) struct AuthEngine {
     /// The session checkpoint file.
     sessions_file: PathBuf,
     token_key: Zeroizing<[u8; 32]>,
+    /// Digests single-use tokens, apart from sessions: one is never the
+    /// other.
+    single_use_key: Zeroizing<[u8; 32]>,
     identifier_key: Zeroizing<[u8; 32]>,
     /// Seals and opens this engine's log sections.
     seal_key: Zeroizing<[u8; 32]>,
@@ -343,6 +350,7 @@ impl AuthEngine {
             dir: dir.to_path_buf(),
             sessions_file,
             token_key: root.derive(TOKEN_KEY_LABEL),
+            single_use_key: root.derive(SINGLE_USE_KEY_LABEL),
             identifier_key: root.derive(IDENTIFIER_KEY_LABEL),
             seal_key: root.derive(SEAL_KEY_LABEL),
             file_key,
@@ -442,6 +450,10 @@ impl AuthEngine {
     /// The realm's roles as last applied.
     fn policy(&self) -> Arc<Policy> {
         Arc::clone(&self.policy.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    fn single_use_digest(&self, random: &[u8; 32]) -> [u8; 32] {
+        mac::blake3_keyed(&self.single_use_key, random)
     }
 
     fn token_digest(&self, random: &[u8; 32]) -> [u8; 32] {
@@ -1739,12 +1751,108 @@ impl AuthTx<'_, '_> {
         })
     }
 
+    /// Issue a token for `account` that works once, for `purpose`, for
+    /// `ttl` (at most 30 days): email verification, a password reset, a
+    /// sign-in link, a preview. It is not a session: it never validates.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Invalid`] when the account does not exist or `ttl` is
+    ///   longer than 30 days.
+    /// - [`Error::Busy`] when the session table is full.
+    pub fn single_use_token(
+        &mut self,
+        purpose: Purpose,
+        account: AccountId,
+        ttl: Duration,
+    ) -> Result<Token> {
+        let engine = self.staged.engine;
+        if !self.staged.accounts.contains(&account) && !engine.account_exists(account)? {
+            return Err(Error::invalid("account", "no such account"));
+        }
+        self.stage_single_use(purpose, account, ttl)
+    }
+
+    fn stage_single_use(
+        &mut self,
+        purpose: Purpose,
+        account: AccountId,
+        ttl: Duration,
+    ) -> Result<Token> {
+        let engine = self.staged.engine;
+        let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
+        if ttl_ms == 0 || ttl_ms > MAX_SINGLE_USE_MS {
+            return Err(Error::invalid("ttl", "must be at most 30 days"));
+        }
+        if engine.sessions.len() + self.staged.issued.len() >= engine.max_sessions {
+            return Err(Error::Busy {
+                what: "the session table",
+            });
+        }
+        let created_ms = now_ms();
+        let session = Session {
+            account,
+            created_ms,
+            expires_ms: created_ms.saturating_add(ttl_ms),
+            epoch: 0,
+            idle_ms: 0,
+            recheck_ms: 0,
+            payload: Payload::new(&purpose.payload())?,
+        };
+        self.stage_digest(session, |random| engine.single_use_digest(random))
+    }
+
+    /// Redeem a single-use token for `purpose`: its account, once. A token
+    /// redeemed before, expired, issued for another purpose, or unknown
+    /// gives `None`.
+    ///
+    /// # Errors
+    ///
+    /// Only storage errors; a malformed token gives `Ok(None)`.
+    pub fn redeem(
+        &mut self,
+        token: impl AsRef<str>,
+        purpose: Purpose,
+    ) -> Result<Option<AccountId>> {
+        let engine = self.staged.engine;
+        let Some(random) = token::parse(token.as_ref()) else {
+            return Ok(None);
+        };
+        let digest = engine.single_use_digest(&random);
+        // Two redeems of one token conflict on its key: only one lands.
+        self.staged.writes.push(session_key(&digest));
+        let account = match engine.sessions.get(&digest) {
+            Some(Slot::Live(session))
+                if now_ms() < session.expires_ms
+                    && session.payload.as_bytes() == purpose.payload()
+                    && engine.account_exists(session.account)? =>
+            {
+                session.account
+            }
+            _ => return Ok(None),
+        };
+        self.staged.ops.push(StagedOp::RevokeSession {
+            digest,
+            reason: RevokeReason::Revoked,
+            at_ms: now_ms(),
+        });
+        Ok(Some(account))
+    }
+
     /// Stage a session for `account` at its current epoch (counting a raise
     /// staged in this transaction).
-    fn stage_session(&mut self, mut session: Session) -> Result<Token> {
+    fn stage_session(&mut self, session: Session) -> Result<Token> {
         let engine = self.staged.engine;
+        self.stage_digest(session, |random| engine.token_digest(random))
+    }
+
+    fn stage_digest(
+        &mut self,
+        mut session: Session,
+        digest_of: impl FnOnce(&[u8; 32]) -> [u8; 32],
+    ) -> Result<Token> {
         let (token, random) = Token::generate()?;
-        let digest = engine.token_digest(&random);
+        let digest = digest_of(&random);
         session.epoch = self.epoch(session.account);
         let _ = self.staged.issued.insert(digest);
         self.staged.writes.push(session_key(&digest));
@@ -2345,6 +2453,74 @@ impl Auth<'_> {
     ) -> Result<()> {
         self.db
             .commit(|tx| tx.auth().set_standing(account, standing, by))
+    }
+
+    /// Issue a single-use token in its own commit. See
+    /// [`AuthTx::single_use_token`].
+    ///
+    /// ```no_run
+    /// # fn main() -> nex_db::Result<()> {
+    /// use std::time::Duration;
+    /// use nex_db::Purpose;
+    /// let db = nex_db::open("data/site")?;
+    /// # let account = nex_db::AccountId::from_bytes([1; 16]);
+    /// let link = db.auth().single_use_token(Purpose::VerifyEmail, account, Duration::from_secs(86_400))?;
+    /// // ... later, from the link:
+    /// let verified = db.auth().redeem(link.as_str(), Purpose::VerifyEmail)?;
+    /// # let _ = verified;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`AuthTx::single_use_token`], plus the errors of
+    /// [`Database::commit`].
+    pub fn single_use_token(
+        &self,
+        purpose: Purpose,
+        account: AccountId,
+        ttl: Duration,
+    ) -> Result<Token> {
+        self.db
+            .commit(|tx| tx.auth().single_use_token(purpose, account, ttl))
+    }
+
+    /// A single-use token for the account `identifier` names, or `None`
+    /// when none does: for a password reset by email address. The work is
+    /// the same either way (a token is committed for no account when none
+    /// matches, and never redeems), so answer the request the same way too.
+    ///
+    /// # Errors
+    ///
+    /// As [`single_use_token`](Self::single_use_token).
+    pub fn single_use_token_for(
+        &self,
+        identifier: &str,
+        purpose: Purpose,
+        ttl: Duration,
+    ) -> Result<Option<Token>> {
+        let engine = self.engine();
+        let account = match normalize_identifier(identifier) {
+            Ok(normalized) => engine.account_for(&engine.identifier_digest(&normalized))?,
+            Err(_) => None,
+        };
+        let target = account.unwrap_or(AccountId::from_bytes([0; 16]));
+        let token = self
+            .db
+            .commit(|tx| tx.auth().stage_single_use(purpose, target, ttl))?;
+        Ok(account.map(|_| token))
+    }
+
+    /// Redeem a single-use token in its own commit. See
+    /// [`AuthTx::redeem`].
+    ///
+    /// # Errors
+    ///
+    /// As [`AuthTx::redeem`], plus the errors of [`Database::commit`].
+    pub fn redeem(&self, token: impl AsRef<str>, purpose: Purpose) -> Result<Option<AccountId>> {
+        let token = token.as_ref();
+        self.db.commit(|tx| tx.auth().redeem(token, purpose))
     }
 
     /// The account, or `None` when it does not exist: its standing (as

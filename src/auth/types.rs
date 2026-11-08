@@ -180,6 +180,38 @@ impl Payload {
     }
 }
 
+/// What a single-use token is for. A token redeems only for the purpose
+/// it was issued for.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Purpose {
+    /// Confirming an email address.
+    VerifyEmail,
+    /// Setting a new password.
+    ResetPassword,
+    /// Signing in from a link.
+    SignInLink,
+    /// Seeing a draft at its real path.
+    Preview,
+    /// An application-defined purpose.
+    Custom(u16),
+}
+
+impl Purpose {
+    /// The payload a single-use token stores: a marker and the purpose.
+    pub(crate) fn payload(self) -> [u8; 4] {
+        let (kind, code) = match self {
+            Purpose::VerifyEmail => (1, 0),
+            Purpose::ResetPassword => (2, 0),
+            Purpose::SignInLink => (3, 0),
+            Purpose::Preview => (4, 0),
+            Purpose::Custom(code) => (5, code),
+        };
+        let [a, b] = code.to_le_bytes();
+        [b'S', kind, a, b]
+    }
+}
+
 /// A valid session, as [`Validation::Valid`] returns it. A `Copy` value of
 /// fixed size, the payload inline: validating allocates nothing.
 #[derive(Clone, Copy, PartialEq, Eq)]

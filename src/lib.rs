@@ -116,7 +116,8 @@ pub use crate::auth::{
     roles::{Account, Role, RoleId},
     token::Token,
     types::{
-        HashedPassword, Login, RevokeReason, Session, SessionSpec, SignIn, Standing, Validation,
+        HashedPassword, Login, Purpose, RevokeReason, Session, SessionSpec, SignIn, Standing,
+        Validation,
     },
 };
 #[cfg(feature = "content")]

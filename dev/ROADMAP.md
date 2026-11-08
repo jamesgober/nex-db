@@ -68,6 +68,7 @@
 - Auth extras (FR-8). Metrics and health hooks.
   - [x] Health and observers (`PLAN.md` D-073); `metrics` still to come.
   - [x] `account`, `add_identifier`, `remove_identifier` (from 0.3, `PLAN.md` D-066), roles (D-067), `set_password` (D-068).
+  - [x] Single-use tokens (`PLAN.md` D-077).
 - **Exit:** James's site serves its pages from nex-db.
 
 ## 0.5.0 Feature complete

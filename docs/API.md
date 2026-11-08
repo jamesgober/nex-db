@@ -445,9 +445,9 @@ every session of the account in the same commit.
 | `verify_totp(challenge, code) -> Result<SignIn>` | P1 | completes `NeedsSecondFactor` |
 | `new_recovery_codes(account) -> Result<RecoveryCodes>` (tx) | P1 | replaces any earlier codes; shown once; stored hashed |
 | `add_passkey`, `verify_passkey` | P2 | WebAuthn public keys and counters |
-| `single_use_token(purpose, account, ttl) -> Result<Token>` | P1 | email verification, magic link, preview |
+| `single_use_token(purpose, account, ttl) -> Result<Token>` | P1 | email verification, magic link, preview; `Purpose` (non-exhaustive): `VerifyEmail`, `ResetPassword`, `SignInLink`, `Preview`, `Custom(u16)`; `ttl` at most 30 days; never validates as a session; also in a transaction |
 | `single_use_token_for(identifier, purpose, ttl) -> Result<Option<Token>>` | P1 | password reset by email address; the same work whether the identifier exists or not, so answer the same either way |
-| `redeem(token, purpose) -> Result<Option<AccountId>>` | P1 | works once |
+| `redeem(token, purpose) -> Result<Option<AccountId>>` | P1 | works once, for the purpose it was issued for; two redeems at once give the account to one; also in a transaction |
 | `create_api_key(account, scopes, expiry) -> Result<ApiKey>` | P1 | the key text is shown once |
 | `validate_api_key(text) -> Result<ApiKeyCheck>`, `revoke_api_key(id)` | P1 | |
 | `define_role(Role) -> Result<RoleId>`, `assign_roles(account, &[RoleId])`, `roles(account)`, `role(id)`, `role_named(name)` | P1 | `Role::new(name).permission(p).inherits(id)`; a role inherits only roles already defined; roles are never removed; at most 256 per realm and 16 per account |

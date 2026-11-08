@@ -181,6 +181,12 @@ impl std::fmt::Debug for RootKey {
 
 impl RootKey {
     /// Derive a 32-byte key for one use, named by `label`.
+    /// A root of its own for one realm (or other part) named by `label`.
+    #[cfg_attr(not(feature = "auth"), allow(dead_code))]
+    pub(crate) fn sub(&self, label: &[u8]) -> RootKey {
+        RootKey(self.derive(label))
+    }
+
     pub(crate) fn derive(&self, label: &[u8]) -> Zeroizing<[u8; 32]> {
         Zeroizing::new(crypt_io::mac::blake3_keyed(&self.0, label))
     }

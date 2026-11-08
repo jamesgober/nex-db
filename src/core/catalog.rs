@@ -36,6 +36,8 @@ const FORMAT: u16 = 2;
 
 /// The one catalog operation in this version.
 const OP_DEFINE: u8 = 1;
+/// Replace an existing collection's definition (0.4).
+const OP_REDEFINE: u8 = 2;
 
 /// Longest collection name.
 pub(crate) const MAX_NAME: usize = 64;
@@ -120,13 +122,23 @@ impl Catalog {
             .any(|c| c.id == id && c.engine == engine)
     }
 
+    /// Every collection, in id order.
+    pub(crate) fn collections(&self) -> Vec<Collection> {
+        let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
+        let mut all = state.collections.clone();
+        all.sort_by_key(|c| c.id);
+        all
+    }
+
     /// The collection named `name`, if defined.
+    #[cfg_attr(not(any(feature = "auth", feature = "content")), allow(dead_code))]
     pub(crate) fn named(&self, name: &str) -> Option<Collection> {
         let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
         state.collections.iter().find(|c| c.name == name).cloned()
     }
 
     /// The id the next new collection gets: one above the highest in use.
+    #[cfg_attr(not(any(feature = "auth", feature = "content")), allow(dead_code))]
     pub(crate) fn next_id(&self) -> Option<u32> {
         let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
         state
@@ -144,6 +156,16 @@ impl CatalogStaged {
     pub(crate) fn define(collections: Vec<Collection>) -> CatalogStaged {
         CatalogStaged {
             defines: collections,
+            redefines: Vec::new(),
+        }
+    }
+
+    /// Work that replaces the definition of collection `id`.
+    #[cfg_attr(not(feature = "auth"), allow(dead_code))]
+    pub(crate) fn redefine(id: u32, definition: Vec<u8>) -> CatalogStaged {
+        CatalogStaged {
+            defines: Vec::new(),
+            redefines: vec![(id, definition)],
         }
     }
 }
@@ -176,7 +198,17 @@ impl Engine for Catalog {
         let mut next = state.collections.clone();
         let mut r = Reader::new(section.body, "a catalog section", seq);
         while !r.is_empty() {
-            if r.u8()? != OP_DEFINE {
+            let op = r.u8()?;
+            if op == OP_REDEFINE {
+                let id = r.u32()?;
+                let definition = r.bytes32()?;
+                let Some(existing) = next.iter_mut().find(|c| c.id == id) else {
+                    return Err(Error::corrupt("a catalog change (no collection)", seq));
+                };
+                existing.definition = definition.to_vec().into();
+                continue;
+            }
+            if op != OP_DEFINE {
                 return Err(Error::corrupt("a catalog operation", seq));
             }
             let id = r.u32()?;
@@ -228,6 +260,7 @@ impl Engine for Catalog {
 #[derive(Debug)]
 pub(crate) struct CatalogStaged {
     defines: Vec<Collection>,
+    redefines: Vec<(u32, Vec<u8>)>,
 }
 
 impl Staged for CatalogStaged {
@@ -240,7 +273,7 @@ impl Staged for CatalogStaged {
     }
 
     fn is_empty(&self) -> bool {
-        self.defines.is_empty()
+        self.defines.is_empty() && self.redefines.is_empty()
     }
 
     fn validate(&self, _snapshot: Seq) -> std::result::Result<(), Conflict> {
@@ -267,6 +300,17 @@ impl Staged for CatalogStaged {
             w.u16(c.engine.0);
             w.str16(&c.name)?;
             w.bytes32(&c.definition)?;
+        }
+        for (id, definition) in &self.redefines {
+            if definition.len() > MAX_DEFINITION {
+                return Err(Error::invalid(
+                    "collection definition",
+                    "larger than 64 KiB",
+                ));
+            }
+            w.u8(OP_REDEFINE);
+            w.u32(*id);
+            w.bytes32(definition)?;
         }
         Ok(())
     }

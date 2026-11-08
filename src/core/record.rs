@@ -1,8 +1,8 @@
 //! The commit log record.
 //!
 //! wal-db frames every record with a length and a CRC32C. Inside that frame a
-//! nex-db record is a header followed by one section per engine the commit
-//! touched:
+//! nex-db record is a header followed by one section per collection the
+//! commit touched (an engine has one section per collection of it):
 //!
 //! ```text
 //! header   format u16 | seq u64 | kind u8 | class u8 | engines u128 | sections u16
@@ -114,6 +114,8 @@ pub(crate) struct RecordWriter {
     seq: Seq,
     expected_sections: u16,
     written_sections: u16,
+    /// The (engine, collection) of each section begun.
+    written: Vec<(EngineId, u32)>,
     mask: u128,
     open_section: Option<usize>,
 }
@@ -131,11 +133,7 @@ impl RecordWriter {
         buf.clear();
         let mut mask = 0u128;
         for engine in engines {
-            let bit = engine_bit(*engine, seq)?;
-            if mask & bit != 0 {
-                return Err(Error::invalid("record", "an engine appears twice"));
-            }
-            mask |= bit;
+            mask |= engine_bit(*engine, seq)?;
         }
         let sections = u16::try_from(engines.len())
             .map_err(|_| Error::invalid("record", "too many sections"))?;
@@ -151,6 +149,7 @@ impl RecordWriter {
             seq,
             expected_sections: sections,
             written_sections: 0,
+            written: Vec::new(),
             mask,
             open_section: None,
         })
@@ -171,6 +170,10 @@ impl RecordWriter {
         if self.mask & engine_bit(engine, self.seq)? == 0 {
             return Err(Error::invalid("record", "section for an undeclared engine"));
         }
+        if self.written.contains(&(engine, collection)) {
+            return Err(Error::invalid("record", "a collection appears twice"));
+        }
+        self.written.push((engine, collection));
         let mut w = Writer::new(&mut self.buf);
         w.u16(engine.0);
         w.u8(flags);
@@ -218,17 +221,19 @@ pub(crate) fn decode(bytes: &[u8], at: u64) -> Result<RecordView<'_>> {
     let mask = r.u128()?;
     let count = r.u16()?;
     let mut seen = 0u128;
-    let mut sections = Vec::with_capacity(usize::from(count));
+    let mut sections: Vec<Section<'_>> = Vec::with_capacity(usize::from(count));
     for _ in 0..count {
         let engine = EngineId(r.u16()?);
-        let bit = engine_bit(engine, seq)?;
-        if seen & bit != 0 {
-            return Err(Error::corrupt("a log record (engine twice)", seq));
-        }
-        seen |= bit;
+        seen |= engine_bit(engine, seq)?;
         let flags = r.u8()?;
         let format = r.u16()?;
         let collection = r.u32()?;
+        if sections
+            .iter()
+            .any(|s| s.engine == engine && s.collection == collection)
+        {
+            return Err(Error::corrupt("a log record (collection twice)", seq));
+        }
         let body = r.bytes32()?;
         sections.push(Section {
             engine,

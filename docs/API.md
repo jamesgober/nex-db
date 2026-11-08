@@ -201,12 +201,22 @@ collections are **spaces** (one or more sites). A new database has the realm
 | `db.auth_realm(name) -> Result<Auth>` | 0.4 | P1 |
 | `db.define_space(name, SpaceSpec) -> Result<()>` | 0.4 | P1 |
 | `db.content_space(name) -> Result<Content>` | 0.4 | P1 |
-| `db.collections() -> Vec<CollectionInfo>` (names and engines) | 0.4 | P2 |
+| `db.collections() -> Vec<CollectionInfo>` (`name()`, `kind()`: `CollectionKind::Realm`, `Space`) | 0.4 | P2 |
+| `db.set_realm_policy(name, RealmPolicy) -> Result<()>` (the default realm is `"users"`) | 0.4 | P1 |
+| `tx.auth_realm(name) -> Result<AuthTx>`, `tx.content_space(name) -> Result<ContentTx>` | 0.4 | P1 |
 
-A `RealmPolicy` sets a realm's lockout threshold and window, idle and
-absolute session limits, and whether new accounts start as
-`PendingVerification`. A `SpaceSpec` sets a space's sites, default locale, and
-fallback chains.
+A `RealmPolicy` sets a realm's lockout threshold and window
+(`.lockout(failures, window, duration)`, default 10 within 15 minutes, for 15
+minutes), absolute and idle session limits (`.max_session(d)`, at most and by
+default 400 days; `.max_idle(d)`, none by default; a longer session asked for
+is cut to them), and whether new accounts start as `PendingVerification`
+(`.pending_verification()`). A changed policy applies to sign-ins and
+sessions from then on. A `SpaceSpec` sets a space's default locale and
+fallback chains (the settings it starts with; `set_space` changes them).
+Each realm has its own accounts, sessions, and keys: a token or identifier of
+one realm means nothing in another. One commit may span realms and spaces.
+A database holds up to 15 realms and 15 spaces besides the defaults; names
+are 1 to 64 ASCII letters, digits, `-`, or `_`.
 
 A collection never changes engine. Dropping one (`db.drop_collection(name)`,
 0.5, P2) marks it and reclaims it in the background.

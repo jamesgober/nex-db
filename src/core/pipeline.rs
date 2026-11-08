@@ -112,6 +112,7 @@ pub(crate) struct Core {
     /// oldest of them started.
     snapshots: Mutex<BTreeMap<Seq, (usize, Instant)>>,
     /// Serializes collection definitions (id choice and name check).
+    #[cfg_attr(not(any(feature = "auth", feature = "content")), allow(dead_code))]
     defining: Mutex<()>,
     /// One checkpoint at a time.
     checkpointing: Mutex<()>,
@@ -270,7 +271,7 @@ impl Core {
     /// - [`Error::Invalid`] when the name or definition is refused, or the
     ///   engine is not hosted.
     /// - [`Error::Storage`] as for any commit.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "auth", feature = "content")), allow(dead_code))]
     pub(crate) fn define_collection(
         &self,
         engines: &dyn Registry,
@@ -281,8 +282,9 @@ impl Core {
         if name.is_empty() || name.len() > MAX_NAME {
             return Err(Error::invalid("collection name", "must be 1 to 64 bytes"));
         }
+        // Any collection of the engine checks a definition the same way.
         let hosted = engines
-            .get(engine)
+            .get(engine, default_collection(engine))
             .ok_or_else(|| Error::invalid("engine", "not hosted by this database"))?;
         hosted.define(definition)?;
         let _defining = self.defining.lock().unwrap_or_else(PoisonError::into_inner);
@@ -301,6 +303,36 @@ impl Core {
         }]);
         self.write_or_fail(engines, Kind::Catalog, self.visible(), &[&staged])?;
         Ok(id)
+    }
+
+    /// Replace the definition of collection `id`, after its engine has
+    /// checked `definition`. Definition changes take the same lock as
+    /// definitions (the catalog lock), so they apply one at a time, in log
+    /// order.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Invalid`] when there is no such collection, or its engine
+    ///   refuses the definition.
+    /// - [`Error::Storage`] as for any commit.
+    #[cfg_attr(not(feature = "auth"), allow(dead_code))]
+    pub(crate) fn redefine_collection(
+        &self,
+        engines: &dyn Registry,
+        id: u32,
+        definition: &[u8],
+    ) -> Result<()> {
+        let _defining = self.defining.lock().unwrap_or_else(PoisonError::into_inner);
+        let collection = self
+            .catalog
+            .collection(id)
+            .ok_or_else(|| Error::invalid("collection", "no such collection"))?;
+        engines
+            .get(collection.engine, id)
+            .ok_or_else(|| Error::invalid("engine", "not hosted by this database"))?
+            .define(definition)?;
+        let staged = CatalogStaged::redefine(id, definition.to_vec());
+        self.write_or_fail(engines, Kind::Catalog, self.visible(), &[&staged])
     }
 
     /// Start a checkpoint after `bytes` more log bytes (at least 1).
@@ -452,7 +484,9 @@ impl Core {
         // One buffer per commit: it must outlive the lock until its apply.
         let mut record = RecordWriter::new(seq, kind, class, &ids, Vec::new())?;
         for work in staged {
-            let format = self.engine(engines, work.engine())?.format();
+            let format = self
+                .engine(engines, work.engine(), work.collection())?
+                .format();
             let flags = if work.sealed() { record::SEALED } else { 0 };
             let body = record.begin_section(work.engine(), flags, format, work.collection())?;
             work.encode(seq, body)?;
@@ -567,18 +601,30 @@ impl Core {
             if !catalog_section && !self.catalog.binds(section.collection, section.engine) {
                 return Err(Error::corrupt("a log section (collection)", view.seq));
             }
-            let engine = self.engine(engines, section.engine)?;
+            let engine = self.engine(engines, section.engine, section.collection)?;
             debug_assert_eq!(engine.id(), section.engine);
             engine.apply(view.seq, section, changes)?;
+            // A collection the catalog just defined (or redefined) gets its
+            // engine before any section of it arrives.
+            if catalog_section {
+                for collection in self.catalog.collections() {
+                    engines.host(&collection)?;
+                }
+            }
         }
         Ok(())
     }
 
-    fn engine<'a>(&'a self, engines: &'a dyn Registry, id: EngineId) -> Result<&'a dyn Engine> {
+    fn engine<'a>(
+        &'a self,
+        engines: &'a dyn Registry,
+        id: EngineId,
+        collection: u32,
+    ) -> Result<&'a dyn Engine> {
         if id == EngineId::CATALOG {
             return Ok(&self.catalog);
         }
-        engines.get(id).ok_or_else(|| id.missing())
+        engines.get(id, collection).ok_or_else(|| id.missing())
     }
 
     /// Let engines drop state kept for snapshots older than the oldest
@@ -645,5 +691,15 @@ impl Drop for SnapshotGuard<'_> {
                 let _ = snapshots.remove(&self.seq);
             }
         }
+    }
+}
+
+/// The collection an engine is always hosted for: the default realm or
+/// space.
+fn default_collection(engine: EngineId) -> u32 {
+    if engine == EngineId::CONTENT {
+        crate::core::catalog::DEFAULT_SPACE.id
+    } else {
+        crate::core::catalog::DEFAULT_REALM.id
     }
 }

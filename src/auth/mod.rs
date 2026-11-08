@@ -11,6 +11,7 @@
 //! or identifiers. The operations below are the whole surface.
 
 mod audit;
+pub(crate) mod realm;
 pub(crate) mod roles;
 mod sessions;
 pub(crate) mod token;
@@ -111,12 +112,6 @@ const MAX_IDENTIFIERS: usize = 5;
 /// Most roles one account holds.
 const MAX_ACCOUNT_ROLES: usize = 16;
 
-/// Failed sign-ins within [`LOCKOUT_WINDOW_MS`] that lock an account out.
-const LOCKOUT_FAILURES: u32 = 10;
-/// The window failures are counted in: 15 minutes.
-const LOCKOUT_WINDOW_MS: u64 = 15 * 60 * 1000;
-/// How long an automatic lock-out lasts: 15 minutes.
-const LOCKOUT_MS: u64 = 15 * 60 * 1000;
 /// Accounts whose failures are counted at once; older windows are dropped
 /// first when it fills.
 const MAX_COUNTED: usize = 100_000;
@@ -298,6 +293,8 @@ pub(crate) struct AuthEngine {
     max_sessions: usize,
     /// The realm's roles, replaced as a whole on each change.
     policy: RwLock<Arc<Policy>>,
+    /// The realm's policy (its catalog definition).
+    realm: RwLock<realm::RealmPolicy>,
     /// A hash checked for unknown identifiers, so they cost what a wrong
     /// password costs.
     dummy: OnceLock<String>,
@@ -369,6 +366,7 @@ impl AuthEngine {
             max_hashing,
             max_sessions,
             policy: RwLock::new(Arc::new(policy)),
+            realm: RwLock::new(realm::RealmPolicy::new()),
             dummy: OnceLock::new(),
         };
         if let Some(checkpoint) = checkpoint {
@@ -643,18 +641,37 @@ impl AuthEngine {
         })
     }
 
+    /// The realm this engine holds.
+    pub(crate) fn collection(&self) -> u32 {
+        self.collection
+    }
+
+    /// The realm's policy.
+    pub(crate) fn realm(&self) -> realm::RealmPolicy {
+        *self.realm.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Take `definition` (as the catalog holds it) as the realm's policy.
+    pub(crate) fn adopt(&self, definition: &[u8]) -> Result<()> {
+        let policy = realm::RealmPolicy::decode(definition)
+            .map_err(|_| Error::corrupt("a realm definition", 0))?;
+        *self.realm.write().unwrap_or_else(PoisonError::into_inner) = policy;
+        Ok(())
+    }
+
     /// Count a failed sign-in of `account` at `now`. Returns the failures in
     /// the current window.
     fn count_failure(&self, account: AccountId, now: u64) -> u32 {
+        let window = self.realm().lockout_window_ms;
         let mut failures = self.failures.lock().unwrap_or_else(PoisonError::into_inner);
         if failures.len() >= MAX_COUNTED && !failures.contains_key(&account) {
-            failures.retain(|_, (_, start)| now.saturating_sub(*start) < LOCKOUT_WINDOW_MS);
+            failures.retain(|_, (_, start)| now.saturating_sub(*start) < window);
             if failures.len() >= MAX_COUNTED {
                 return 0;
             }
         }
         let entry = failures.entry(account).or_insert((0, now));
-        if now.saturating_sub(entry.1) >= LOCKOUT_WINDOW_MS {
+        if now.saturating_sub(entry.1) >= window {
             *entry = (0, now);
         }
         entry.0 += 1;
@@ -941,16 +958,8 @@ impl Engine for AuthEngine {
     }
 
     fn define(&self, definition: &[u8]) -> Result<()> {
-        // Realm policies (lockout, session limits) arrive with 0.3; until
-        // then a realm has no definition.
-        if definition.is_empty() {
-            Ok(())
-        } else {
-            Err(Error::invalid(
-                "realm definition",
-                "must be empty in this version",
-            ))
-        }
+        // A realm's definition is its policy; empty for the defaults.
+        realm::RealmPolicy::decode(definition).map(|_| ())
     }
 
     fn apply(&self, seq: Seq, section: &Section<'_>, changes: &mut Vec<Change>) -> Result<()> {
@@ -1755,7 +1764,11 @@ impl AuthTx<'_, '_> {
         let value = AccountRecord {
             created_ms: now_ms(),
             digest,
-            standing: Standing::Active,
+            standing: if engine.realm().pending_verification {
+                Standing::PendingVerification
+            } else {
+                Standing::Active
+            },
             phc: Zeroizing::new(password.0.clone()),
             identifiers: Vec::new(),
             roles: Vec::new(),
@@ -1792,12 +1805,13 @@ impl AuthTx<'_, '_> {
             });
         }
         let created_ms = now_ms();
+        let (ttl_ms, idle_ms) = engine.realm().limit(spec.ttl_ms(), spec.idle_ms());
         self.stage_session(Session {
             account,
             created_ms,
-            expires_ms: created_ms.saturating_add(spec.ttl_ms()),
+            expires_ms: created_ms.saturating_add(ttl_ms),
             epoch: 0,
-            idle_ms: spec.idle_ms(),
+            idle_ms,
             recheck_ms: spec
                 .recheck_ms()
                 .map_or(0, |after| created_ms.saturating_add(after).max(1)),
@@ -2331,11 +2345,17 @@ impl AuthTx<'_, '_> {
 #[derive(Debug, Clone, Copy)]
 pub struct Auth<'db> {
     pub(crate) db: &'db Database,
+    pub(crate) engine: &'db AuthEngine,
 }
 
 impl Auth<'_> {
     fn engine(&self) -> &AuthEngine {
-        self.db.auth_engine()
+        self.engine
+    }
+
+    /// The realm this handle acts on.
+    pub(crate) fn collection(&self) -> u32 {
+        self.engine.collection
     }
 
     /// Check a session token. Reads memory only and allocates nothing.
@@ -2387,8 +2407,10 @@ impl Auth<'_> {
     /// As [`AuthTx::create_account`], plus the errors of
     /// [`Database::commit`].
     pub fn create_account(&self, identifier: &str, password: &HashedPassword) -> Result<AccountId> {
-        self.db
-            .commit(|tx| tx.auth().create_account(identifier, password))
+        self.db.commit(|tx| {
+            tx.auth_of(self.engine.collection)
+                .create_account(identifier, password)
+        })
     }
 
     /// Issue a session in its own commit. See [`AuthTx::issue_session`].
@@ -2398,7 +2420,10 @@ impl Auth<'_> {
     /// As [`AuthTx::issue_session`], plus the errors of
     /// [`Database::commit`].
     pub fn issue_session(&self, account: AccountId, spec: SessionSpec) -> Result<Token> {
-        self.db.commit(|tx| tx.auth().issue_session(account, spec))
+        self.db.commit(|tx| {
+            tx.auth_of(self.engine.collection)
+                .issue_session(account, spec)
+        })
     }
 
     /// Revoke a session in its own commit. See [`AuthTx::revoke`].
@@ -2408,7 +2433,8 @@ impl Auth<'_> {
     /// The errors of [`Database::commit`].
     pub fn revoke(&self, token: impl AsRef<str>) -> Result<bool> {
         let token = token.as_ref();
-        self.db.commit(|tx| tx.auth().revoke(token))
+        self.db
+            .commit(|tx| tx.auth_of(self.engine.collection).revoke(token))
     }
 
     /// Sign an account out everywhere in its own commit. See
@@ -2428,7 +2454,8 @@ impl Auth<'_> {
     ///
     /// As [`AuthTx::revoke_all`], plus the errors of [`Database::commit`].
     pub fn revoke_all(&self, account: AccountId) -> Result<u32> {
-        self.db.commit(|tx| tx.auth().revoke_all(account))
+        self.db
+            .commit(|tx| tx.auth_of(self.engine.collection).revoke_all(account))
     }
 
     /// Replace a session's token in its own commit. See
@@ -2439,7 +2466,8 @@ impl Auth<'_> {
     /// As [`AuthTx::rotate`], plus the errors of [`Database::commit`].
     pub fn rotate(&self, token: impl AsRef<str>) -> Result<Token> {
         let token = token.as_ref();
-        self.db.commit(|tx| tx.auth().rotate(token))
+        self.db
+            .commit(|tx| tx.auth_of(self.engine.collection).rotate(token))
     }
 
     /// Check `password` for `identifier` inside the engine and, when it
@@ -2502,9 +2530,11 @@ impl Auth<'_> {
                     account: Some(account),
                 });
                 let now = now_ms();
-                if engine.count_failure(account, now) >= LOCKOUT_FAILURES {
-                    let until = time_of(now.saturating_add(LOCKOUT_MS));
-                    self.db.commit(|tx| tx.auth().lock_out(account, until))?;
+                let realm = engine.realm();
+                if engine.count_failure(account, now) >= realm.lockout_failures {
+                    let until = time_of(now.saturating_add(realm.lockout_ms));
+                    self.db
+                        .commit(|tx| tx.auth_of(self.engine.collection).lock_out(account, until))?;
                     engine.clear_failures(account);
                     observers.security(SecurityEvent::LockedOut { account });
                 }
@@ -2546,8 +2576,10 @@ impl Auth<'_> {
         standing: Standing,
         by: Option<AccountId>,
     ) -> Result<()> {
-        self.db
-            .commit(|tx| tx.auth().set_standing(account, standing, by))
+        self.db.commit(|tx| {
+            tx.auth_of(self.engine.collection)
+                .set_standing(account, standing, by)
+        })
     }
 
     /// Issue a single-use token in its own commit. See
@@ -2577,8 +2609,10 @@ impl Auth<'_> {
         account: AccountId,
         ttl: Duration,
     ) -> Result<Token> {
-        self.db
-            .commit(|tx| tx.auth().single_use_token(purpose, account, ttl))
+        self.db.commit(|tx| {
+            tx.auth_of(self.engine.collection)
+                .single_use_token(purpose, account, ttl)
+        })
     }
 
     /// A single-use token for the account `identifier` names, or `None`
@@ -2601,9 +2635,10 @@ impl Auth<'_> {
             Err(_) => None,
         };
         let target = account.unwrap_or(AccountId::from_bytes([0; 16]));
-        let token = self
-            .db
-            .commit(|tx| tx.auth().stage_single_use(purpose, target, ttl))?;
+        let token = self.db.commit(|tx| {
+            tx.auth_of(self.engine.collection)
+                .stage_single_use(purpose, target, ttl)
+        })?;
         Ok(account.map(|_| token))
     }
 
@@ -2615,7 +2650,8 @@ impl Auth<'_> {
     /// As [`AuthTx::redeem`], plus the errors of [`Database::commit`].
     pub fn redeem(&self, token: impl AsRef<str>, purpose: Purpose) -> Result<Option<AccountId>> {
         let token = token.as_ref();
-        self.db.commit(|tx| tx.auth().redeem(token, purpose))
+        self.db
+            .commit(|tx| tx.auth_of(self.engine.collection).redeem(token, purpose))
     }
 
     /// The account, or `None` when it does not exist: its standing (as
@@ -2678,7 +2714,8 @@ impl Auth<'_> {
     ///
     /// As [`AuthTx::define_role`], plus the errors of [`Database::commit`].
     pub fn define_role(&self, role: Role) -> Result<RoleId> {
-        self.db.commit(|tx| tx.auth().define_role(role.clone()))
+        self.db
+            .commit(|tx| tx.auth_of(self.engine.collection).define_role(role.clone()))
     }
 
     /// Replace an account's roles in its own commit. See
@@ -2688,7 +2725,10 @@ impl Auth<'_> {
     ///
     /// As [`AuthTx::assign_roles`], plus the errors of [`Database::commit`].
     pub fn assign_roles(&self, account: AccountId, roles: &[RoleId]) -> Result<()> {
-        self.db.commit(|tx| tx.auth().assign_roles(account, roles))
+        self.db.commit(|tx| {
+            tx.auth_of(self.engine.collection)
+                .assign_roles(account, roles)
+        })
     }
 
     /// Replace an account's password in its own commit. See
@@ -2698,8 +2738,10 @@ impl Auth<'_> {
     ///
     /// As [`AuthTx::set_password`], plus the errors of [`Database::commit`].
     pub fn set_password(&self, account: AccountId, password: &HashedPassword) -> Result<()> {
-        self.db
-            .commit(|tx| tx.auth().set_password(account, password))
+        self.db.commit(|tx| {
+            tx.auth_of(self.engine.collection)
+                .set_password(account, password)
+        })
     }
 
     /// Add an identifier in its own commit. See
@@ -2710,8 +2752,10 @@ impl Auth<'_> {
     /// As [`AuthTx::add_identifier`], plus the errors of
     /// [`Database::commit`].
     pub fn add_identifier(&self, account: AccountId, identifier: &str) -> Result<()> {
-        self.db
-            .commit(|tx| tx.auth().add_identifier(account, identifier))
+        self.db.commit(|tx| {
+            tx.auth_of(self.engine.collection)
+                .add_identifier(account, identifier)
+        })
     }
 
     /// Remove an identifier in its own commit. See
@@ -2722,8 +2766,10 @@ impl Auth<'_> {
     /// As [`AuthTx::remove_identifier`], plus the errors of
     /// [`Database::commit`].
     pub fn remove_identifier(&self, account: AccountId, identifier: &str) -> Result<bool> {
-        self.db
-            .commit(|tx| tx.auth().remove_identifier(account, identifier))
+        self.db.commit(|tx| {
+            tx.auth_of(self.engine.collection)
+                .remove_identifier(account, identifier)
+        })
     }
 }
 

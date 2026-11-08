@@ -113,6 +113,7 @@ mod wheel;
 #[cfg_attr(docsrs, doc(cfg(feature = "auth")))]
 pub use crate::auth::{
     Auth, AuthRead, AuthTx,
+    realm::RealmPolicy,
     roles::{Account, Role, RoleId},
     token::Token,
     types::{
@@ -134,7 +135,7 @@ pub use crate::content::{
 };
 pub use crate::{
     core::keys::Keys,
-    db::{Builder, Database, Read, Transaction, open},
+    db::{Builder, CollectionInfo, CollectionKind, Database, Read, Transaction, open},
     error::{Error, Result},
     feed::{Change, Feed, Position},
     ids::{AccountId, Rid},

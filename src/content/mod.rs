@@ -23,7 +23,7 @@ use std::{
     fmt,
     path::{Path, PathBuf},
     sync::{
-        Mutex, PoisonError, RwLock,
+        Arc, Mutex, PoisonError, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::SystemTime,
@@ -39,7 +39,7 @@ use self::{
     lists::{Cursor, ListIndex, Listing, Page},
     locale::{Locale, SpaceSpec},
     routes::RouteTable,
-    schedule::Schedules,
+    schedule::{Schedules, Wake},
     tree::Tree,
     types::{Rule, Type, TypeIndex, Types},
 };
@@ -252,7 +252,7 @@ impl fmt::Debug for ContentEngine {
 
 impl ContentEngine {
     /// Open the store in `dir` and rebuild the route index from it.
-    pub(crate) fn open(dir: &Path, collection: u32) -> Result<Self> {
+    pub(crate) fn open(dir: &Path, collection: u32, wake: Arc<Wake>) -> Result<Self> {
         let store = Lsm::open(dir)?;
         let applied = match store.get(META_APPLIED)? {
             Some(bytes) => {
@@ -267,7 +267,7 @@ impl ContentEngine {
         let routes = RouteTable::new();
         let lists = ListIndex::new();
         let tree = Tree::new();
-        let schedules = Schedules::new();
+        let schedules = Schedules::new(wake);
         let types = match store.get(types_key(collection))? {
             Some(bytes) => Types::decode(&bytes, applied)?,
             None => Types::default(),
@@ -354,6 +354,22 @@ impl ContentEngine {
                 Err(seen) => last = seen,
             }
         }
+    }
+
+    /// The space this engine holds.
+    pub(crate) fn collection(&self) -> u32 {
+        self.collection
+    }
+
+    /// Take `definition` (as the catalog holds it): the settings a new
+    /// space starts with, until `set_space` stores others.
+    pub(crate) fn adopt(&self, definition: &[u8]) -> Result<()> {
+        if definition.is_empty() || self.store.get(space_key(self.collection))?.is_some() {
+            return Ok(());
+        }
+        *self.space.write().unwrap_or_else(PoisonError::into_inner) =
+            SpaceSpec::decode(definition, 0)?;
+        Ok(())
     }
 
     /// The stored head bytes of `rid` as a snapshot at `at` sees them.
@@ -600,16 +616,14 @@ impl Engine for ContentEngine {
     }
 
     fn define(&self, definition: &[u8]) -> Result<()> {
-        // Space definitions (sites, fallback chains) arrive later in 0.4;
-        // until then a space has no definition.
+        // A space's definition is the settings it starts with; empty for
+        // the defaults.
         if definition.is_empty() {
-            Ok(())
-        } else {
-            Err(Error::invalid(
-                "space definition",
-                "must be empty in this version",
-            ))
+            return Ok(());
         }
+        SpaceSpec::decode(definition, 0)
+            .map(|_| ())
+            .map_err(|_| Error::invalid("space definition", "not space settings"))
     }
 
     fn apply(&self, seq: Seq, section: &Section<'_>, changes: &mut Vec<Change>) -> Result<()> {
@@ -2108,11 +2122,17 @@ impl ContentTx<'_, '_> {
 #[derive(Debug, Clone, Copy)]
 pub struct Content<'db> {
     pub(crate) db: &'db Database,
+    pub(crate) engine: &'db ContentEngine,
 }
 
 impl Content<'_> {
     fn engine(&self) -> &ContentEngine {
-        self.db.content_engine()
+        self.engine
+    }
+
+    /// The space this handle acts on.
+    pub(crate) fn collection(&self) -> u32 {
+        self.engine.collection
     }
 
     /// The published revision of `rid`, or `None` when nothing is
@@ -2171,7 +2191,8 @@ impl Content<'_> {
     ///
     /// As [`ContentTx::define`], plus the errors of [`Database::commit`].
     pub fn define(&self, ty: Type) -> Result<()> {
-        self.db.commit(|tx| tx.content().define(ty.clone()))
+        self.db
+            .commit(|tx| tx.content_of(self.engine.collection).define(ty.clone()))
     }
 
     /// The type named `name`, if the space defines it.
@@ -2193,7 +2214,8 @@ impl Content<'_> {
     /// The errors of [`Database::commit`].
     pub fn set_space(&self, spec: SpaceSpec) -> Result<()> {
         self.db.commit(|tx| {
-            tx.content().set_space(spec.clone());
+            tx.content_of(self.engine.collection)
+                .set_space(spec.clone());
             Ok(())
         })
     }
@@ -2318,7 +2340,8 @@ impl Content<'_> {
     ///
     /// As [`ContentTx::create`], plus the errors of [`Database::commit`].
     pub fn create(&self, entity: Entity) -> Result<Rid> {
-        self.db.commit(|tx| tx.content().create(entity.clone()))
+        self.db
+            .commit(|tx| tx.content_of(self.engine.collection).create(entity.clone()))
     }
 
     /// Change a draft in its own commit. See [`ContentTx::save_draft`].
@@ -2328,8 +2351,10 @@ impl Content<'_> {
     /// As [`ContentTx::save_draft`], plus the errors of
     /// [`Database::commit`].
     pub fn save_draft(&self, rid: Rid, patch: Patch) -> Result<()> {
-        self.db
-            .commit(|tx| tx.content().save_draft(rid, patch.clone()))
+        self.db.commit(|tx| {
+            tx.content_of(self.engine.collection)
+                .save_draft(rid, patch.clone())
+        })
     }
 
     /// Record a revision in its own commit. See
@@ -2340,8 +2365,10 @@ impl Content<'_> {
     /// As [`ContentTx::save_revision`], plus the errors of
     /// [`Database::commit`].
     pub fn save_revision(&self, rid: Rid, message: &str) -> Result<u32> {
-        self.db
-            .commit(|tx| tx.content().save_revision(rid, message))
+        self.db.commit(|tx| {
+            tx.content_of(self.engine.collection)
+                .save_revision(rid, message)
+        })
     }
 
     /// Publish in its own commit. See [`ContentTx::publish`].
@@ -2350,7 +2377,8 @@ impl Content<'_> {
     ///
     /// As [`ContentTx::publish`], plus the errors of [`Database::commit`].
     pub fn publish(&self, rid: Rid) -> Result<u32> {
-        self.db.commit(|tx| tx.content().publish(rid))
+        self.db
+            .commit(|tx| tx.content_of(self.engine.collection).publish(rid))
     }
 
     /// Unpublish in its own commit. See [`ContentTx::unpublish`].
@@ -2359,7 +2387,8 @@ impl Content<'_> {
     ///
     /// As [`ContentTx::unpublish`], plus the errors of [`Database::commit`].
     pub fn unpublish(&self, rid: Rid) -> Result<bool> {
-        self.db.commit(|tx| tx.content().unpublish(rid))
+        self.db
+            .commit(|tx| tx.content_of(self.engine.collection).unpublish(rid))
     }
 
     /// Trash an entity in its own commit. See [`ContentTx::trash`].
@@ -2368,7 +2397,8 @@ impl Content<'_> {
     ///
     /// As [`ContentTx::trash`], plus the errors of [`Database::commit`].
     pub fn trash(&self, rid: Rid) -> Result<()> {
-        self.db.commit(|tx| tx.content().trash(rid))
+        self.db
+            .commit(|tx| tx.content_of(self.engine.collection).trash(rid))
     }
 
     /// Restore an entity in its own commit. See [`ContentTx::restore`].
@@ -2377,7 +2407,8 @@ impl Content<'_> {
     ///
     /// As [`ContentTx::restore`], plus the errors of [`Database::commit`].
     pub fn restore(&self, rid: Rid) -> Result<()> {
-        self.db.commit(|tx| tx.content().restore(rid))
+        self.db
+            .commit(|tx| tx.content_of(self.engine.collection).restore(rid))
     }
 
     /// Delete an entity in its own commit. See [`ContentTx::delete`].
@@ -2386,7 +2417,8 @@ impl Content<'_> {
     ///
     /// As [`ContentTx::delete`], plus the errors of [`Database::commit`].
     pub fn delete(&self, rid: Rid) -> Result<()> {
-        self.db.commit(|tx| tx.content().delete(rid))
+        self.db
+            .commit(|tx| tx.content_of(self.engine.collection).delete(rid))
     }
 
     /// The entities that refer to `rid` (other than `rid` itself): through
@@ -2453,7 +2485,10 @@ impl Content<'_> {
     /// As [`ContentTx::schedule_in`], plus the errors of
     /// [`Database::commit`].
     pub fn schedule(&self, rid: Rid, action: Action, at: SystemTime) -> Result<()> {
-        self.db.commit(|tx| tx.content().schedule(rid, action, at))
+        self.db.commit(|tx| {
+            tx.content_of(self.engine.collection)
+                .schedule(rid, action, at)
+        })
     }
 
     /// Fire every schedule due at `now`, each in its own commit; a schedule
@@ -2462,13 +2497,17 @@ impl Content<'_> {
     pub(crate) fn fire_due(&self, now: u64) -> bool {
         let mut done = true;
         for (at, rid, locale, action) in self.engine().schedules.due(now) {
-            let fired = self
-                .db
-                .commit(|tx| tx.content().fire(rid, locale, action, at));
+            let fired = self.db.commit(|tx| {
+                tx.content_of(self.engine.collection)
+                    .fire(rid, locale, action, at)
+            });
             if fired.is_err()
                 && self
                     .db
-                    .commit(|tx| tx.content().clear_schedule(rid, locale, action, at))
+                    .commit(|tx| {
+                        tx.content_of(self.engine.collection)
+                            .clear_schedule(rid, locale, action, at)
+                    })
                     .is_err()
             {
                 done = false;
@@ -2485,7 +2524,10 @@ impl Content<'_> {
     /// As [`ContentTx::set_parent`], plus the errors of
     /// [`Database::commit`].
     pub fn set_parent(&self, rid: Rid, parent: Option<Rid>) -> Result<()> {
-        self.db.commit(|tx| tx.content().set_parent(rid, parent))
+        self.db.commit(|tx| {
+            tx.content_of(self.engine.collection)
+                .set_parent(rid, parent)
+        })
     }
 
     /// Replace an entity's authors in its own commit. See
@@ -2496,7 +2538,10 @@ impl Content<'_> {
     /// As [`ContentTx::set_authors`], plus the errors of
     /// [`Database::commit`].
     pub fn set_authors(&self, rid: Rid, authors: &[AccountId]) -> Result<()> {
-        self.db.commit(|tx| tx.content().set_authors(rid, authors))
+        self.db.commit(|tx| {
+            tx.content_of(self.engine.collection)
+                .set_authors(rid, authors)
+        })
     }
 
     /// Move an entity in its own commit. See [`ContentTx::set_path`].
@@ -2505,7 +2550,8 @@ impl Content<'_> {
     ///
     /// As [`ContentTx::set_path`], plus the errors of [`Database::commit`].
     pub fn set_path(&self, rid: Rid, path: &str) -> Result<()> {
-        self.db.commit(|tx| tx.content().set_path(rid, path))
+        self.db
+            .commit(|tx| tx.content_of(self.engine.collection).set_path(rid, path))
     }
 }
 
@@ -2616,7 +2662,7 @@ mod tests {
         w.u8(OP_CREATE);
         w.bytes32(&record).unwrap();
         {
-            let engine = ContentEngine::open(&dir, 2).unwrap();
+            let engine = ContentEngine::open(&dir, 2, Arc::default()).unwrap();
             engine
                 .apply(
                     1,
@@ -2644,7 +2690,7 @@ mod tests {
             store.put(entity_key(2, home), &home_record).unwrap();
             store.flush().unwrap();
         }
-        let engine = ContentEngine::open(&dir, 2).unwrap();
+        let engine = ContentEngine::open(&dir, 2, Arc::default()).unwrap();
         assert!(engine.routes.get(crate::DEFAULT_SITE, "/old").is_some());
         let entry = engine.published_in(rid, None, Seq::MAX).unwrap().unwrap();
         assert_eq!(entry.status(), Status::Published);

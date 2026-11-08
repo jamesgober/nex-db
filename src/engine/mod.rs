@@ -215,8 +215,16 @@ pub(crate) trait Staged {
 /// holds itself. The database facade implements it over its typed engine
 /// fields, so looking an engine up allocates nothing.
 pub(crate) trait Registry {
-    /// The engine with `id`, when this build hosts it.
-    fn get(&self, id: EngineId) -> Option<&dyn Engine>;
+    /// The engine with `id` that holds `collection`, when this build hosts
+    /// it.
+    fn get(&self, id: EngineId, collection: u32) -> Option<&dyn Engine>;
+
+    /// Host `collection` as the catalog now defines it: open its engine
+    /// when it is new, or hand an engine its changed definition. Called
+    /// for every collection after each catalog change and at open.
+    fn host(&self, _collection: &crate::core::catalog::Collection) -> Result<()> {
+        Ok(())
+    }
 
     /// Call `f` with every hosted engine, in id order.
     fn each(&self, f: &mut dyn FnMut(&dyn Engine));

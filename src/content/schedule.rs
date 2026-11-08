@@ -37,16 +37,20 @@ struct Index {
     placed: HashMap<Rid, Vec<Row>>,
 }
 
-/// Every schedule, earliest first.
-#[derive(Debug, Default)]
+/// Every schedule of one space, earliest first.
+#[derive(Debug)]
 pub(crate) struct Schedules {
     inner: Mutex<Index>,
+    /// Shared by every space of the database.
     wake: Arc<Wake>,
 }
 
 impl Schedules {
-    pub(crate) fn new() -> Self {
-        Self::default()
+    pub(crate) fn new(wake: Arc<Wake>) -> Self {
+        Schedules {
+            inner: Mutex::new(Index::default()),
+            wake,
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Index> {
@@ -107,7 +111,7 @@ impl Schedules {
 /// Wakes the scheduling thread: a commit changed the earliest schedule, or
 /// the database is closing.
 #[derive(Debug, Default)]
-struct Wake {
+pub(crate) struct Wake {
     /// (woken, stopping).
     state: Mutex<(bool, bool)>,
     signal: Condvar,
@@ -150,6 +154,7 @@ impl Scheduler {
     /// Start the thread for the database `inner` belongs to.
     pub(crate) fn start(inner: Arc<Inner>) -> Result<Scheduler> {
         let wake = Arc::clone(&inner.content_engine().schedules.wake);
+        // Every space shares the one wake signal.
         let thread_wake = Arc::clone(&wake);
         let thread = std::thread::Builder::new()
             .name("nex-db-schedule".to_owned())
@@ -171,12 +176,20 @@ impl Scheduler {
 }
 
 fn run(db: &Database, wake: &Wake) {
-    let schedules = &db.content_engine().schedules;
     loop {
         let now = now_ms();
-        let sleep = match schedules.next() {
+        let spaces = db.spaces();
+        let next = spaces
+            .iter()
+            .filter_map(|s| s.engine().schedules.next())
+            .min();
+        let sleep = match next {
             Some(at) if at <= now => {
-                if db.content().fire_due(now) {
+                let mut done = true;
+                for space in &spaces {
+                    done &= space.fire_due(now);
+                }
+                if done {
                     continue;
                 }
                 BACKOFF

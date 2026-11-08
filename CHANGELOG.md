@@ -19,6 +19,7 @@ All notable changes to `nex-db` are documented in this file. The format is based
 - `Database::health` and `Health`; `Builder::observer`, `Observer`, `CommitInfo`, and `SecurityEvent`.
 - `trash`, `restore`, and `delete` (paths of a trashed or deleted entity answer `RouteKind::Gone`).
 - Types: `Content::define`, `type_named`, `Type` (`field`, `unique`, `singleton`), and `FieldType`.
+- `Database::commit_serializable`, and `ContentTx::draft` to read inside a transaction.
 - Scheduled publishing: `Action`, `schedule`, `schedule_in`, `cancel_schedule`, `cancel_schedule_in`, and `Entry::scheduled`; a thread of the database fires them.
 - Terms: `Value::List`, `FieldType::List` and `FieldType::Terms`, `Type::terms` and `Type::taxonomy`, and `Listing::term`.
 - Page tree and authors: `Entity::parent`, `order`, and `author`; `set_parent`, `set_order`, `set_authors`; `Content::children` and `ancestors`; `Entry::parent`, `order`, and `authors`; `Listing::by_author`.

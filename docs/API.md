@@ -283,7 +283,7 @@ Rules:
 |---|---|---|
 | `db.commit(\|tx\| ..) -> Result<T>` | 0.1 | P0 |
 | `tx.auth() -> AuthTx`, `tx.content() -> ContentTx` | 0.1 | P0 |
-| `db.commit_serializable(\|tx\| ..) -> Result<T>` (also checks what the closure read) | 0.4 | P1 |
+| `db.commit_serializable(\|tx\| ..) -> Result<T>` (also checks what the closure read: entities, routes, types and settings, references to an entity, accounts, identifiers, sessions, the roles policy; not listings or other index reads); `tx.content().draft(rid)` reads inside a transaction | 0.4 | P1 |
 | `db.commit_with(CommitOptions, \|tx\| ..) -> Result<Committed<T>>` (retries, idempotency key) | 0.3 | P2 |
 
 An idempotency key makes a retried request commit at most once. A commit with

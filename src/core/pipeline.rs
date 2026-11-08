@@ -257,7 +257,7 @@ impl Core {
         if snapshot.expired() {
             return Err(Attempt::Conflict);
         }
-        self.write(engines, Kind::Commit, snapshot.seq(), &parts)
+        self.write(engines, Kind::Commit, snapshot.seq(), &parts, staged)
             .map(Some)
     }
 
@@ -383,7 +383,7 @@ impl Core {
         snapshot: Seq,
         staged: &[&dyn Staged],
     ) -> Result<()> {
-        match self.write(engines, kind, snapshot, staged) {
+        match self.write(engines, kind, snapshot, staged, &[]) {
             Ok(_) => Ok(()),
             Err(Attempt::Failed(err)) => Err(err),
             Err(Attempt::Conflict) => Err(Error::Conflict),
@@ -398,8 +398,9 @@ impl Core {
         kind: Kind,
         snapshot: Seq,
         staged: &[&dyn Staged],
+        readers: &[&dyn Staged],
     ) -> std::result::Result<Seq, Attempt> {
-        let (seq, bytes) = self.sequence(engines, kind, snapshot, staged)?;
+        let (seq, bytes) = self.sequence(engines, kind, snapshot, staged, readers)?;
         let result = self.complete(engines, seq, &bytes);
         let mut state = self.commit.lock().unwrap_or_else(PoisonError::into_inner);
         state.in_flight -= 1;
@@ -419,6 +420,7 @@ impl Core {
         kind: Kind,
         snapshot: Seq,
         staged: &[&dyn Staged],
+        readers: &[&dyn Staged],
     ) -> std::result::Result<(Seq, Arc<[u8]>), Attempt> {
         let mut state = self.commit.lock().unwrap_or_else(PoisonError::into_inner);
         if self.order.halted() {
@@ -431,6 +433,11 @@ impl Core {
         }
         for work in staged {
             if work.validate(snapshot).is_err() {
+                return Err(Attempt::Conflict);
+            }
+        }
+        for work in readers {
+            if work.validate_reads(snapshot).is_err() {
                 return Err(Attempt::Conflict);
             }
         }

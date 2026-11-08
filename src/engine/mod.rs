@@ -190,6 +190,15 @@ pub(crate) trait Staged {
     /// committed after `snapshot`.
     fn validate(&self, snapshot: Seq) -> std::result::Result<(), Conflict>;
 
+    /// Serializable check, for
+    /// [`Database::commit_serializable`](crate::Database::commit_serializable):
+    /// fail when a key this work read was committed after `snapshot`.
+    /// Called for every engine the transaction touched, even one that
+    /// staged no write.
+    fn validate_reads(&self, _snapshot: Seq) -> std::result::Result<(), Conflict> {
+        Ok(())
+    }
+
     /// Record that the staged keys are written at `seq`.
     fn reserve(&self, seq: Seq);
 

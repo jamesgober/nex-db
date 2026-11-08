@@ -11,6 +11,7 @@ All notable changes to `nex-db` are documented in this file. The format is based
 - `Auth::account` and `Account`; `add_identifier` and `remove_identifier` (up to five identifiers per account).
 - Roles: `Role`, `RoleId`, `define_role`, `assign_roles`, `roles`, `role`, `role_named`, and `allowed`.
 - `set_password`: replaces the password and ends the account's sessions in the same commit.
+- Single-use tokens: `single_use_token`, `single_use_token_for` (password reset by address), `redeem`, and `Purpose`.
 - Drafts and publishing: `save_draft` with `Patch`, `save_revision`, `publish`, `unpublish`, `set_path`, `set_status`, `set_visibility`; `Content::draft`, `revisions`, `revision`; `Status`, `Visibility`, `RevisionInfo`; `Entry::status`, `visibility`, `updated_at`, `published_at`, `first_published_at`.
 - `RouteKind::Redirect` (a moved entity's old path, 301) and `RouteKind::Gone`; `RouteEntry::visibility`.
 - The change feed: `Database::feed`, `Database::position`, `Feed`, `Position`, `Change`, and `Error::FeedBehind` (NEX-1012).

@@ -902,3 +902,83 @@ fn test_set_password_ends_sessions_and_changes_the_password() {
         Login::Verified(_)
     ));
 }
+
+#[test]
+fn test_single_use_tokens_redeem_once_for_their_purpose_only() {
+    use nex_db::Purpose;
+    let dir = TempDir::new("single-use");
+    let db = Database::open(&dir.0).unwrap();
+    let password = db.auth().hash_password(PASSWORD).unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    let day = Duration::from_secs(86_400);
+    let link = db
+        .auth()
+        .single_use_token(Purpose::VerifyEmail, ann, day)
+        .unwrap();
+    // Not a session.
+    assert_eq!(db.auth().validate(&link).unwrap(), Validation::Unknown);
+    // Not for another purpose.
+    assert_eq!(
+        db.auth().redeem(&link, Purpose::ResetPassword).unwrap(),
+        None
+    );
+    assert_eq!(
+        db.auth().redeem(&link, Purpose::VerifyEmail).unwrap(),
+        Some(ann)
+    );
+    assert_eq!(db.auth().redeem(&link, Purpose::VerifyEmail).unwrap(), None);
+    assert_eq!(
+        db.auth()
+            .redeem("not a token", Purpose::VerifyEmail)
+            .unwrap(),
+        None
+    );
+    // A session token does not redeem.
+    let session = db.auth().issue_session(ann, SessionSpec::web()).unwrap();
+    assert_eq!(
+        db.auth().redeem(&session, Purpose::VerifyEmail).unwrap(),
+        None
+    );
+
+    // A reset by address: a token for a known one, `None` for an unknown
+    // one, and the unknown one's decoy never redeems.
+    let reset = db
+        .auth()
+        .single_use_token_for("ANN@example.com", Purpose::ResetPassword, day)
+        .unwrap()
+        .unwrap();
+    assert!(
+        db.auth()
+            .single_use_token_for("nobody@example.com", Purpose::ResetPassword, day)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        db.auth()
+            .single_use_token(Purpose::Custom(7), ann, Duration::from_secs(31 * 86_400))
+            .is_err()
+    );
+
+    // Concurrent redeems: exactly one wins.
+    let db = Arc::new(db);
+    let winners: Vec<_> = (0..8)
+        .map(|_| {
+            let db = Arc::clone(&db);
+            let reset = reset.as_str().to_owned();
+            thread::spawn(move || db.auth().redeem(&reset, Purpose::ResetPassword))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|h| h.join().unwrap())
+        .collect();
+    let won = winners.iter().filter(|r| matches!(r, Ok(Some(_)))).count();
+    assert_eq!(won, 1, "{winners:?}");
+    assert!(
+        winners
+            .iter()
+            .all(|r| matches!(r, Ok(_) | Err(Error::Conflict)))
+    );
+}

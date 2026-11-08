@@ -545,8 +545,20 @@ A space declares its types. Undeclared fields are stored but not indexed.
 | `.copied_from(reference, field)` | a copy of a field of the entity an `Entity` reference points at, kept current by the engine |
 | `.revisions(RevisionPolicy::keep(n) \| keep_for(Duration))` | how many revisions to keep |
 
-`db.content().define(Type) -> Result<()>` (P0). Changing a type adds fields
-or flags; removing one keeps the stored values readable.
+`db.content().define(Type) -> Result<()>` (P0), and `type_named(name)` to
+read one back. Changing a type adds fields or flags; a redefinition that drops
+a field, a kind, or a flag is refused, so stored values always stay readable.
+
+Built so far: `Type::new`, `.singleton()` (a second entity of the type is
+`AlreadyExists { what: "singleton" }`), `.field(name, FieldType)` with
+`FieldType::Text`, `Int`, `Bool`, `Account`, and `Entity` (a value of another
+kind is refused when saved), and `.unique()` on the field declared last (a
+second published entity with the same value is
+`AlreadyExists { what: "field value" }`; drafts may share it). The other
+declarations arrive with what gives them meaning: `Float`, `Time`, `Terms`,
+`Blob`, and `List` with their values, `.reference` with deletes, `.indexed`
+with filtered listings, `.translatable` with shared fields, `.searchable`
+with search (0.5), `.revisions` with revision pruning.
 
 ### Drafts, revisions, and publishing (0.4)
 

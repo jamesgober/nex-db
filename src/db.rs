@@ -490,6 +490,12 @@ impl Database {
         Feed::new(self, from)
     }
 
+    /// The last visible commit: single reads see the state through it.
+    #[cfg_attr(not(feature = "content"), allow(dead_code))]
+    pub(crate) fn visible(&self) -> Seq {
+        self.inner.core.visible()
+    }
+
     pub(crate) fn feed_log(&self) -> &FeedLog {
         self.inner.core.feed()
     }

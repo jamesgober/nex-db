@@ -2,7 +2,7 @@
 
 > One milestone at a time, each ending with something that runs. Work only on the current milestone. Requirements (FR, NFR) are in [`PLAN.md`](./PLAN.md).
 
-**Current milestone: 0.4.0 (content and adapters). 0.1.0, 0.2.0, and 0.3.0 are released (GitHub pre-releases).**
+**Current milestone: 0.5.0 (feature complete). 0.1.0 to 0.4.0 are released (GitHub pre-releases).**
 
 ---
 
@@ -77,7 +77,8 @@
   - [x] Single-use tokens (`PLAN.md` D-077).
   - [x] Session listing and `revoke_session` (`PLAN.md` D-089), API keys (D-090), recovery codes (D-091).
   - Waiting: TOTP and passkeys need crypt-io 1.5 (HMAC-SHA1, ES256 and RS256 verification); in 0.4 if it is out first, else 0.5 (`PLAN.md` D-092).
-- **Exit:** James's site serves its pages from nex-db.
+- **Exit:** James's site serves its pages from nex-db. Released 2026-11-08 with this open: the site's adapter is built against 0.4, so `examples/site.rs` stands in for it (sign up, sign in, publish, resolve, reopen) on Linux, macOS, and Windows in CI. James confirms on his site.
+- Moved to 0.5: TOTP and passkeys (they wait for crypt-io 1.5, `PLAN.md` D-092; a 0.4 patch release if it lands first), devices, descendant paths following a moved parent, sticky posts, `revert`, releases, `get_many`, `Keys::vault`, and assets.
 
 ## 0.5.0 Feature complete
 

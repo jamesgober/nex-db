@@ -64,6 +64,7 @@
   - [x] Locales: per-locale drafts, publishing, and paths, fallback chains (`PLAN.md` D-074).
   - [x] Types: declared field kinds, unique fields, singletons (`PLAN.md` D-075).
   - [x] Trash, restore, delete with gone routes (`PLAN.md` D-076).
+  - [x] References of entity fields, `referenced_by`, and their rules on delete (`PLAN.md` D-078).
   - Blocker recorded: lsm-db 1.1 scans materialize the whole range, so derived indexes stay in memory and are rebuilt at open; a lazy, bounded scan is requested from lsm-db.
 - Auth extras (FR-8). Metrics and health hooks.
   - [x] Health and observers (`PLAN.md` D-073); `metrics` still to come.

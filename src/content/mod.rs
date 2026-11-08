@@ -17,7 +17,7 @@ mod routes;
 pub(crate) mod types;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     path::{Path, PathBuf},
     sync::{
@@ -31,12 +31,12 @@ use lsm_db::{Batch, Lsm};
 use self::{
     entity::{
         Body, Entity, Entry, Head, Patch, Published, Revision, RevisionInfo, RouteEntry, RouteKind,
-        Status, Visibility, decode_route, encode_route,
+        Status, Visibility, decode_route, encode_route, ref_set,
     },
     lists::{Cursor, ListIndex, Listing, Page},
     locale::{Locale, SpaceSpec},
     routes::RouteTable,
-    types::{Type, TypeIndex, Types},
+    types::{Rule, Type, TypeIndex, Types},
 };
 use crate::{
     Database,
@@ -76,6 +76,13 @@ const OP_SET_SPACE: u8 = 6;
 const OP_SET_TYPES: u8 = 7;
 /// Remove an entity and its revisions.
 const OP_DELETE_ENTITY: u8 = 8;
+/// Record that an entity refers to another.
+const OP_PUT_LINK: u8 = 9;
+/// Remove such a record.
+const OP_DELETE_LINK: u8 = 10;
+
+/// Most entities one delete removes, counting those it cascades to.
+const MAX_CASCADE: usize = 1000;
 
 /// The status an entity's old path redirects with when the path changes.
 const MOVED: u16 = 301;
@@ -109,6 +116,30 @@ fn revision_prefix(collection: u32, rid: Rid) -> Vec<u8> {
 fn revision_key(collection: u32, rid: Rid, n: u32) -> Vec<u8> {
     let mut key = revision_prefix(collection, rid);
     key.extend_from_slice(&n.to_be_bytes());
+    key
+}
+
+fn link_prefix(collection: u32, target: Rid) -> Vec<u8> {
+    let mut key = prefix(collection, b'b');
+    key.extend_from_slice(target.as_bytes());
+    key
+}
+
+/// The stored record that `source` refers to `target`: found by a scan of
+/// the target's prefix.
+fn link_key(collection: u32, target: Rid, source: Rid) -> Vec<u8> {
+    let mut key = link_prefix(collection, target);
+    key.extend_from_slice(source.as_bytes());
+    key
+}
+
+/// Conflict key of the references to `target`: written by a commit that
+/// adds one and by a commit that deletes the target, so the two never
+/// both land.
+fn link_conflict(target: Rid) -> Vec<u8> {
+    let mut key = Vec::with_capacity(17);
+    key.push(b'l');
+    key.extend_from_slice(target.as_bytes());
     key
 }
 
@@ -216,11 +247,21 @@ impl ContentEngine {
         let mut type_index = TypeIndex::default();
         // Every head goes into the listing index. Entities stored by 0.1 to
         // 0.3 have no route records: their routes come from the entities.
+        // Nor do they, or heads of the format before, have reference
+        // records: those are written now, from the heads.
+        let mut links = Batch::new();
+        let mut any_links = false;
         let start = entity_prefix(collection);
         for (_, value) in store.scan(start.clone()..after(&start))? {
             let head = Head::decode(&value, applied)?;
             lists.update(&head);
             type_index.update(&types, &head);
+            if !Head::is_current(&value) {
+                for target in head.refs() {
+                    links.put(link_key(collection, target, head.rid), []);
+                    any_links = true;
+                }
+            }
             if Head::is_legacy(&value) {
                 let base = head.base();
                 if let Some(path) = base.draft.path.as_deref() {
@@ -238,6 +279,9 @@ impl ContentEngine {
             Some(bytes) => SpaceSpec::decode(&bytes, applied)?,
             None => SpaceSpec::default(),
         };
+        if any_links {
+            store.write(links)?;
+        }
         Ok(ContentEngine {
             collection,
             dir: dir.to_path_buf(),
@@ -292,6 +336,20 @@ impl ContentEngine {
         self.type_index
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The entities whose stored references name `target`.
+    fn stored_referrers(&self, target: Rid) -> Result<Vec<Rid>> {
+        let start = link_prefix(self.collection, target);
+        self.store
+            .scan(start.clone()..after(&start))?
+            .map(|(key, _)| {
+                key.get(start.len()..)
+                    .and_then(|b| <[u8; 16]>::try_from(b).ok())
+                    .map(Rid::from_bytes)
+                    .ok_or_else(|| Error::corrupt("a reference key", 0))
+            })
+            .collect()
     }
 
     /// Every head in the store.
@@ -416,6 +474,8 @@ enum Op<'a> {
     SetSpace(&'a [u8]),
     SetTypes(&'a [u8]),
     DeleteEntity(Rid),
+    PutLink(Rid, Rid),
+    DeleteLink(Rid, Rid),
 }
 
 fn decode_ops(seq: Seq, format: u16, body: &[u8]) -> Result<Vec<Op<'_>>> {
@@ -433,6 +493,12 @@ fn decode_ops(seq: Seq, format: u16, body: &[u8]) -> Result<Vec<Op<'_>>> {
             (FORMAT, OP_SET_SPACE) => Op::SetSpace(r.bytes16()?),
             (FORMAT, OP_SET_TYPES) => Op::SetTypes(r.bytes32()?),
             (FORMAT, OP_DELETE_ENTITY) => Op::DeleteEntity(Rid::from_bytes(r.fixed()?)),
+            (FORMAT, OP_PUT_LINK) => {
+                Op::PutLink(Rid::from_bytes(r.fixed()?), Rid::from_bytes(r.fixed()?))
+            }
+            (FORMAT, OP_DELETE_LINK) => {
+                Op::DeleteLink(Rid::from_bytes(r.fixed()?), Rid::from_bytes(r.fixed()?))
+            }
             _ => return Err(Error::corrupt("a content operation", seq)),
         };
         ops.push(op);
@@ -489,6 +555,9 @@ impl Engine for ContentEngine {
                     self.versions
                         .record(&key, seq, Some(record), || Ok(self.store.get(&key)?))?;
                     batch.put(key, record);
+                    for target in head.refs() {
+                        batch.put(link_key(self.collection, target, head.rid), []);
+                    }
                     changes.push(Change::EntityChanged {
                         rid: head.rid,
                         revision: 1,
@@ -508,6 +577,13 @@ impl Engine for ContentEngine {
                         .record(&key, seq, Some(value), || Ok(self.store.get(&key)?))?;
                     batch.put(key, *value);
                     let head = Head::decode(value, seq)?;
+                    // A head of the format before records no references
+                    // in its section.
+                    if !Head::is_current(value) {
+                        for target in head.refs() {
+                            batch.put(link_key(self.collection, target, head.rid), []);
+                        }
+                    }
                     changes.push(Change::EntityChanged {
                         rid: *rid,
                         revision: head.base().published.as_ref().map_or(0, |p| p.revision),
@@ -550,6 +626,12 @@ impl Engine for ContentEngine {
                         rid: *rid,
                         revision: 0,
                     });
+                }
+                Op::PutLink(target, source) => {
+                    batch.put(link_key(self.collection, *target, *source), []);
+                }
+                Op::DeleteLink(target, source) => {
+                    batch.delete(link_key(self.collection, *target, *source));
                 }
             }
         }
@@ -645,6 +727,11 @@ pub(crate) struct ContentStaged<'e> {
     types: Option<Types>,
     /// Unique values this work published, and the entity holding each.
     unique: HashMap<Vec<u8>, Rid>,
+    /// References this work added (`true`) or removed, by target and
+    /// source.
+    links: HashMap<(Rid, Rid), bool>,
+    /// Entities this work deleted.
+    deleted: HashSet<Rid>,
     writes: Vec<Vec<u8>>,
 }
 
@@ -658,6 +745,8 @@ impl<'e> ContentStaged<'e> {
             routes: HashMap::new(),
             types: None,
             unique: HashMap::new(),
+            links: HashMap::new(),
+            deleted: HashSet::new(),
             writes: Vec::new(),
         }
     }
@@ -673,7 +762,7 @@ impl Staged for ContentStaged<'_> {
     }
 
     fn is_empty(&self) -> bool {
-        self.heads.is_empty() && self.ops.is_empty()
+        self.heads.is_empty() && self.ops.is_empty() && self.links.is_empty()
     }
 
     fn validate(&self, snapshot: Seq) -> std::result::Result<(), Conflict> {
@@ -729,6 +818,17 @@ impl Staged for ContentStaged<'_> {
                 }
             }
         }
+        let mut links: Vec<_> = self.links.iter().collect();
+        links.sort_unstable();
+        for ((target, source), present) in links {
+            w.u8(if *present {
+                OP_PUT_LINK
+            } else {
+                OP_DELETE_LINK
+            });
+            w.bytes(target.as_bytes());
+            w.bytes(source.as_bytes());
+        }
         for head in &self.heads {
             w.u8(OP_PUT_HEAD);
             w.bytes(head.rid.as_bytes());
@@ -759,6 +859,9 @@ impl ContentTx<'_, '_> {
         if let Some(head) = self.staged.heads.iter().find(|h| h.rid == rid) {
             return Ok(head.clone());
         }
+        if self.staged.deleted.contains(&rid) {
+            return Err(Error::invalid("entity", "no such entity"));
+        }
         self.staged
             .engine
             .head(rid)?
@@ -784,6 +887,12 @@ impl ContentTx<'_, '_> {
             Status::Published if !head.is_published() => Status::Draft,
             status => status,
         };
+        let refs = head.refs();
+        let old = match self.staged.heads.iter().find(|h| h.rid == head.rid) {
+            Some(prev) => prev.refs(),
+            None => self.stored_refs(head.rid)?,
+        };
+        self.link(head.rid, &old, &refs)?;
         let key = entity_key(self.staged.engine.collection, head.rid);
         match self.staged.heads.iter_mut().find(|h| h.rid == head.rid) {
             Some(slot) => *slot = head,
@@ -793,6 +902,79 @@ impl ContentTx<'_, '_> {
             }
         }
         Ok(())
+    }
+
+    /// The references of the stored head of `rid`, before this work
+    /// rewrites it. A head stored by 0.1 to 0.3 is its own published body:
+    /// that body is kept as the revision the rewritten head points at.
+    fn stored_refs(&mut self, rid: Rid) -> Result<Vec<Rid>> {
+        let Some(bytes) = self.staged.engine.head_bytes_at(rid, Seq::MAX)? else {
+            return Ok(Vec::new());
+        };
+        let stored = Head::decode(&bytes, 0)?;
+        if Head::is_legacy(&bytes) {
+            let base = stored.base();
+            if let Some(published) = &base.published {
+                let revision =
+                    Revision::new(base.locale, stored.created_ms, "", base.draft.clone())?;
+                self.staged.ops.push(StagedOp::Revision(
+                    rid,
+                    published.revision,
+                    revision.encode()?,
+                ));
+                let _ = self
+                    .staged
+                    .revisions
+                    .insert((rid, published.revision), (base.locale, base.draft.clone()));
+            }
+        }
+        Ok(stored.refs())
+    }
+
+    /// Stage the change of `source`'s references from `old` to `new`. An
+    /// added reference must name an entity that exists.
+    fn link(&mut self, source: Rid, old: &[Rid], new: &[Rid]) -> Result<()> {
+        for &target in new.iter().filter(|t| !old.contains(t)) {
+            if target != source && !self.exists(target)? {
+                return Err(Error::invalid("field value", "refers to no entity"));
+            }
+            self.staged.writes.push(link_conflict(target));
+            let _ = self.staged.links.insert((target, source), true);
+        }
+        for &target in old.iter().filter(|t| !new.contains(t)) {
+            let _ = self.staged.links.insert((target, source), false);
+        }
+        Ok(())
+    }
+
+    fn exists(&self, rid: Rid) -> Result<bool> {
+        if self.staged.heads.iter().any(|h| h.rid == rid) {
+            return Ok(true);
+        }
+        if self.staged.deleted.contains(&rid) {
+            return Ok(false);
+        }
+        Ok(self.staged.engine.head_bytes_at(rid, Seq::MAX)?.is_some())
+    }
+
+    /// The entities referring to `target` as this transaction sees it,
+    /// other than `target` itself.
+    fn referrers(&self, target: Rid) -> Result<Vec<Rid>> {
+        let mut out: Vec<Rid> = self
+            .staged
+            .engine
+            .stored_referrers(target)?
+            .into_iter()
+            .filter(|s| self.staged.links.get(&(target, *s)) != Some(&false))
+            .collect();
+        for ((t, s), present) in &self.staged.links {
+            if *t == target && *present && !out.contains(s) {
+                out.push(*s);
+            }
+        }
+        out.retain(|s| *s != target && !self.staged.deleted.contains(s));
+        out.sort_unstable();
+        Ok(out)
     }
 
     /// Refuse publishing `head` when another entity's published value
@@ -937,6 +1119,16 @@ impl ContentTx<'_, '_> {
             .ok_or_else(|| Error::invalid("locale", "the entity has no such translation"))?
             .draft
             .clone();
+        self.record_body(head, locale, draft, message)
+    }
+
+    fn record_body(
+        &mut self,
+        head: &mut Head,
+        locale: Locale,
+        draft: Body,
+        message: &str,
+    ) -> Result<u32> {
         let n = head
             .last_revision
             .checked_add(1)
@@ -1128,6 +1320,7 @@ impl ContentTx<'_, '_> {
                 revision: n,
                 at_ms: now,
                 path: variant.draft.path.clone(),
+                refs: ref_set(variant.draft.refs()),
             });
             if head.first_published_ms == 0 {
                 head.first_published_ms = now;
@@ -1338,19 +1531,154 @@ impl ContentTx<'_, '_> {
     /// published at, and those its trash left gone, answer
     /// [`RouteKind::Gone`] (410) until another entity takes them.
     ///
+    /// Each entity referring to it is handled by the rule of its referring
+    /// field ([`Type::reference`]): [`Rule::Restrict`] (also the rule of a
+    /// field none is declared for) refuses the delete, [`Rule::Detach`]
+    /// removes the field, and [`Rule::Cascade`] deletes that entity too,
+    /// by the same rules. A field in a published body is detached by
+    /// publishing a new revision without it.
+    ///
     /// # Errors
     ///
-    /// [`Error::Invalid`] when the entity does not exist.
+    /// - [`Error::Restricted`] when a reference rule keeps the entity (or
+    ///   one it cascades to).
+    /// - [`Error::Invalid`] when the entity does not exist or the delete
+    ///   cascades to more than 1,000 entities.
     pub fn delete(&mut self, rid: Rid) -> Result<()> {
+        let _ = self.head(rid)?;
+        // Plan first, so a refusal stages nothing.
+        let types = self.types();
+        let mut doomed = vec![rid];
+        let mut seen: HashSet<Rid> = doomed.iter().copied().collect();
+        let mut detach = Vec::new();
+        let mut stale = Vec::new();
+        let mut next = 0;
+        while let Some(&target) = doomed.get(next) {
+            next += 1;
+            for source in self.referrers(target)? {
+                if seen.contains(&source) {
+                    continue;
+                }
+                let head = self.head(source)?;
+                match self.rule_for(&types, &head, target)? {
+                    None => stale.push((target, source)),
+                    Some(Rule::Cascade) => {
+                        if doomed.len() >= MAX_CASCADE {
+                            return Err(Error::invalid(
+                                "delete",
+                                "cascades to more than 1,000 entities",
+                            ));
+                        }
+                        let _ = seen.insert(source);
+                        doomed.push(source);
+                    }
+                    Some(Rule::Detach) => detach.push((source, target)),
+                    Some(_) => return Err(Error::Restricted { what: "entity" }),
+                }
+            }
+        }
+        // A reference record no field backs (left by a format before) is
+        // dropped.
+        for key in stale {
+            let _ = self.staged.links.insert(key, false);
+        }
+        for (source, target) in detach {
+            if !seen.contains(&source) {
+                self.detach(source, target)?;
+            }
+        }
+        for rid in doomed {
+            self.remove(rid)?;
+        }
+        Ok(())
+    }
+
+    /// The strongest rule of the fields of `head` that refer to `target`:
+    /// restrict, then cascade, then detach. `None` when no field does.
+    fn rule_for(&self, types: &Types, head: &Head, target: Rid) -> Result<Option<Rule>> {
+        let mut names: Vec<String> = Vec::new();
+        for variant in &head.variants {
+            names.extend(variant.draft.fields_referring(target).map(str::to_owned));
+            let Some(published) = &variant.published else {
+                continue;
+            };
+            if !published.refs.contains(&target) {
+                continue;
+            }
+            if let Some((_, body)) = self.revision_body(head.rid, published.revision)? {
+                names.extend(body.fields_referring(target).map(str::to_owned));
+            }
+        }
+        let rank = |rule: Rule| match rule {
+            Rule::Detach => 0,
+            Rule::Cascade => 1,
+            _ => 2,
+        };
+        Ok(names
+            .iter()
+            .map(|name| types.rule(&head.kind, name))
+            .max_by_key(|rule| rank(*rule)))
+    }
+
+    /// Remove every field of `source` that refers to `target`: from its
+    /// drafts, and from each published body by publishing a new revision
+    /// without it.
+    fn detach(&mut self, source: Rid, target: Rid) -> Result<()> {
+        let mut head = self.head(source)?;
+        let before = head.clone();
+        for variant in &mut head.variants {
+            let _ = variant.draft.detach(target);
+        }
+        let published: Vec<(Locale, u32)> = head
+            .variants
+            .iter()
+            .filter_map(|v| {
+                let p = v.published.as_ref().filter(|p| p.refs.contains(&target))?;
+                Some((v.locale, p.revision))
+            })
+            .collect();
+        for (locale, n) in published {
+            let mut body = match self.revision_body(source, n)? {
+                Some((_, body)) => body,
+                // A head from 0.1 to 0.3: its draft was its published body.
+                None => before
+                    .variant(locale)
+                    .map(|v| v.draft.clone())
+                    .ok_or_else(|| Error::corrupt("an entity without its revision", 0))?,
+            };
+            let _ = body.detach(target);
+            let refs = ref_set(body.refs());
+            let n = self.record_body(&mut head, locale, body, "")?;
+            if let Some(p) = head.variant_mut(locale).and_then(|v| v.published.as_mut()) {
+                p.revision = n;
+                p.at_ms = now_ms();
+                p.refs = refs;
+            }
+            self.route_published(&head, locale, None)?;
+        }
+        self.put_head(head)
+    }
+
+    /// Delete `rid` itself: trash it, then remove it and its references.
+    fn remove(&mut self, rid: Rid) -> Result<()> {
         let head = self.head(rid)?;
         if head.status != Status::Trashed {
             self.trash(rid)?;
         }
+        let refs = match self.staged.heads.iter().find(|h| h.rid == rid) {
+            Some(head) => head.refs(),
+            None => self.stored_refs(rid)?,
+        };
+        for target in refs {
+            let _ = self.staged.links.insert((target, rid), false);
+        }
         self.staged.heads.retain(|h| h.rid != rid);
+        let _ = self.staged.deleted.insert(rid);
         self.staged.ops.push(StagedOp::Delete(rid));
         self.staged
             .writes
             .push(entity_key(self.staged.engine.collection, rid));
+        self.staged.writes.push(link_conflict(rid));
         Ok(())
     }
 
@@ -1653,6 +1981,20 @@ impl Content<'_> {
         self.db.commit(|tx| tx.content().delete(rid))
     }
 
+    /// The entities that refer to `rid` (other than `rid` itself): through
+    /// an [`Entity`](crate::Value::Entity) field of a draft or of a
+    /// published body, in any locale. Sorted by record id. One prefix read
+    /// of the reference records, which every commit keeps current.
+    ///
+    /// # Errors
+    ///
+    /// As [`get`](Self::get).
+    pub fn referenced_by(&self, rid: Rid) -> Result<Vec<Rid>> {
+        let mut out = self.engine().stored_referrers(rid)?;
+        out.retain(|s| *s != rid);
+        Ok(out)
+    }
+
     /// Move an entity in its own commit. See [`ContentTx::set_path`].
     ///
     /// # Errors
@@ -1757,11 +2099,14 @@ mod tests {
             now_ms()
         ));
         let rid = Rid::from_bytes([6; 16]);
+        let home = Rid::from_bytes([7; 16]);
         let record = Entity::new("page")
             .field("title", "Old")
+            .field("up", home)
             .path("/old")
             .encode_v1(rid, 3)
             .unwrap();
+        let home_record = Entity::new("page").encode_v1(home, 3).unwrap();
         let mut body = Vec::new();
         let mut w = Writer::new(&mut body);
         w.u8(OP_CREATE);
@@ -1787,10 +2132,12 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
 
-        // A store written by 0.3 has the record and no route records.
+        // A store written by 0.3 has the records and no route or reference
+        // records.
         {
             let store = Lsm::open(&dir).unwrap();
             store.put(entity_key(2, rid), &record).unwrap();
+            store.put(entity_key(2, home), &home_record).unwrap();
             store.flush().unwrap();
         }
         let engine = ContentEngine::open(&dir, 2).unwrap();
@@ -1799,6 +2146,37 @@ mod tests {
         assert_eq!(entry.status(), Status::Published);
         assert_eq!(entry.revision(), 1);
         assert_eq!(entry.field("title").and_then(|v| v.as_text()), Some("Old"));
+        // Its references are recorded at open.
+        assert_eq!(engine.stored_referrers(home).unwrap(), vec![rid]);
+
+        // Editing it keeps its published body: the record becomes revision 1.
+        let mut staged = ContentStaged::new(&engine);
+        ContentTx {
+            staged: &mut staged,
+        }
+        .save_draft(rid, Patch::new().set("title", "New").remove("up"))
+        .unwrap();
+        let mut body = Vec::new();
+        staged.encode(2, &mut body).unwrap();
+        engine
+            .apply(
+                2,
+                &Section {
+                    engine: EngineId::CONTENT,
+                    flags: 0,
+                    format: FORMAT,
+                    collection: 2,
+                    body: &body,
+                },
+                &mut Vec::new(),
+            )
+            .unwrap();
+        let entry = engine.published_in(rid, None, Seq::MAX).unwrap().unwrap();
+        assert_eq!(entry.field("title").and_then(|v| v.as_text()), Some("Old"));
+        let draft = engine.draft_in(rid, None, Seq::MAX).unwrap().unwrap();
+        assert_eq!(draft.field("title").and_then(|v| v.as_text()), Some("New"));
+        // The published body still refers to `home`.
+        assert_eq!(engine.stored_referrers(home).unwrap(), vec![rid]);
         drop(engine);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1808,5 +2186,10 @@ mod tests {
         assert!(decode_ops(1, FORMAT_CREATE_ONLY, &[OP_PUT_HEAD]).is_err());
         assert!(decode_ops(1, FORMAT, &[OP_CREATE]).is_err());
         assert!(decode_ops(1, FORMAT, &[0xEE]).is_err());
+        let mut link = vec![OP_PUT_LINK];
+        link.extend_from_slice(&[1; 32]);
+        assert!(decode_ops(1, FORMAT, &link).is_ok());
+        assert!(decode_ops(1, FORMAT, &link[..20]).is_err());
+        assert!(decode_ops(1, FORMAT_CREATE_ONLY, &link).is_err());
     }
 }

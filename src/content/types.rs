@@ -2,9 +2,10 @@
 //!
 //! A type names its fields and their kinds; a value of the wrong kind is
 //! refused when it is saved. A unique field's published values are unique
-//! within the space. A singleton type has at most one entity. Fields a type
-//! does not declare are stored as they are. A type is only ever extended:
-//! a redefinition keeps every field it had, with the same kind.
+//! within the space. A singleton type has at most one entity. A reference
+//! field's rule says what deleting the entity it refers to does. Fields a
+//! type does not declare are stored as they are. A type is only ever
+//! extended: a redefinition keeps every field it had, with the same kind.
 
 use std::collections::{HashMap, HashSet};
 
@@ -23,6 +24,44 @@ const MAX_TYPES: usize = 256;
 const MAX_TYPE_FIELDS: usize = 256;
 
 const FLAG_UNIQUE: u8 = 1;
+/// Bits 1 and 2 of a field's flags: its reference rule (0 for none).
+const RULE_SHIFT: u8 = 1;
+const RULE_MASK: u8 = 0b110;
+
+/// What deleting an entity does to a field referring to it, for
+/// [`Type::reference`]. A field no rule is declared for restricts.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Rule {
+    /// The delete is refused with [`Error::Restricted`] while the field
+    /// refers to the entity.
+    Restrict,
+    /// The field is removed from the referring entity: from its drafts, and
+    /// from a published body by publishing a new revision without it.
+    Detach,
+    /// The referring entity is deleted too.
+    Cascade,
+}
+
+impl Rule {
+    fn bits(self) -> u8 {
+        let code = match self {
+            Rule::Restrict => 1,
+            Rule::Detach => 2,
+            Rule::Cascade => 3,
+        };
+        code << RULE_SHIFT
+    }
+
+    fn of(flags: u8) -> Option<Rule> {
+        match (flags & RULE_MASK) >> RULE_SHIFT {
+            1 => Some(Rule::Restrict),
+            2 => Some(Rule::Detach),
+            3 => Some(Rule::Cascade),
+            _ => None,
+        }
+    }
+}
 
 /// The kind of value a declared field holds.
 #[non_exhaustive]
@@ -115,6 +154,31 @@ impl Type {
         self
     }
 
+    /// Declare field `name` as a reference to another entity
+    /// ([`FieldType::Entity`]) and what deleting that entity does.
+    ///
+    /// ```
+    /// use nex_db::{Rule, Type};
+    /// let post = Type::new("post")
+    ///     .reference("author", Rule::Restrict)
+    ///     .reference("hero", Rule::Detach);
+    /// assert_eq!(post.rule("hero"), Some(Rule::Detach));
+    /// ```
+    pub fn reference(mut self, name: impl Into<String>, rule: Rule) -> Type {
+        self.fields
+            .push((name.into(), FieldType::Entity, rule.bits()));
+        self
+    }
+
+    /// The rule declared for reference field `name`, if any.
+    #[must_use]
+    pub fn rule(&self, name: &str) -> Option<Rule> {
+        self.fields
+            .iter()
+            .find(|(n, _, _)| n == name)
+            .and_then(|(_, _, f)| Rule::of(*f))
+    }
+
     /// The field declared last: its published values are unique within the
     /// space.
     pub fn unique(mut self) -> Type {
@@ -168,11 +232,13 @@ impl Types {
             }
         }
         if let Some(old) = self.get(&next.name) {
+            // A reference rule may change; a unique flag stays.
             for (name, kind, flags) in &old.fields {
+                let unique = flags & FLAG_UNIQUE;
                 let kept = next
                     .fields
                     .iter()
-                    .any(|(n, k, f)| n == name && k == kind && f & flags == *flags);
+                    .any(|(n, k, f)| n == name && k == kind && f & unique == unique);
                 if !kept {
                     return Err(Error::invalid(
                         "type",
@@ -190,6 +256,15 @@ impl Types {
         out.types.retain(|t| t.name != next.name);
         out.types.push(next);
         Ok(out)
+    }
+
+    /// What deleting an entity does to field `field` of an entity of
+    /// `kind` that refers to it: the declared rule, else
+    /// [`Rule::Restrict`].
+    pub(crate) fn rule(&self, kind: &str, field: &str) -> Rule {
+        self.get(kind)
+            .and_then(|t| t.rule(field))
+            .unwrap_or(Rule::Restrict)
     }
 
     /// Refuse a declared field of `kind` holding a value of another kind.
@@ -260,7 +335,13 @@ impl Types {
             for _ in 0..r.u16()? {
                 let field = r.str16()?.to_owned();
                 let kind = FieldType::of(r.u8()?, at)?;
-                fields.push((field, kind, r.u8()?));
+                let flags = r.u8()?;
+                if flags & !(FLAG_UNIQUE | RULE_MASK) != 0
+                    || (Rule::of(flags).is_some() && kind != FieldType::Entity)
+                {
+                    return Err(Error::corrupt("a field's flags", at));
+                }
+                fields.push((field, kind, flags));
             }
             types.push(Type {
                 name,
@@ -414,6 +495,23 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn test_reference_rules_round_trip_and_may_change() {
+        let types = Types::default()
+            .with(Type::new("post").reference("author", Rule::Cascade))
+            .unwrap();
+        assert_eq!(Types::decode(&types.encode().unwrap(), 0).unwrap(), types);
+        assert_eq!(types.rule("post", "author"), Rule::Cascade);
+        assert_eq!(types.rule("post", "other"), Rule::Restrict);
+        assert_eq!(types.rule("page", "author"), Rule::Restrict);
+        let changed = types
+            .with(Type::new("post").reference("author", Rule::Detach))
+            .unwrap();
+        assert_eq!(changed.rule("post", "author"), Rule::Detach);
+        // Dropping the field is still refused.
+        assert!(types.with(Type::new("post")).is_err());
     }
 
     #[test]

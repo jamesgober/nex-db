@@ -251,22 +251,25 @@ sessions.
 
 | Key | Value |
 |---|---|
-| `collection, 'e', rid [16]` | entity head (format 2), or a 0.1 to 0.3 entity record (format 1) |
+| `collection, 'e', rid [16]` | entity head (format 3; format 2 from builds before 0.4.0 still reads), or a 0.1 to 0.3 entity record (format 1) |
 | `collection, 'v', rid [16], number u32 (big-endian)` | a fixed revision |
 | `collection, 'r', site, 0, path` | a route |
+| `collection, 'b', target rid [16], source rid [16]` | empty: `source` refers to `target` (a draft or published field); `referenced_by` reads the target's prefix |
 | `collection, 'm'` | the space's settings: `format u8 (1)`, `default locale`, `chain count u8`, then per chain `locale`, `count u8`, and that many `locale` |
 
-| `collection, 't'` | the space's types: `format u8 (1)`, `type count u16`, then per type `name str16`, `singleton u8`, `field count u16`, and per field `name str16`, `kind u8` (1 text, 2 int, 3 bool, 4 account, 5 entity), `flags u8` (1 unique) |
+| `collection, 't'` | the space's types: `format u8 (1)`, `type count u16`, then per type `name str16`, `singleton u8`, `field count u16`, and per field `name str16`, `kind u8` (1 text, 2 int, 3 bool, 4 account, 5 entity), `flags u8` (bit 0 unique; bits 1 and 2 the reference rule of an entity field: 0 none, 1 restrict, 2 detach, 3 cascade) |
 
 A locale is stored as `length u8` and its ASCII tag (at most 15 bytes).
 
 The route index is rebuilt at open from the route records, and from the
-paths of format 1 entity records, which have none.
+paths of format 1 entity records, which have none. Reference records of
+format 1 and format 2 heads, which have none, are written at open from the
+heads (format 2 published references taken from the drafts).
 
-### Entity head (format 2)
+### Entity head (format 3)
 
 ```text
-format u8                 2
+format u8                 3
 rid [16]
 created ms u64
 updated ms u64
@@ -283,6 +286,8 @@ locale count times:
     published revision u32  0 when this locale is not published
     published ms u64
     published path str16  empty for none
+    published refs u16    entities the published body refers to, then
+                          each rid [16], sorted (format 2: absent)
     draft path str16      empty for none
     draft fields          as in the entity record below
 gone count u16            paths left gone (410) by a trash, then each:
@@ -290,7 +295,8 @@ gone count u16            paths left gone (410) by a trash, then each:
     path str16
 ```
 
-A format 1 record reads as an entity in `en`.
+A format 1 record reads as an entity in `en`. When one is first rewritten,
+its body is stored as the revision its head points at.
 
 ### Revision
 

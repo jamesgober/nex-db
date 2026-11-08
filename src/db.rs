@@ -382,7 +382,10 @@ impl Database {
                     }
                     return Ok(value);
                 }
-                Err(Attempt::Conflict) => {}
+                Err(Attempt::Conflict) => {
+                    drop(snapshot);
+                    self.core.wait_for_sequenced();
+                }
                 Err(Attempt::Failed(err)) => return Err(err),
             }
         }

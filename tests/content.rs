@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 
 use nex_db::{
-    Cursor, DEFAULT_SITE, Database, Entity, Error, Listing, Patch, RouteKind, Status, Value,
-    Visibility,
+    Cursor, DEFAULT_SITE, Database, Entity, Error, Listing, Patch, RouteKind, Rule, Status, Type,
+    Value, Visibility,
 };
 
 struct TempDir(PathBuf);
@@ -619,4 +619,168 @@ fn test_trash_restore_and_delete() {
             .entity(),
         next
     );
+}
+
+#[test]
+fn test_references_are_indexed_and_their_rules_apply_on_delete() {
+    let dir = TempDir::new("references");
+    let (author, post, gallery) = {
+        let db = Database::open(&dir.0).unwrap();
+        db.content()
+            .define(
+                Type::new("post")
+                    .reference("author", Rule::Restrict)
+                    .reference("hero", Rule::Detach),
+            )
+            .unwrap();
+        db.content()
+            .define(Type::new("comment").reference("on", Rule::Cascade))
+            .unwrap();
+
+        // A reference must name an entity.
+        let nowhere = nex_db::Rid::from_bytes([9; 16]);
+        assert!(matches!(
+            db.content()
+                .create(Entity::new("post").field("author", nowhere)),
+            Err(Error::Invalid { .. })
+        ));
+
+        let author = db
+            .content()
+            .create(Entity::new("person").field("title", "Ann").path("/ann"))
+            .unwrap();
+        let image = db
+            .content()
+            .create(Entity::new("image").path("/img"))
+            .unwrap();
+        let post = db
+            .content()
+            .create(
+                Entity::new("post")
+                    .field("title", "Hello")
+                    .field("author", author)
+                    .field("hero", image)
+                    .path("/hello"),
+            )
+            .unwrap();
+        let _ = db.content().publish(post).unwrap();
+        let _ = db.content().publish(image).unwrap();
+        assert_eq!(db.content().referenced_by(author).unwrap(), vec![post]);
+        assert_eq!(db.content().referenced_by(image).unwrap(), vec![post]);
+
+        // Restrict: the author stays while the post names it.
+        assert!(matches!(
+            db.content().delete(author),
+            Err(Error::Restricted { what: "entity" })
+        ));
+        assert!(db.content().draft(author).unwrap().is_some());
+
+        // Detach: the image goes, and the post is published again without it.
+        let before = db.content().get(post).unwrap().unwrap().revision();
+        db.content().delete(image).unwrap();
+        let after = db.content().get(post).unwrap().unwrap();
+        assert!(after.revision() > before);
+        assert!(after.field("hero").is_none());
+        assert_eq!(after.field("title").and_then(Value::as_text), Some("Hello"));
+        assert!(
+            db.content()
+                .draft(post)
+                .unwrap()
+                .unwrap()
+                .field("hero")
+                .is_none()
+        );
+        let route = db
+            .content()
+            .resolve(DEFAULT_SITE, "/hello")
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.revision(), after.revision());
+
+        // A draft that drops the reference while the published body keeps
+        // it: still a reference.
+        db.content()
+            .save_draft(post, Patch::new().remove("author"))
+            .unwrap();
+        assert_eq!(db.content().referenced_by(author).unwrap(), vec![post]);
+        assert!(db.content().delete(author).is_err());
+
+        // Cascade: deleting the post deletes its comment, by the same rules.
+        let comment = db
+            .content()
+            .create(Entity::new("comment").field("on", post))
+            .unwrap();
+        let reply = db
+            .content()
+            .create(Entity::new("comment").field("on", comment))
+            .unwrap();
+        // An undeclared reference restricts.
+        let gallery = db
+            .content()
+            .create(Entity::new("gallery").field("cover", reply))
+            .unwrap();
+        assert!(matches!(
+            db.content().delete(post),
+            Err(Error::Restricted { .. })
+        ));
+        assert!(db.content().draft(comment).unwrap().is_some());
+        db.content()
+            .save_draft(gallery, Patch::new().remove("cover"))
+            .unwrap();
+        assert!(db.content().referenced_by(reply).unwrap().is_empty());
+        db.content().delete(post).unwrap();
+        for gone in [post, comment, reply] {
+            assert!(db.content().draft(gone).unwrap().is_none());
+        }
+        // Nothing names the author now: it can go.
+        assert!(db.content().referenced_by(author).unwrap().is_empty());
+        (author, post, gallery)
+    };
+    // The reference records survive a reopen.
+    let db = Database::open(&dir.0).unwrap();
+    assert!(db.content().draft(post).unwrap().is_none());
+    let tag = db
+        .content()
+        .create(Entity::new("tag").field("by", author))
+        .unwrap();
+    let db_refs = db.content().referenced_by(author).unwrap();
+    assert_eq!(db_refs, vec![tag]);
+    assert!(db.content().delete(author).is_err());
+    db.content().delete(tag).unwrap();
+    db.content().delete(author).unwrap();
+    assert!(db.content().draft(gallery).unwrap().is_some());
+}
+
+#[test]
+fn test_a_reference_to_an_entity_deleted_concurrently_never_lands() {
+    use std::{sync::Arc, thread};
+    let dir = TempDir::new("references-race");
+    let db = Arc::new(Database::open(&dir.0).unwrap());
+    for _ in 0..20 {
+        let target = db
+            .content()
+            .create(Entity::new("page").field("title", "T"))
+            .unwrap();
+        let a = {
+            let db = Arc::clone(&db);
+            thread::spawn(move || db.content().delete(target))
+        };
+        let b = {
+            let db = Arc::clone(&db);
+            thread::spawn(move || {
+                db.content()
+                    .create(Entity::new("post").field("about", target))
+            })
+        };
+        let deleted = a.join().unwrap();
+        let created = b.join().unwrap();
+        // One of the two wins; never both.
+        match (&deleted, &created) {
+            (Ok(()), Err(Error::Invalid { .. })) => {}
+            (Err(Error::Restricted { .. }), Ok(source)) => {
+                assert_eq!(db.content().referenced_by(target).unwrap(), vec![*source]);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 }

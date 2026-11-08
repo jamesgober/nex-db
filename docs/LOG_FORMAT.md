@@ -209,10 +209,14 @@ an Argon2id string in the PHC format.
 | 6 | replace the space's settings | `settings bytes16` (as stored, see `FILE_FORMATS.md`) |
 | 7 | replace the space's types | `types bytes32` (as stored, see `FILE_FORMATS.md`) |
 | 8 | delete an entity | `rid [16]`: its head and every revision |
+| 9 | record a reference | `target rid [16]`, `source rid [16]` |
+| 10 | remove a reference record | `target rid [16]`, `source rid [16]` |
 
-Heads, revisions, and routes are the records stored in the content store; see
+Heads, revisions, routes, and reference records are the records stored in
+the content store; see
 [FILE_FORMATS.md](./FILE_FORMATS.md#content-store-contentstore). Staging
-computes them; applying a commit stores them as they are.
+computes them; applying a commit stores them as they are. Applying a head of
+format 2 (from builds before 0.4.0) also records its references.
 
 ### Content (engine 2), format 1 (0.1 to 0.3; read, never written)
 

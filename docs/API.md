@@ -554,9 +554,11 @@ Built so far: `Type::new`, `.singleton()` (a second entity of the type is
 `FieldType::Text`, `Int`, `Bool`, `Account`, and `Entity` (a value of another
 kind is refused when saved), and `.unique()` on the field declared last (a
 second published entity with the same value is
-`AlreadyExists { what: "field value" }`; drafts may share it). The other
+`AlreadyExists { what: "field value" }`; drafts may share it), and
+`.reference(name, Rule)` (a `FieldType::Entity` field; `Type::rule(name)`
+reads the rule back; a redefinition may change a rule). The other
 declarations arrive with what gives them meaning: `Float`, `Time`, `Terms`,
-`Blob`, and `List` with their values, `.reference` with deletes, `.indexed`
+`Blob`, and `List` with their values, `.indexed`
 with filtered listings, `.translatable` with shared fields, `.searchable`
 with search (0.5), `.revisions` with revision pruning.
 
@@ -727,6 +729,17 @@ the content engine never checks auth data itself.
   ways in the same commit, so "what links here" is one read. References found
   inside a body, which nex-db never parses, are passed with
   `Entity::references(&[Rid])` and indexed the same way.
+
+  Built so far: `Entity` fields, in drafts and published bodies of every
+  locale. Saving a reference to an entity that does not exist is
+  `Invalid`. `delete` applies the rule of each referring field:
+  `Rule::Restrict` (also the rule of a field none is declared for) refuses
+  with `Restricted { what: "entity" }`, `Rule::Detach` removes the field
+  (a published body by a new published revision without it), and
+  `Rule::Cascade` deletes the referring entity by the same rules, at most
+  1,000 entities per delete. A reference added while its target is deleted
+  conflicts with the delete, so one of the two commits lands and the other
+  retries against it.
 - **Assets:** an entity of type `asset` with the media type, size, width,
   height, duration, content hash, focal point, alt text and caption per
   locale, and a list of variants. Media bytes are stored by the application
@@ -740,7 +753,7 @@ the content engine never checks auth data itself.
 | `Listing::latest(kind)`, `.updated()`, `.site(s)`, `.limit(n)` | 0.4 | P0 |
 | `.term(t)`, `.by_author(a)`, `.sticky_first()` | 0.4 (with terms and authors) | P0 |
 | `children(rid)`, `ancestors(rid)` | 0.4 | P1 |
-| `referenced_by(rid)` | 0.4 | P1 |
+| `referenced_by(rid) -> Result<Vec<Rid>>` | 0.4 | P1 |
 | `stream(Listing)` for sitemaps and feeds | 0.4 | P1 |
 | `search(locale, query) -> Result<Page<Hit>>` | 0.5 | P1 |
 | `related(rid, limit)` | 0.5 | P2 |

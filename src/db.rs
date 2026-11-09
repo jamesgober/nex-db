@@ -1089,6 +1089,7 @@ impl Read<'_> {
         ContentRead {
             engine: self.db.content_engine(),
             snapshot: &self.snapshot,
+            observers: self.db.observers(),
         }
     }
 }

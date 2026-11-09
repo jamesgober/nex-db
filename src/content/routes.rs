@@ -92,6 +92,7 @@ mod tests {
             kind: RouteKind::Page,
             visibility: Visibility::Public,
             locale: crate::content::locale::Locale::EN,
+            canary: false,
         }
     }
 

@@ -13,12 +13,15 @@
 mod audit;
 mod datakeys;
 pub(crate) mod keys;
+pub(crate) mod mode;
 #[cfg(feature = "mfa")]
 pub(crate) mod passkey;
 pub(crate) mod realm;
 pub(crate) mod recovery;
 pub(crate) mod roles;
 mod sessions;
+#[cfg(feature = "split-auth")]
+pub(crate) mod split;
 pub(crate) mod token;
 pub(crate) mod totp;
 pub(crate) mod types;
@@ -383,6 +386,25 @@ fn normalize_identifier(identifier: &str) -> Result<String> {
         return Err(Error::invalid("identifier", "contains a control character"));
     }
     Ok(trimmed.to_lowercase())
+}
+
+/// How long opening waits for the auth lock that an ending auth process
+/// of the same database (split auth) still holds.
+const AUTH_LOCK_WAIT: Duration = Duration::from_secs(10);
+
+/// Take the lock on `auth_dir`, held by whichever process opens the auth
+/// stores: the database in embedded mode, the auth process in split mode.
+/// Waits a while for an auth process that is still ending.
+pub(crate) fn lock_auth(auth_dir: &Path) -> Result<fs::DirLock> {
+    let started = std::time::Instant::now();
+    loop {
+        match fs::DirLock::acquire(auth_dir) {
+            Err(Error::Locked) if started.elapsed() < AUTH_LOCK_WAIT => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            other => return other,
+        }
+    }
 }
 
 fn check_password(password: &str) -> Result<()> {
@@ -1069,6 +1091,7 @@ impl AuthEngine {
         })
     }
 
+    #[cfg_attr(not(feature = "split-auth"), allow(dead_code))]
     /// The realm this engine holds.
     pub(crate) fn collection(&self) -> u32 {
         self.collection
@@ -1155,7 +1178,7 @@ impl AuthEngine {
         let _slot = self.hashing_slot()?;
         let phc = kdf::argon2_hash(password.as_bytes())
             .map_err(|_| Error::invalid("password", "could not be hashed"))?;
-        Ok(HashedPassword(phc))
+        Ok(HashedPassword(types::Hashed::Phc(phc)))
     }
 
     /// Check `password` for `identifier`. Unknown identifiers cost one
@@ -1199,6 +1222,254 @@ impl AuthEngine {
         let hash = kdf::argon2_hash(&random[..])
             .map_err(|_| Error::invalid("password", "could not be hashed"))?;
         Ok(self.dummy.get_or_init(|| hash))
+    }
+
+    /// What may be read of an account: never its credential or its
+    /// identifiers. At `at`, as a snapshot there sees it; else the latest.
+    fn account_view(&self, account: AccountId, at: Option<Seq>) -> Result<Option<AccountView>> {
+        let record = match at {
+            Some(at) => self.load_account_at(account, at)?,
+            None => self.load_account(account)?,
+        };
+        Ok(record.map(|record| AccountView {
+            created_ms: record.created_ms,
+            standing: record.standing,
+            roles: record.roles,
+        }))
+    }
+
+    /// The account `identifier` names, if any.
+    fn account_named(&self, identifier: &str) -> Result<Option<AccountId>> {
+        match normalize_identifier(identifier) {
+            Ok(normalized) => self.account_for(&self.identifier_digest(&normalized)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// The live sessions of `account`, newest first.
+    fn session_list(&self, account: AccountId) -> Vec<types::SessionInfo> {
+        let epoch = self.epochs.get(account);
+        let mut out: Vec<types::SessionInfo> = self
+            .sessions
+            .sessions_of(account, epoch, now_ms())
+            .into_iter()
+            .map(|(digest, session, seen)| types::SessionInfo {
+                id: self.session_id(&digest),
+                created_ms: session.created_ms,
+                expires_ms: session.expires_ms,
+                last_used_ms: seen.max(session.created_ms),
+                idle_ms: session.idle_ms,
+            })
+            .collect();
+        out.sort_by(|a, b| b.created_ms.cmp(&a.created_ms).then(a.id.cmp(&b.id)));
+        out
+    }
+
+    /// Check an API key's text.
+    fn api_key_check(&self, text: &str) -> Result<keys::ApiKeyCheck> {
+        let Some(random) = token::parse(text) else {
+            return Ok(keys::ApiKeyCheck::Malformed);
+        };
+        Ok(match self.api_key_record(&self.api_key_digest(&random))? {
+            Some(record) => record.check(now_ms()),
+            None => keys::ApiKeyCheck::Unknown,
+        })
+    }
+
+    /// The passkeys of `account`, oldest first.
+    #[cfg(feature = "mfa")]
+    fn passkey_list(&self, account: AccountId) -> Result<Vec<passkey::PasskeyInfo>> {
+        let mut out = Vec::new();
+        for digest in self.passkeys_of(account)? {
+            if let Some(record) = self.passkey_record(&digest)? {
+                out.push(passkey::PasskeyInfo {
+                    id: passkey_id(&digest),
+                    created_ms: record.created_ms,
+                    last_used_ms: record.last_used_ms,
+                });
+            }
+        }
+        out.sort_by_key(|p| (p.created_ms, p.id));
+        Ok(out)
+    }
+}
+
+/// What may be read of an account record outside the engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AccountView {
+    created_ms: u64,
+    /// As stored: a lock-out that has run out is still a lock-out here.
+    standing: Standing,
+    roles: Vec<RoleId>,
+}
+
+/// The engine of one realm as the facade reaches it: in this process, or,
+/// in split mode, in the auth process (each call one round trip).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AuthRef<'a> {
+    Local(&'a AuthEngine),
+    #[cfg(feature = "split-auth")]
+    Remote(&'a split::RemoteAuth),
+}
+
+/// A hosted realm's engine: here, or a stand-in for the one in the auth
+/// process.
+#[derive(Debug)]
+// One per realm, set once: the size does not matter.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum AuthSlot {
+    Local(AuthEngine),
+    #[cfg(feature = "split-auth")]
+    Remote(split::RemoteAuth),
+}
+
+impl AuthSlot {
+    pub(crate) fn get(&self) -> AuthRef<'_> {
+        match self {
+            AuthSlot::Local(engine) => AuthRef::Local(engine),
+            #[cfg(feature = "split-auth")]
+            AuthSlot::Remote(remote) => AuthRef::Remote(remote),
+        }
+    }
+
+    pub(crate) fn engine(&self) -> &dyn Engine {
+        match self {
+            AuthSlot::Local(engine) => engine,
+            #[cfg(feature = "split-auth")]
+            AuthSlot::Remote(remote) => remote,
+        }
+    }
+
+    pub(crate) fn collection(&self) -> u32 {
+        self.get().collection()
+    }
+
+    /// Take `definition` (as the catalog holds it) as the realm's policy.
+    pub(crate) fn adopt(&self, definition: &[u8]) -> Result<()> {
+        match self {
+            AuthSlot::Local(engine) => engine.adopt(definition),
+            #[cfg(feature = "split-auth")]
+            AuthSlot::Remote(remote) => remote.adopt(definition),
+        }
+    }
+}
+
+impl AuthRef<'_> {
+    pub(crate) fn collection(self) -> u32 {
+        match self {
+            AuthRef::Local(engine) => engine.collection,
+            #[cfg(feature = "split-auth")]
+            AuthRef::Remote(remote) => remote.collection(),
+        }
+    }
+
+    fn realm(self) -> realm::RealmPolicy {
+        match self {
+            AuthRef::Local(engine) => engine.realm(),
+            #[cfg(feature = "split-auth")]
+            AuthRef::Remote(remote) => remote.realm(),
+        }
+    }
+
+    fn validate(self, token: &str) -> Result<Validation> {
+        match self {
+            AuthRef::Local(engine) => Ok(engine.validate(token)),
+            #[cfg(feature = "split-auth")]
+            AuthRef::Remote(remote) => remote.validate(token),
+        }
+    }
+
+    fn hash_password(self, password: &str) -> Result<HashedPassword> {
+        match self {
+            AuthRef::Local(engine) => engine.hash_password(password),
+            #[cfg(feature = "split-auth")]
+            AuthRef::Remote(remote) => remote.hash_password(password),
+        }
+    }
+
+    fn check(self, identifier: &str, password: &str) -> Result<Checked> {
+        match self {
+            AuthRef::Local(engine) => engine.check(identifier, password),
+            #[cfg(feature = "split-auth")]
+            AuthRef::Remote(remote) => remote.check(identifier, password),
+        }
+    }
+
+    fn clear_failures(self, account: AccountId) -> Result<()> {
+        match self {
+            AuthRef::Local(engine) => {
+                engine.clear_failures(account);
+                Ok(())
+            }
+            #[cfg(feature = "split-auth")]
+            AuthRef::Remote(remote) => remote.clear_failures(account),
+        }
+    }
+
+    fn count_failure(self, account: AccountId, now: u64) -> Result<u32> {
+        match self {
+            AuthRef::Local(engine) => Ok(engine.count_failure(account, now)),
+            #[cfg(feature = "split-auth")]
+            AuthRef::Remote(remote) => remote.count_failure(account, now),
+        }
+    }
+
+    fn needs_second_factor(self, account: AccountId) -> Result<bool> {
+        match self {
+            AuthRef::Local(engine) => engine.needs_second_factor(account),
+            #[cfg(feature = "split-auth")]
+            AuthRef::Remote(remote) => remote.needs_second_factor(account),
+        }
+    }
+
+    fn account_view(self, account: AccountId, at: Option<Seq>) -> Result<Option<AccountView>> {
+        match self {
+            AuthRef::Local(engine) => engine.account_view(account, at),
+            #[cfg(feature = "split-auth")]
+            AuthRef::Remote(remote) => remote.account_view(account, at),
+        }
+    }
+
+    fn account_named(self, identifier: &str) -> Result<Option<AccountId>> {
+        match self {
+            AuthRef::Local(engine) => engine.account_named(identifier),
+            #[cfg(feature = "split-auth")]
+            AuthRef::Remote(remote) => remote.account_named(identifier),
+        }
+    }
+
+    fn sessions(self, account: AccountId) -> Result<Vec<types::SessionInfo>> {
+        match self {
+            AuthRef::Local(engine) => Ok(engine.session_list(account)),
+            #[cfg(feature = "split-auth")]
+            AuthRef::Remote(remote) => remote.sessions(account),
+        }
+    }
+
+    fn api_key_check(self, text: &str) -> Result<keys::ApiKeyCheck> {
+        match self {
+            AuthRef::Local(engine) => engine.api_key_check(text),
+            #[cfg(feature = "split-auth")]
+            AuthRef::Remote(remote) => remote.api_key_check(text),
+        }
+    }
+
+    #[cfg(feature = "mfa")]
+    fn passkeys(self, account: AccountId) -> Result<Vec<passkey::PasskeyInfo>> {
+        match self {
+            AuthRef::Local(engine) => engine.passkey_list(account),
+            #[cfg(feature = "split-auth")]
+            AuthRef::Remote(remote) => remote.passkeys(account),
+        }
+    }
+
+    /// The realm's roles as last applied.
+    fn policy(self) -> Result<Arc<Policy>> {
+        match self {
+            AuthRef::Local(engine) => Ok(engine.policy()),
+            #[cfg(feature = "split-auth")]
+            AuthRef::Remote(remote) => remote.policy(),
+        }
     }
 }
 
@@ -2300,7 +2571,7 @@ fn decode_standing(code: u8, until: u64, reason: u32) -> Result<Standing> {
 }
 
 /// What checking a password found, before failures are counted.
-enum Checked {
+pub(crate) enum Checked {
     Verified(AccountId),
     /// Wrong password (with the account when the identifier exists), or an
     /// unknown identifier.
@@ -2457,15 +2728,71 @@ fn unpad(plain: &[u8], seq: Seq) -> Result<&[u8]> {
 /// written until the transaction commits; if the closure returns an error,
 /// nothing is written at all.
 pub struct AuthTx<'t, 'db> {
-    pub(crate) staged: &'t mut AuthStaged<'db>,
+    pub(crate) part: &'t mut AuthPart<'db>,
 }
 
 impl fmt::Debug for AuthTx<'_, '_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AuthTx")
-            .field("operations", &self.staged.ops.len())
-            .finish()
+        match &*self.part {
+            AuthPart::Local(staged) => f
+                .debug_struct("AuthTx")
+                .field("operations", &staged.ops.len())
+                .finish(),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(_) => f.debug_struct("AuthTx").finish_non_exhaustive(),
+        }
     }
+}
+
+/// One transaction's work in one realm: staged here, or, in split mode,
+/// staged in the auth process.
+// Held inline, as the embedded part always was: no allocation per
+// transaction for the common case.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum AuthPart<'db> {
+    Local(AuthStaged<'db>),
+    #[cfg(feature = "split-auth")]
+    Remote(split::RemoteStaged<'db>),
+}
+
+impl<'db> AuthPart<'db> {
+    /// A new part for the realm `engine` holds.
+    pub(crate) fn new(engine: AuthRef<'db>, serializable: bool) -> Self {
+        match engine {
+            AuthRef::Local(engine) => {
+                AuthPart::Local(AuthStaged::new(engine).serializable(serializable))
+            }
+            #[cfg(feature = "split-auth")]
+            AuthRef::Remote(remote) => {
+                AuthPart::Remote(split::RemoteStaged::new(remote, serializable))
+            }
+        }
+    }
+
+    /// The realm.
+    pub(crate) fn collection(&self) -> u32 {
+        match self {
+            AuthPart::Local(staged) => staged.engine.collection,
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.collection(),
+        }
+    }
+
+    /// The work, for the core.
+    pub(crate) fn staged(&self) -> &dyn Staged {
+        match self {
+            AuthPart::Local(staged) => staged,
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote,
+        }
+    }
+}
+
+/// The operations of [`AuthTx`] on work staged in this process: the auth
+/// engine's own code, run here in embedded mode and in the auth process in
+/// split mode.
+pub(crate) struct LocalTx<'t, 'e> {
+    pub(crate) staged: &'t mut AuthStaged<'e>,
 }
 
 impl AuthTx<'_, '_> {
@@ -2496,6 +2823,568 @@ impl AuthTx<'_, '_> {
         identifier: &str,
         password: &HashedPassword,
     ) -> Result<AccountId> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.create_account(identifier, password),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.create_account(identifier, password),
+        }
+    }
+
+    /// Issue a session for `account` and return its token. The token is
+    /// returned once; nex-db keeps only its digest.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Invalid`] when the account does not exist.
+    /// - [`Error::Busy`] when the session table is full.
+    pub fn issue_session(&mut self, account: AccountId, spec: SessionSpec) -> Result<Token> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.issue_session(account, spec),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.issue_session(account, spec),
+        }
+    }
+
+    /// Issue a token for `account` that works once, for `purpose`, for
+    /// `ttl` (at most 30 days): email verification, a password reset, a
+    /// sign-in link, a preview. It is not a session: it never validates.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Invalid`] when the account does not exist or `ttl` is
+    ///   longer than 30 days.
+    /// - [`Error::Busy`] when the session table is full.
+    pub fn single_use_token(
+        &mut self,
+        purpose: Purpose,
+        account: AccountId,
+        ttl: Duration,
+    ) -> Result<Token> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.single_use_token(purpose, account, ttl),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.single_use_token(purpose, account, ttl),
+        }
+    }
+
+    pub(crate) fn stage_single_use(
+        &mut self,
+        purpose: Purpose,
+        account: AccountId,
+        ttl: Duration,
+    ) -> Result<Token> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.stage_single_use(purpose, account, ttl),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.stage_single_use(purpose, account, ttl),
+        }
+    }
+
+    /// Stage a second-factor challenge for `account`: a single-use token
+    /// only `verify_totp` redeems.
+    pub(crate) fn stage_challenge(&mut self, account: AccountId) -> Result<Token> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.stage_challenge(account),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.stage_challenge(account),
+        }
+    }
+
+    /// Redeem a single-use token for `purpose`: its account, once. A token
+    /// redeemed before, expired, issued for another purpose, or unknown
+    /// gives `None`.
+    ///
+    /// # Errors
+    ///
+    /// Only storage errors; a malformed token gives `Ok(None)`.
+    pub fn redeem(
+        &mut self,
+        token: impl AsRef<str>,
+        purpose: Purpose,
+    ) -> Result<Option<AccountId>> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.redeem(token.as_ref(), purpose),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.redeem(token.as_ref(), purpose),
+        }
+    }
+
+    /// Sign `account` out everywhere: every session issued before this
+    /// commit ends, at once and on every reader, as
+    /// `Revoked { reason: SignedOutEverywhere }`. Returns how many sessions
+    /// were live. A session issued later in the same transaction stays valid.
+    ///
+    /// Commits ahead of ordinary commits.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the account does not exist.
+    pub fn revoke_all(&mut self, account: AccountId) -> Result<u32> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.revoke_all(account),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.revoke_all(account),
+        }
+    }
+
+    /// Replace the session `token` names with a new one for the same
+    /// account and the same expiry; the old token becomes
+    /// `Revoked { reason: Rotated }`. Use it after a sign-in step-up or a
+    /// privilege change, so a token seen before cannot be replayed.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the token names no valid session.
+    pub fn rotate(&mut self, token: impl AsRef<str>) -> Result<Token> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.rotate(token.as_ref()),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.rotate(token.as_ref()),
+        }
+    }
+
+    /// Set the account's standing. A standing that takes access away
+    /// (`LockedOut`, `Suspended`, `Banned`) also ends every session of the
+    /// account, in this commit, ahead of ordinary commits. `by` is the
+    /// administrator who set it, or `None` for an automatic change.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the account does not exist, or was created in
+    /// this same transaction.
+    pub fn set_standing(
+        &mut self,
+        account: AccountId,
+        standing: Standing,
+        by: Option<AccountId>,
+    ) -> Result<()> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.set_standing(account, standing, by),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.set_standing(account, standing, by),
+        }
+    }
+
+    /// Erase `account`: its record and password hash, identifiers, second
+    /// factors, recovery codes, passkeys, and API keys are removed, and the
+    /// key that sealed its private records is destroyed, so no copy of them
+    /// (in the commit log, a store file, or a restored backup) can be read
+    /// again. Its sessions end at
+    /// once as `Revoked { reason: Erased }`. Its identifiers are free for a
+    /// new account. Content that refers to the account is the
+    /// application's to remove.
+    ///
+    /// Commits ahead of ordinary commits.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the account does not exist, or was created in
+    /// this same transaction.
+    pub fn erase_account(&mut self, account: AccountId) -> Result<()> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.erase_account(account),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.erase_account(account),
+        }
+    }
+
+    /// Stage again what the auth section of commit `seq`, made after a
+    /// restore point, took away: ended sessions, sign-outs everywhere,
+    /// erasures, revoked API keys, and from a replaced account record its
+    /// password and a standing that blocks. Everything else in it is left
+    /// out.
+    pub(crate) fn reapply(&mut self, seq: Seq, section: &Section<'_>) -> Result<()> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.reapply(seq, section),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.reapply(seq, section),
+        }
+    }
+
+    /// Replace the account's password. Every session the account has ends,
+    /// in this commit; a session issued later in the same transaction
+    /// stays.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the account does not exist, or was created in
+    /// this same transaction.
+    pub fn set_password(&mut self, account: AccountId, password: &HashedPassword) -> Result<()> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.set_password(account, password),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.set_password(account, password),
+        }
+    }
+
+    /// Let the account also sign in with `identifier` (a second email
+    /// address, a username). An account has at most five identifiers.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::AlreadyExists`] (`what = "identifier"`) when an account
+    ///   already uses the identifier.
+    /// - [`Error::Invalid`] when the identifier is not valid (as for
+    ///   [`create_account`](Self::create_account)), the account has five,
+    ///   or the account does not exist or was created in this transaction.
+    pub fn add_identifier(&mut self, account: AccountId, identifier: &str) -> Result<()> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.add_identifier(account, identifier),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.add_identifier(account, identifier),
+        }
+    }
+
+    /// Stop the account signing in with `identifier`. Returns `false` when
+    /// the identifier is not one of the account's.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when it is the account's only identifier (an
+    /// account keeps at least one), or the account does not exist or was
+    /// created in this transaction.
+    pub fn remove_identifier(&mut self, account: AccountId, identifier: &str) -> Result<bool> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.remove_identifier(account, identifier),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.remove_identifier(account, identifier),
+        }
+    }
+
+    /// Define a role in the realm and return its id. Roles are never
+    /// removed, so an id stays valid.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::AlreadyExists`] (`what = "role"`) when a role has the name.
+    /// - [`Error::Invalid`] when a name is empty or longer than 64 bytes,
+    ///   the role grants more than 64 permissions or inherits more than 64
+    ///   roles, inherits one that is not defined, or the realm has 256.
+    pub fn define_role(&mut self, role: Role) -> Result<RoleId> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.define_role(role),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.define_role(role),
+        }
+    }
+
+    /// Replace the account's roles with `roles` (at most 16; repeats count
+    /// once).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when a role is not defined, there are more than
+    /// 16, or the account does not exist or was created in this
+    /// transaction.
+    pub fn assign_roles(&mut self, account: AccountId, roles: &[RoleId]) -> Result<()> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.assign_roles(account, roles),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.assign_roles(account, roles),
+        }
+    }
+
+    /// Lock the account out until `until`, unless its standing already keeps
+    /// it from signing in.
+    pub(crate) fn lock_out(&mut self, account: AccountId, until: SystemTime) -> Result<()> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.lock_out(account, until),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.lock_out(account, until),
+        }
+    }
+
+    /// Start TOTP for `account`: a new secret, replacing any it had. Codes
+    /// are not asked for at sign-in until the account confirms one with
+    /// [`confirm_totp`](Self::confirm_totp).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the account does not exist.
+    #[cfg(feature = "mfa")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+    pub fn add_totp(&mut self, account: AccountId) -> Result<totp::TotpEnrollment> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.add_totp(account),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.add_totp(account),
+        }
+    }
+
+    /// Confirm `account`'s TOTP secret with a code from the app: `true`
+    /// turns TOTP on, so sign-ins ask for a code from then on.
+    ///
+    /// # Errors
+    ///
+    /// Only storage errors.
+    #[cfg(feature = "mfa")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+    pub fn confirm_totp(&mut self, account: AccountId, code: &str) -> Result<bool> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.confirm_totp(account, code),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.confirm_totp(account, code),
+        }
+    }
+
+    /// Check a TOTP code of `account`, which must have TOTP on: `true` once
+    /// per code. For an application that checks the password with
+    /// [`verify_password`](Auth::verify_password) and issues sessions
+    /// itself; [`Auth::verify_totp`] does both for a sign-in.
+    ///
+    /// # Errors
+    ///
+    /// Only storage errors.
+    #[cfg(feature = "mfa")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+    pub fn check_totp(&mut self, account: AccountId, code: &str) -> Result<bool> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.check_totp(account, code),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.check_totp(account, code),
+        }
+    }
+
+    /// Turn TOTP off for `account`; `false` when it had none.
+    ///
+    /// # Errors
+    ///
+    /// Only storage errors.
+    #[cfg(feature = "mfa")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+    pub fn remove_totp(&mut self, account: AccountId) -> Result<bool> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.remove_totp(account),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.remove_totp(account),
+        }
+    }
+
+    /// Make a challenge to register a passkey for `account`: give it to
+    /// `navigator.credentials.create` (with the account's id as the user
+    /// id, so the passkey can sign in without an identifier), then pass
+    /// what it returns to [`add_passkey`](Self::add_passkey).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the account does not exist; [`Error::Busy`]
+    /// when the session table is full.
+    #[cfg(feature = "mfa")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+    pub fn passkey_registration(
+        &mut self,
+        account: AccountId,
+    ) -> Result<passkey::PasskeyChallenge> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.passkey_registration(account),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.passkey_registration(account),
+        }
+    }
+
+    /// Make a challenge to sign in with a passkey: give it to
+    /// `navigator.credentials.get`, then pass what it returns to
+    /// [`Auth::verify_passkey`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Busy`] when the session table is full.
+    #[cfg(feature = "mfa")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+    pub fn passkey_sign_in(&mut self) -> Result<passkey::PasskeyChallenge> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.passkey_sign_in(),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.passkey_sign_in(),
+        }
+    }
+
+    /// Register a passkey for `account` from what
+    /// `navigator.credentials.create` returned for a
+    /// [`passkey_registration`](Self::passkey_registration) challenge.
+    /// Checks the client data (type, challenge, origin), the RP ID, the
+    /// user's presence (and verification, when `rp` requires it), and that
+    /// the key is one crypt-io checks (`ES256`, `EdDSA`, `RS256`).
+    /// Attestation is not checked: the passkey is trusted as the account's
+    /// because the account asked for it.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Invalid`] when any check fails or the challenge is
+    ///   unknown, used, expired, or another account's.
+    /// - [`Error::AlreadyExists`] (`what = "passkey"`) when the credential
+    ///   is registered already.
+    #[cfg(feature = "mfa")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+    pub fn add_passkey(
+        &mut self,
+        account: AccountId,
+        rp: &passkey::RelyingParty,
+        registration: &passkey::PasskeyRegistration<'_>,
+    ) -> Result<passkey::PasskeyId> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.add_passkey(account, rp, registration),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.add_passkey(account, rp, registration),
+        }
+    }
+
+    /// Remove the passkey of `account` with `id`; `false` when it has no
+    /// such passkey.
+    ///
+    /// # Errors
+    ///
+    /// Only storage errors.
+    #[cfg(feature = "mfa")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
+    pub fn remove_passkey(&mut self, account: AccountId, id: passkey::PasskeyId) -> Result<bool> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.remove_passkey(account, id),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.remove_passkey(account, id),
+        }
+    }
+
+    /// Check a passkey assertion and, when it holds, redeem its challenge,
+    /// record the use, and issue a session. `Ok(None)` when it does not
+    /// hold; `Err` only for storage. A blocked account gives its block.
+    #[cfg(feature = "mfa")]
+    pub(crate) fn complete_passkey(
+        &mut self,
+        rp: &passkey::RelyingParty,
+        assertion: &passkey::PasskeyAssertion<'_>,
+        spec: SessionSpec,
+    ) -> Result<Option<PasskeyOutcome>> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.complete_passkey(rp, assertion, spec),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.complete_passkey(rp, assertion, spec),
+        }
+    }
+
+    /// Complete a sign-in that answered [`SignIn::NeedsSecondFactor`]:
+    /// redeem `challenge` and issue a session, when `code` is a fresh TOTP
+    /// code of its account. `None` when the challenge is unknown, used, or
+    /// expired; `Some(false)` for a wrong code (the challenge stays).
+    #[cfg(feature = "mfa")]
+    pub(crate) fn complete_second_factor(
+        &mut self,
+        challenge: &str,
+        code: &str,
+        spec: SessionSpec,
+    ) -> Result<Option<(AccountId, Option<Token>)>> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => {
+                LocalTx { staged }.complete_second_factor(challenge, code, spec)
+            }
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.complete_second_factor(challenge, code, spec),
+        }
+    }
+
+    /// Make ten new recovery codes for `account`, replacing any it had:
+    /// one-time codes the account holder keeps on paper, for when other
+    /// ways to sign in are lost. They are shown here only; nex-db keeps
+    /// keyed digests of them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the account does not exist.
+    pub fn new_recovery_codes(&mut self, account: AccountId) -> Result<recovery::RecoveryCodes> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.new_recovery_codes(account),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.new_recovery_codes(account),
+        }
+    }
+
+    /// Use one of `account`'s recovery codes: `true`, once, for a code it
+    /// holds (typed with or without its dash, in either case); `false`
+    /// otherwise. Two uses of one code at once give `true` to one. Sign the
+    /// account in, or let it set a new password, only on `true`.
+    ///
+    /// # Errors
+    ///
+    /// Only storage errors.
+    pub fn use_recovery_code(&mut self, account: AccountId, code: &str) -> Result<bool> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.use_recovery_code(account, code),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.use_recovery_code(account, code),
+        }
+    }
+
+    /// Make an API key for `account`: a credential for a program, with
+    /// `scopes` (at most 32, each 1 to 64 bytes without spaces; nex-db
+    /// stores them and returns them on each check, the application decides
+    /// what they allow) and an optional `expiry`. The key's text is in the
+    /// result only: show it once.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the account does not exist, a scope breaks
+    /// its rule, or `expiry` has passed.
+    pub fn create_api_key(
+        &mut self,
+        account: AccountId,
+        scopes: &[&str],
+        expiry: Option<SystemTime>,
+    ) -> Result<keys::ApiKey> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.create_api_key(account, scopes, expiry),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.create_api_key(account, scopes, expiry),
+        }
+    }
+
+    /// Revoke the API key with `id`: it answers
+    /// [`ApiKeyCheck::Revoked`](keys::ApiKeyCheck::Revoked) from now on.
+    /// `false` when there is no such key or it was revoked before.
+    ///
+    /// # Errors
+    ///
+    /// Only storage errors.
+    pub fn revoke_api_key(&mut self, id: keys::ApiKeyId) -> Result<bool> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.revoke_api_key(id),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.revoke_api_key(id),
+        }
+    }
+
+    /// End the session of `account` with id `id` (from
+    /// [`Auth::sessions`]): "sign out that device". `false` when the
+    /// account has no such live session.
+    ///
+    /// # Errors
+    ///
+    /// Only storage errors.
+    pub fn revoke_session(&mut self, account: AccountId, id: types::SessionId) -> Result<bool> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.revoke_session(account, id),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.revoke_session(account, id),
+        }
+    }
+
+    /// Revoke the session `token` names. Returns `true` when a session was
+    /// revoked, `false` when the token names no session or one already
+    /// revoked. A revoked session never validates again.
+    ///
+    /// # Errors
+    ///
+    /// Only storage errors; a malformed token returns `Ok(false)`.
+    pub fn revoke(&mut self, token: impl AsRef<str>) -> Result<bool> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.revoke(token.as_ref()),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.revoke(token.as_ref()),
+        }
+    }
+}
+
+impl LocalTx<'_, '_> {
+    fn create_account(&mut self, identifier: &str, password: &HashedPassword) -> Result<AccountId> {
         let engine = self.staged.engine;
         let normalized = normalize_identifier(identifier)?;
         let digest = engine.identifier_digest(&normalized);
@@ -2525,7 +3414,7 @@ impl AuthTx<'_, '_> {
             } else {
                 Standing::Active
             },
-            phc: Zeroizing::new(password.0.clone()),
+            phc: Zeroizing::new(password.phc()?.to_owned()),
             identifiers: Vec::new(),
             roles: Vec::new(),
         }
@@ -2539,14 +3428,7 @@ impl AuthTx<'_, '_> {
         Ok(account)
     }
 
-    /// Issue a session for `account` and return its token. The token is
-    /// returned once; nex-db keeps only its digest.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Invalid`] when the account does not exist.
-    /// - [`Error::Busy`] when the session table is full.
-    pub fn issue_session(&mut self, account: AccountId, spec: SessionSpec) -> Result<Token> {
+    fn issue_session(&mut self, account: AccountId, spec: SessionSpec) -> Result<Token> {
         let engine = self.staged.engine;
         if !self.staged.accounts.contains(&account)
             && !{
@@ -2576,16 +3458,7 @@ impl AuthTx<'_, '_> {
         })
     }
 
-    /// Issue a token for `account` that works once, for `purpose`, for
-    /// `ttl` (at most 30 days): email verification, a password reset, a
-    /// sign-in link, a preview. It is not a session: it never validates.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Invalid`] when the account does not exist or `ttl` is
-    ///   longer than 30 days.
-    /// - [`Error::Busy`] when the session table is full.
-    pub fn single_use_token(
+    fn single_use_token(
         &mut self,
         purpose: Purpose,
         account: AccountId,
@@ -2612,8 +3485,6 @@ impl AuthTx<'_, '_> {
         self.stage_single_use_payload(purpose.payload(), account, ttl)
     }
 
-    /// Stage a second-factor challenge for `account`: a single-use token
-    /// only `verify_totp` redeems.
     fn stage_challenge(&mut self, account: AccountId) -> Result<Token> {
         self.stage_single_use_payload(
             CHALLENGE_PAYLOAD,
@@ -2651,18 +3522,7 @@ impl AuthTx<'_, '_> {
         self.stage_digest(session, |random| engine.single_use_digest(random))
     }
 
-    /// Redeem a single-use token for `purpose`: its account, once. A token
-    /// redeemed before, expired, issued for another purpose, or unknown
-    /// gives `None`.
-    ///
-    /// # Errors
-    ///
-    /// Only storage errors; a malformed token gives `Ok(None)`.
-    pub fn redeem(
-        &mut self,
-        token: impl AsRef<str>,
-        purpose: Purpose,
-    ) -> Result<Option<AccountId>> {
+    fn redeem(&mut self, token: impl AsRef<str>, purpose: Purpose) -> Result<Option<AccountId>> {
         let engine = self.staged.engine;
         let Some(random) = token::parse(token.as_ref()) else {
             return Ok(None);
@@ -2695,8 +3555,6 @@ impl AuthTx<'_, '_> {
         Ok(Some(account))
     }
 
-    /// Stage a session for `account` at its current epoch (counting a raise
-    /// staged in this transaction).
     fn stage_session(&mut self, session: Session) -> Result<Token> {
         let engine = self.staged.engine;
         self.stage_digest(session, |random| engine.token_digest(random))
@@ -2718,7 +3576,6 @@ impl AuthTx<'_, '_> {
         Ok(token)
     }
 
-    /// The account's epoch as this transaction sees it.
     fn epoch(&self, account: AccountId) -> u32 {
         self.staged
             .raised
@@ -2730,17 +3587,7 @@ impl AuthTx<'_, '_> {
             })
     }
 
-    /// Sign `account` out everywhere: every session issued before this
-    /// commit ends, at once and on every reader, as
-    /// `Revoked { reason: SignedOutEverywhere }`. Returns how many sessions
-    /// were live. A session issued later in the same transaction stays valid.
-    ///
-    /// Commits ahead of ordinary commits.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Invalid`] when the account does not exist.
-    pub fn revoke_all(&mut self, account: AccountId) -> Result<u32> {
+    fn revoke_all(&mut self, account: AccountId) -> Result<u32> {
         let engine = self.staged.engine;
         if !self.staged.accounts.contains(&account)
             && !{
@@ -2769,15 +3616,7 @@ impl AuthTx<'_, '_> {
         Ok(live)
     }
 
-    /// Replace the session `token` names with a new one for the same
-    /// account and the same expiry; the old token becomes
-    /// `Revoked { reason: Rotated }`. Use it after a sign-in step-up or a
-    /// privilege change, so a token seen before cannot be replayed.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Invalid`] when the token names no valid session.
-    pub fn rotate(&mut self, token: impl AsRef<str>) -> Result<Token> {
+    fn rotate(&mut self, token: impl AsRef<str>) -> Result<Token> {
         let engine = self.staged.engine;
         let session = token::parse(token.as_ref())
             .map(|random| engine.token_digest(&random))
@@ -2812,16 +3651,7 @@ impl AuthTx<'_, '_> {
         })
     }
 
-    /// Set the account's standing. A standing that takes access away
-    /// (`LockedOut`, `Suspended`, `Banned`) also ends every session of the
-    /// account, in this commit, ahead of ordinary commits. `by` is the
-    /// administrator who set it, or `None` for an automatic change.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Invalid`] when the account does not exist, or was created in
-    /// this same transaction.
-    pub fn set_standing(
+    fn set_standing(
         &mut self,
         account: AccountId,
         standing: Standing,
@@ -2844,22 +3674,7 @@ impl AuthTx<'_, '_> {
         Ok(())
     }
 
-    /// Erase `account`: its record and password hash, identifiers, second
-    /// factors, recovery codes, passkeys, and API keys are removed, and the
-    /// key that sealed its private records is destroyed, so no copy of them
-    /// (in the commit log, a store file, or a restored backup) can be read
-    /// again. Its sessions end at
-    /// once as `Revoked { reason: Erased }`. Its identifiers are free for a
-    /// new account. Content that refers to the account is the
-    /// application's to remove.
-    ///
-    /// Commits ahead of ordinary commits.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Invalid`] when the account does not exist, or was created in
-    /// this same transaction.
-    pub fn erase_account(&mut self, account: AccountId) -> Result<()> {
+    fn erase_account(&mut self, account: AccountId) -> Result<()> {
         let engine = self.staged.engine;
         if self.staged.accounts.contains(&account) {
             return Err(Error::invalid("account", "created in this transaction"));
@@ -2904,12 +3719,7 @@ impl AuthTx<'_, '_> {
         Ok(())
     }
 
-    /// Stage again what the auth section of commit `seq`, made after a
-    /// restore point, took away: ended sessions, sign-outs everywhere,
-    /// erasures, revoked API keys, and from a replaced account record its
-    /// password and a standing that blocks. Everything else in it is left
-    /// out.
-    pub(crate) fn reapply(&mut self, seq: Seq, section: &Section<'_>) -> Result<()> {
+    fn reapply(&mut self, seq: Seq, section: &Section<'_>) -> Result<()> {
         let engine = self.staged.engine;
         let plain;
         let body = match (section.format, section.flags) {
@@ -2983,7 +3793,6 @@ impl AuthTx<'_, '_> {
         Ok(())
     }
 
-    /// Erase `account` when it exists.
     fn erase_if_present(&mut self, account: AccountId) -> Result<()> {
         match self.record(account)? {
             Some(_) => self.erase_account(account),
@@ -2991,7 +3800,6 @@ impl AuthTx<'_, '_> {
         }
     }
 
-    /// The account's record as this transaction sees it.
     fn record(&self, account: AccountId) -> Result<Option<AccountRecord>> {
         if let Some(record) = self.staged.updated.get(&account) {
             return Ok(Some(record.clone()));
@@ -3003,9 +3811,6 @@ impl AuthTx<'_, '_> {
         }
     }
 
-    /// Replace the account's record with `change` applied, in this commit;
-    /// `what` says what changed, for the audit chain. One record per account
-    /// is written, the last.
     fn update_record(
         &mut self,
         account: AccountId,
@@ -3048,7 +3853,6 @@ impl AuthTx<'_, '_> {
         Ok(())
     }
 
-    /// The role policy as this transaction sees it.
     fn policy(&self) -> Policy {
         match &self.staged.policy {
             Some(policy) => policy.clone(),
@@ -3059,34 +3863,16 @@ impl AuthTx<'_, '_> {
         }
     }
 
-    /// Replace the account's password. Every session the account has ends,
-    /// in this commit; a session issued later in the same transaction
-    /// stays.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Invalid`] when the account does not exist, or was created in
-    /// this same transaction.
-    pub fn set_password(&mut self, account: AccountId, password: &HashedPassword) -> Result<()> {
+    fn set_password(&mut self, account: AccountId, password: &HashedPassword) -> Result<()> {
         self.update_record(account, UPDATE_PASSWORD, |record| {
-            record.phc = Zeroizing::new(password.0.clone());
+            record.phc = Zeroizing::new(password.phc()?.to_owned());
             Ok(())
         })?;
         let _ = self.revoke_all(account)?;
         Ok(())
     }
 
-    /// Let the account also sign in with `identifier` (a second email
-    /// address, a username). An account has at most five identifiers.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::AlreadyExists`] (`what = "identifier"`) when an account
-    ///   already uses the identifier.
-    /// - [`Error::Invalid`] when the identifier is not valid (as for
-    ///   [`create_account`](Self::create_account)), the account has five,
-    ///   or the account does not exist or was created in this transaction.
-    pub fn add_identifier(&mut self, account: AccountId, identifier: &str) -> Result<()> {
+    fn add_identifier(&mut self, account: AccountId, identifier: &str) -> Result<()> {
         let engine = self.staged.engine;
         let normalized = normalize_identifier(identifier)?;
         let digest = engine.identifier_digest(&normalized);
@@ -3119,15 +3905,7 @@ impl AuthTx<'_, '_> {
         Ok(())
     }
 
-    /// Stop the account signing in with `identifier`. Returns `false` when
-    /// the identifier is not one of the account's.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Invalid`] when it is the account's only identifier (an
-    /// account keeps at least one), or the account does not exist or was
-    /// created in this transaction.
-    pub fn remove_identifier(&mut self, account: AccountId, identifier: &str) -> Result<bool> {
+    fn remove_identifier(&mut self, account: AccountId, identifier: &str) -> Result<bool> {
         let engine = self.staged.engine;
         let Ok(normalized) = normalize_identifier(identifier) else {
             return Ok(false);
@@ -3163,16 +3941,7 @@ impl AuthTx<'_, '_> {
         Ok(true)
     }
 
-    /// Define a role in the realm and return its id. Roles are never
-    /// removed, so an id stays valid.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::AlreadyExists`] (`what = "role"`) when a role has the name.
-    /// - [`Error::Invalid`] when a name is empty or longer than 64 bytes,
-    ///   the role grants more than 64 permissions or inherits more than 64
-    ///   roles, inherits one that is not defined, or the realm has 256.
-    pub fn define_role(&mut self, role: Role) -> Result<RoleId> {
+    fn define_role(&mut self, role: Role) -> Result<RoleId> {
         let (next, id) = self.policy().with(role)?;
         let value = next.encode()?;
         self.staged
@@ -3187,15 +3956,7 @@ impl AuthTx<'_, '_> {
         Ok(id)
     }
 
-    /// Replace the account's roles with `roles` (at most 16; repeats count
-    /// once).
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Invalid`] when a role is not defined, there are more than
-    /// 16, or the account does not exist or was created in this
-    /// transaction.
-    pub fn assign_roles(&mut self, account: AccountId, roles: &[RoleId]) -> Result<()> {
+    fn assign_roles(&mut self, account: AccountId, roles: &[RoleId]) -> Result<()> {
         let policy = self.policy();
         let mut list: Vec<RoleId> = Vec::with_capacity(roles.len());
         for role in roles {
@@ -3215,8 +3976,6 @@ impl AuthTx<'_, '_> {
         })
     }
 
-    /// Lock the account out until `until`, unless its standing already keeps
-    /// it from signing in.
     fn lock_out(&mut self, account: AccountId, until: SystemTime) -> Result<()> {
         match self.record(account)? {
             Some(record) if record.standing.blocked_until(now_ms()).is_none() => {
@@ -3226,16 +3985,8 @@ impl AuthTx<'_, '_> {
         }
     }
 
-    /// Start TOTP for `account`: a new secret, replacing any it had. Codes
-    /// are not asked for at sign-in until the account confirms one with
-    /// [`confirm_totp`](Self::confirm_totp).
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Invalid`] when the account does not exist.
     #[cfg(feature = "mfa")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
-    pub fn add_totp(&mut self, account: AccountId) -> Result<totp::TotpEnrollment> {
+    fn add_totp(&mut self, account: AccountId) -> Result<totp::TotpEnrollment> {
         let engine = self.staged.engine;
         if !self.staged.accounts.contains(&account) && !engine.account_exists(account)? {
             return Err(Error::invalid("account", "no such account"));
@@ -3253,34 +4004,16 @@ impl AuthTx<'_, '_> {
         Ok(totp::TotpEnrollment { secret })
     }
 
-    /// Confirm `account`'s TOTP secret with a code from the app: `true`
-    /// turns TOTP on, so sign-ins ask for a code from then on.
-    ///
-    /// # Errors
-    ///
-    /// Only storage errors.
     #[cfg(feature = "mfa")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
-    pub fn confirm_totp(&mut self, account: AccountId, code: &str) -> Result<bool> {
+    fn confirm_totp(&mut self, account: AccountId, code: &str) -> Result<bool> {
         self.use_totp(account, code, false)
     }
 
-    /// Check a TOTP code of `account`, which must have TOTP on: `true` once
-    /// per code. For an application that checks the password with
-    /// [`verify_password`](Auth::verify_password) and issues sessions
-    /// itself; [`Auth::verify_totp`] does both for a sign-in.
-    ///
-    /// # Errors
-    ///
-    /// Only storage errors.
     #[cfg(feature = "mfa")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
-    pub fn check_totp(&mut self, account: AccountId, code: &str) -> Result<bool> {
+    fn check_totp(&mut self, account: AccountId, code: &str) -> Result<bool> {
         self.use_totp(account, code, true)
     }
 
-    /// Accept `code` for `account`'s TOTP record (confirmed, when
-    /// `confirmed`), recording its step so it works once.
     #[cfg(feature = "mfa")]
     fn use_totp(&mut self, account: AccountId, code: &str, confirmed: bool) -> Result<bool> {
         let engine = self.staged.engine;
@@ -3306,14 +4039,8 @@ impl AuthTx<'_, '_> {
         Ok(true)
     }
 
-    /// Turn TOTP off for `account`; `false` when it had none.
-    ///
-    /// # Errors
-    ///
-    /// Only storage errors.
     #[cfg(feature = "mfa")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
-    pub fn remove_totp(&mut self, account: AccountId) -> Result<bool> {
+    fn remove_totp(&mut self, account: AccountId) -> Result<bool> {
         let engine = self.staged.engine;
         self.staged.note(totp_conflict(&account));
         if engine.totp_record(account)?.is_none() {
@@ -3349,8 +4076,6 @@ impl AuthTx<'_, '_> {
         Ok(())
     }
 
-    /// A passkey challenge with `payload`, for `account` (zeros for a
-    /// sign-in, where the passkey names the account).
     #[cfg(feature = "mfa")]
     fn passkey_challenge(
         &mut self,
@@ -3364,21 +4089,8 @@ impl AuthTx<'_, '_> {
         Ok(passkey::PasskeyChallenge { bytes })
     }
 
-    /// Make a challenge to register a passkey for `account`: give it to
-    /// `navigator.credentials.create` (with the account's id as the user
-    /// id, so the passkey can sign in without an identifier), then pass
-    /// what it returns to [`add_passkey`](Self::add_passkey).
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Invalid`] when the account does not exist; [`Error::Busy`]
-    /// when the session table is full.
     #[cfg(feature = "mfa")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
-    pub fn passkey_registration(
-        &mut self,
-        account: AccountId,
-    ) -> Result<passkey::PasskeyChallenge> {
+    fn passkey_registration(&mut self, account: AccountId) -> Result<passkey::PasskeyChallenge> {
         let engine = self.staged.engine;
         if !self.staged.accounts.contains(&account) && !engine.account_exists(account)? {
             return Err(Error::invalid("account", "no such account"));
@@ -3386,21 +4098,11 @@ impl AuthTx<'_, '_> {
         self.passkey_challenge(PASSKEY_REGISTRATION_PAYLOAD, account)
     }
 
-    /// Make a challenge to sign in with a passkey: give it to
-    /// `navigator.credentials.get`, then pass what it returns to
-    /// [`Auth::verify_passkey`].
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Busy`] when the session table is full.
     #[cfg(feature = "mfa")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
-    pub fn passkey_sign_in(&mut self) -> Result<passkey::PasskeyChallenge> {
+    fn passkey_sign_in(&mut self) -> Result<passkey::PasskeyChallenge> {
         self.passkey_challenge(PASSKEY_SIGN_IN_PAYLOAD, AccountId::from_bytes([0; 16]))
     }
 
-    /// The account a live, unused passkey challenge for `payload` was
-    /// made for, redeeming it; `None` otherwise.
     #[cfg(feature = "mfa")]
     fn redeem_passkey_challenge(
         &mut self,
@@ -3427,24 +4129,8 @@ impl AuthTx<'_, '_> {
         Some(account)
     }
 
-    /// Register a passkey for `account` from what
-    /// `navigator.credentials.create` returned for a
-    /// [`passkey_registration`](Self::passkey_registration) challenge.
-    /// Checks the client data (type, challenge, origin), the RP ID, the
-    /// user's presence (and verification, when `rp` requires it), and that
-    /// the key is one crypt-io checks (`ES256`, `EdDSA`, `RS256`).
-    /// Attestation is not checked: the passkey is trusted as the account's
-    /// because the account asked for it.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Invalid`] when any check fails or the challenge is
-    ///   unknown, used, expired, or another account's.
-    /// - [`Error::AlreadyExists`] (`what = "passkey"`) when the credential
-    ///   is registered already.
     #[cfg(feature = "mfa")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
-    pub fn add_passkey(
+    fn add_passkey(
         &mut self,
         account: AccountId,
         rp: &passkey::RelyingParty,
@@ -3486,15 +4172,8 @@ impl AuthTx<'_, '_> {
         Ok(passkey_id(&digest))
     }
 
-    /// Remove the passkey of `account` with `id`; `false` when it has no
-    /// such passkey.
-    ///
-    /// # Errors
-    ///
-    /// Only storage errors.
     #[cfg(feature = "mfa")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
-    pub fn remove_passkey(&mut self, account: AccountId, id: passkey::PasskeyId) -> Result<bool> {
+    fn remove_passkey(&mut self, account: AccountId, id: passkey::PasskeyId) -> Result<bool> {
         let engine = self.staged.engine;
         let Some(digest) = engine
             .passkeys_of(account)?
@@ -3539,9 +4218,6 @@ impl AuthTx<'_, '_> {
         Ok(())
     }
 
-    /// Check a passkey assertion and, when it holds, redeem its challenge,
-    /// record the use, and issue a session. `Ok(None)` when it does not
-    /// hold; `Err` only for storage. A blocked account gives its block.
     #[cfg(feature = "mfa")]
     fn complete_passkey(
         &mut self,
@@ -3604,10 +4280,6 @@ impl AuthTx<'_, '_> {
         Ok(Some(Ok((account, token))))
     }
 
-    /// Complete a sign-in that answered [`SignIn::NeedsSecondFactor`]:
-    /// redeem `challenge` and issue a session, when `code` is a fresh TOTP
-    /// code of its account. `None` when the challenge is unknown, used, or
-    /// expired; `Some(false)` for a wrong code (the challenge stays).
     #[cfg(feature = "mfa")]
     fn complete_second_factor(
         &mut self,
@@ -3643,15 +4315,7 @@ impl AuthTx<'_, '_> {
         Ok(Some((account, Some(token))))
     }
 
-    /// Make ten new recovery codes for `account`, replacing any it had:
-    /// one-time codes the account holder keeps on paper, for when other
-    /// ways to sign in are lost. They are shown here only; nex-db keeps
-    /// keyed digests of them.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Invalid`] when the account does not exist.
-    pub fn new_recovery_codes(&mut self, account: AccountId) -> Result<recovery::RecoveryCodes> {
+    fn new_recovery_codes(&mut self, account: AccountId) -> Result<recovery::RecoveryCodes> {
         let engine = self.staged.engine;
         if !self.staged.accounts.contains(&account) && !engine.account_exists(account)? {
             return Err(Error::invalid("account", "no such account"));
@@ -3667,15 +4331,7 @@ impl AuthTx<'_, '_> {
         Ok(recovery::RecoveryCodes { codes })
     }
 
-    /// Use one of `account`'s recovery codes: `true`, once, for a code it
-    /// holds (typed with or without its dash, in either case); `false`
-    /// otherwise. Two uses of one code at once give `true` to one. Sign the
-    /// account in, or let it set a new password, only on `true`.
-    ///
-    /// # Errors
-    ///
-    /// Only storage errors.
-    pub fn use_recovery_code(&mut self, account: AccountId, code: &str) -> Result<bool> {
+    fn use_recovery_code(&mut self, account: AccountId, code: &str) -> Result<bool> {
         let engine = self.staged.engine;
         let Some(symbols) = recovery::normalize(code) else {
             return Ok(false);
@@ -3732,17 +4388,7 @@ impl AuthTx<'_, '_> {
         Ok(())
     }
 
-    /// Make an API key for `account`: a credential for a program, with
-    /// `scopes` (at most 32, each 1 to 64 bytes without spaces; nex-db
-    /// stores them and returns them on each check, the application decides
-    /// what they allow) and an optional `expiry`. The key's text is in the
-    /// result only: show it once.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Invalid`] when the account does not exist, a scope breaks
-    /// its rule, or `expiry` has passed.
-    pub fn create_api_key(
+    fn create_api_key(
         &mut self,
         account: AccountId,
         scopes: &[&str],
@@ -3779,14 +4425,7 @@ impl AuthTx<'_, '_> {
         Ok(keys::ApiKey { id, token })
     }
 
-    /// Revoke the API key with `id`: it answers
-    /// [`ApiKeyCheck::Revoked`](keys::ApiKeyCheck::Revoked) from now on.
-    /// `false` when there is no such key or it was revoked before.
-    ///
-    /// # Errors
-    ///
-    /// Only storage errors.
-    pub fn revoke_api_key(&mut self, id: keys::ApiKeyId) -> Result<bool> {
+    fn revoke_api_key(&mut self, id: keys::ApiKeyId) -> Result<bool> {
         let engine = self.staged.engine;
         self.staged.note(api_key_conflict(&id));
         let Some(digest) = engine.api_key_digest_of(&id)? else {
@@ -3822,14 +4461,7 @@ impl AuthTx<'_, '_> {
         Ok(())
     }
 
-    /// End the session of `account` with id `id` (from
-    /// [`Auth::sessions`]): "sign out that device". `false` when the
-    /// account has no such live session.
-    ///
-    /// # Errors
-    ///
-    /// Only storage errors.
-    pub fn revoke_session(&mut self, account: AccountId, id: types::SessionId) -> Result<bool> {
+    fn revoke_session(&mut self, account: AccountId, id: types::SessionId) -> Result<bool> {
         let engine = self.staged.engine;
         let epoch = self.epoch(account);
         let found = engine
@@ -3851,14 +4483,7 @@ impl AuthTx<'_, '_> {
         Ok(true)
     }
 
-    /// Revoke the session `token` names. Returns `true` when a session was
-    /// revoked, `false` when the token names no session or one already
-    /// revoked. A revoked session never validates again.
-    ///
-    /// # Errors
-    ///
-    /// Only storage errors; a malformed token returns `Ok(false)`.
-    pub fn revoke(&mut self, token: impl AsRef<str>) -> Result<bool> {
+    fn revoke(&mut self, token: impl AsRef<str>) -> Result<bool> {
         let engine = self.staged.engine;
         let Some(random) = token::parse(token.as_ref()) else {
             return Ok(false);
@@ -3893,17 +4518,17 @@ impl AuthTx<'_, '_> {
 #[derive(Debug, Clone, Copy)]
 pub struct Auth<'db> {
     pub(crate) db: &'db Database,
-    pub(crate) engine: &'db AuthEngine,
+    pub(crate) engine: AuthRef<'db>,
 }
 
 impl Auth<'_> {
-    fn engine(&self) -> &AuthEngine {
+    fn engine(&self) -> AuthRef<'_> {
         self.engine
     }
 
     /// The realm this handle acts on.
     pub(crate) fn collection(&self) -> u32 {
-        self.engine.collection
+        self.engine.collection()
     }
 
     /// Check a session token. Reads memory only and allocates nothing.
@@ -3922,10 +4547,10 @@ impl Auth<'_> {
     ///
     /// # Errors
     ///
-    /// None in this version; the `Result` leaves room for split-process
-    /// auth, where validation crosses a channel.
+    /// None embedded. With split auth, where the check is one round trip to
+    /// the auth process, [`Error::Storage`] once that process is gone.
     pub fn validate(&self, token: impl AsRef<str>) -> Result<Validation> {
-        let validation = self.engine().validate(token.as_ref());
+        let validation = self.engine().validate(token.as_ref())?;
         if matches!(validation, Validation::Revoked { .. }) {
             self.db
                 .observers()
@@ -3956,7 +4581,7 @@ impl Auth<'_> {
     /// [`Database::commit`].
     pub fn create_account(&self, identifier: &str, password: &HashedPassword) -> Result<AccountId> {
         self.db.commit(|tx| {
-            tx.auth_of(self.engine.collection)
+            tx.auth_of(self.engine.collection())
                 .create_account(identifier, password)
         })
     }
@@ -3969,7 +4594,7 @@ impl Auth<'_> {
     /// [`Database::commit`].
     pub fn issue_session(&self, account: AccountId, spec: SessionSpec) -> Result<Token> {
         self.db.commit(|tx| {
-            tx.auth_of(self.engine.collection)
+            tx.auth_of(self.engine.collection())
                 .issue_session(account, spec)
         })
     }
@@ -3982,7 +4607,7 @@ impl Auth<'_> {
     pub fn revoke(&self, token: impl AsRef<str>) -> Result<bool> {
         let token = token.as_ref();
         self.db
-            .commit(|tx| tx.auth_of(self.engine.collection).revoke(token))
+            .commit(|tx| tx.auth_of(self.engine.collection()).revoke(token))
     }
 
     /// Make new recovery codes in their own commit. See
@@ -3994,7 +4619,7 @@ impl Auth<'_> {
     /// [`Database::commit`].
     pub fn new_recovery_codes(&self, account: AccountId) -> Result<recovery::RecoveryCodes> {
         self.db.commit(|tx| {
-            tx.auth_of(self.engine.collection)
+            tx.auth_of(self.engine.collection())
                 .new_recovery_codes(account)
         })
     }
@@ -4008,7 +4633,7 @@ impl Auth<'_> {
     /// [`Database::commit`].
     pub fn use_recovery_code(&self, account: AccountId, code: &str) -> Result<bool> {
         self.db.commit(|tx| {
-            tx.auth_of(self.engine.collection)
+            tx.auth_of(self.engine.collection())
                 .use_recovery_code(account, code)
         })
     }
@@ -4040,7 +4665,7 @@ impl Auth<'_> {
         expiry: Option<SystemTime>,
     ) -> Result<keys::ApiKey> {
         self.db.commit(|tx| {
-            tx.auth_of(self.engine.collection)
+            tx.auth_of(self.engine.collection())
                 .create_api_key(account, scopes, expiry)
         })
     }
@@ -4053,16 +4678,7 @@ impl Auth<'_> {
     /// Only storage errors; a malformed key gives
     /// [`ApiKeyCheck::Malformed`](keys::ApiKeyCheck::Malformed).
     pub fn validate_api_key(&self, text: impl AsRef<str>) -> Result<keys::ApiKeyCheck> {
-        let Some(random) = token::parse(text.as_ref()) else {
-            return Ok(keys::ApiKeyCheck::Malformed);
-        };
-        let engine = self.engine;
-        Ok(
-            match engine.api_key_record(&engine.api_key_digest(&random))? {
-                Some(record) => record.check(now_ms()),
-                None => keys::ApiKeyCheck::Unknown,
-            },
-        )
+        self.engine.api_key_check(text.as_ref())
     }
 
     /// Revoke an API key in its own commit. See [`AuthTx::revoke_api_key`].
@@ -4073,7 +4689,7 @@ impl Auth<'_> {
     /// [`Database::commit`].
     pub fn revoke_api_key(&self, id: keys::ApiKeyId) -> Result<bool> {
         self.db
-            .commit(|tx| tx.auth_of(self.engine.collection).revoke_api_key(id))
+            .commit(|tx| tx.auth_of(self.engine.collection()).revoke_api_key(id))
     }
 
     /// The live sessions of `account`, newest first: ids, times, never
@@ -4081,24 +4697,10 @@ impl Auth<'_> {
     ///
     /// # Errors
     ///
-    /// Never in this version.
+    /// None embedded; with split auth, [`Error::Storage`] once the auth
+    /// process is gone.
     pub fn sessions(&self, account: AccountId) -> Result<Vec<types::SessionInfo>> {
-        let engine = self.engine;
-        let epoch = engine.epochs.get(account);
-        let mut out: Vec<types::SessionInfo> = engine
-            .sessions
-            .sessions_of(account, epoch, now_ms())
-            .into_iter()
-            .map(|(digest, session, seen)| types::SessionInfo {
-                id: engine.session_id(&digest),
-                created_ms: session.created_ms,
-                expires_ms: session.expires_ms,
-                last_used_ms: seen.max(session.created_ms),
-                idle_ms: session.idle_ms,
-            })
-            .collect();
-        out.sort_by(|a, b| b.created_ms.cmp(&a.created_ms).then(a.id.cmp(&b.id)));
-        Ok(out)
+        self.engine.sessions(account)
     }
 
     /// End one session of `account` in its own commit. See
@@ -4110,7 +4712,7 @@ impl Auth<'_> {
     /// [`Database::commit`].
     pub fn revoke_session(&self, account: AccountId, id: types::SessionId) -> Result<bool> {
         self.db.commit(|tx| {
-            tx.auth_of(self.engine.collection)
+            tx.auth_of(self.engine.collection())
                 .revoke_session(account, id)
         })
     }
@@ -4133,7 +4735,7 @@ impl Auth<'_> {
     /// As [`AuthTx::revoke_all`], plus the errors of [`Database::commit`].
     pub fn revoke_all(&self, account: AccountId) -> Result<u32> {
         self.db
-            .commit(|tx| tx.auth_of(self.engine.collection).revoke_all(account))
+            .commit(|tx| tx.auth_of(self.engine.collection()).revoke_all(account))
     }
 
     /// Erase an account in its own commit. See [`AuthTx::erase_account`].
@@ -4153,7 +4755,7 @@ impl Auth<'_> {
     /// As [`AuthTx::erase_account`], plus the errors of [`Database::commit`].
     pub fn erase_account(&self, account: AccountId) -> Result<()> {
         self.db
-            .commit(|tx| tx.auth_of(self.engine.collection).erase_account(account))
+            .commit(|tx| tx.auth_of(self.engine.collection()).erase_account(account))
     }
 
     /// Replace a session's token in its own commit. See
@@ -4165,7 +4767,7 @@ impl Auth<'_> {
     pub fn rotate(&self, token: impl AsRef<str>) -> Result<Token> {
         let token = token.as_ref();
         self.db
-            .commit(|tx| tx.auth_of(self.engine.collection).rotate(token))
+            .commit(|tx| tx.auth_of(self.engine.collection()).rotate(token))
     }
 
     /// Check `password` for `identifier` inside the engine and, when it
@@ -4195,9 +4797,10 @@ impl Auth<'_> {
                 Ok(SignIn::Success { account, token })
             }
             Login::NeedsSecondFactor { account } => {
-                let challenge = self
-                    .db
-                    .commit(|tx| tx.auth_of(self.engine.collection).stage_challenge(account))?;
+                let challenge = self.db.commit(|tx| {
+                    tx.auth_of(self.engine.collection())
+                        .stage_challenge(account)
+                })?;
                 Ok(SignIn::NeedsSecondFactor { challenge })
             }
             Login::LockedOut { until } => Ok(SignIn::LockedOut { until }),
@@ -4225,22 +4828,22 @@ impl Auth<'_> {
         let engine = self.engine;
         let challenge = challenge.as_ref();
         let outcome = self.db.commit(|tx| {
-            tx.auth_of(engine.collection)
+            tx.auth_of(engine.collection())
                 .complete_second_factor(challenge, code, spec)
         })?;
         match outcome {
             Some((account, Some(token))) => {
-                engine.clear_failures(account);
+                engine.clear_failures(account)?;
                 Ok(SignIn::Success { account, token })
             }
             Some((account, None)) => {
                 let now = now_ms();
                 let realm = engine.realm();
-                if engine.count_failure(account, now) >= realm.lockout_failures {
+                if engine.count_failure(account, now)? >= realm.lockout_failures {
                     let until = time_of(now.saturating_add(realm.lockout_ms));
                     self.db
-                        .commit(|tx| tx.auth_of(engine.collection).lock_out(account, until))?;
-                    engine.clear_failures(account);
+                        .commit(|tx| tx.auth_of(engine.collection()).lock_out(account, until))?;
+                    engine.clear_failures(account)?;
                     self.db
                         .observers()
                         .security(SecurityEvent::LockedOut { account });
@@ -4265,7 +4868,7 @@ impl Auth<'_> {
     #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
     pub fn passkey_registration(&self, account: AccountId) -> Result<passkey::PasskeyChallenge> {
         self.db.commit(|tx| {
-            tx.auth_of(self.engine.collection)
+            tx.auth_of(self.engine.collection())
                 .passkey_registration(account)
         })
     }
@@ -4284,7 +4887,7 @@ impl Auth<'_> {
         registration: &passkey::PasskeyRegistration<'_>,
     ) -> Result<passkey::PasskeyId> {
         self.db.commit(|tx| {
-            tx.auth_of(self.engine.collection)
+            tx.auth_of(self.engine.collection())
                 .add_passkey(account, rp, registration)
         })
     }
@@ -4300,7 +4903,7 @@ impl Auth<'_> {
     #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
     pub fn passkey_sign_in(&self) -> Result<passkey::PasskeyChallenge> {
         self.db
-            .commit(|tx| tx.auth_of(self.engine.collection).passkey_sign_in())
+            .commit(|tx| tx.auth_of(self.engine.collection()).passkey_sign_in())
     }
 
     /// Sign in with a passkey: check what `navigator.credentials.get`
@@ -4324,7 +4927,7 @@ impl Auth<'_> {
         spec: SessionSpec,
     ) -> Result<SignIn> {
         let outcome = self.db.commit(|tx| {
-            tx.auth_of(self.engine.collection)
+            tx.auth_of(self.engine.collection())
                 .complete_passkey(rp, assertion, spec)
         })?;
         Ok(match outcome {
@@ -4350,19 +4953,7 @@ impl Auth<'_> {
     #[cfg(feature = "mfa")]
     #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
     pub fn passkeys(&self, account: AccountId) -> Result<Vec<passkey::PasskeyInfo>> {
-        let engine = self.engine;
-        let mut out = Vec::new();
-        for digest in engine.passkeys_of(account)? {
-            if let Some(record) = engine.passkey_record(&digest)? {
-                out.push(passkey::PasskeyInfo {
-                    id: passkey_id(&digest),
-                    created_ms: record.created_ms,
-                    last_used_ms: record.last_used_ms,
-                });
-            }
-        }
-        out.sort_by_key(|p| (p.created_ms, p.id));
-        Ok(out)
+        self.engine.passkeys(account)
     }
 
     /// Remove a passkey in its own commit. See [`AuthTx::remove_passkey`].
@@ -4375,7 +4966,7 @@ impl Auth<'_> {
     #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
     pub fn remove_passkey(&self, account: AccountId, id: passkey::PasskeyId) -> Result<bool> {
         self.db.commit(|tx| {
-            tx.auth_of(self.engine.collection)
+            tx.auth_of(self.engine.collection())
                 .remove_passkey(account, id)
         })
     }
@@ -4389,7 +4980,7 @@ impl Auth<'_> {
     #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
     pub fn add_totp(&self, account: AccountId) -> Result<totp::TotpEnrollment> {
         self.db
-            .commit(|tx| tx.auth_of(self.engine.collection).add_totp(account))
+            .commit(|tx| tx.auth_of(self.engine.collection()).add_totp(account))
     }
 
     /// Confirm TOTP in its own commit. See [`AuthTx::confirm_totp`].
@@ -4401,7 +4992,7 @@ impl Auth<'_> {
     #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
     pub fn confirm_totp(&self, account: AccountId, code: &str) -> Result<bool> {
         self.db.commit(|tx| {
-            tx.auth_of(self.engine.collection)
+            tx.auth_of(self.engine.collection())
                 .confirm_totp(account, code)
         })
     }
@@ -4414,8 +5005,10 @@ impl Auth<'_> {
     #[cfg(feature = "mfa")]
     #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
     pub fn check_totp(&self, account: AccountId, code: &str) -> Result<bool> {
-        self.db
-            .commit(|tx| tx.auth_of(self.engine.collection).check_totp(account, code))
+        self.db.commit(|tx| {
+            tx.auth_of(self.engine.collection())
+                .check_totp(account, code)
+        })
     }
 
     /// Turn TOTP off in its own commit. See [`AuthTx::remove_totp`].
@@ -4427,7 +5020,7 @@ impl Auth<'_> {
     #[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
     pub fn remove_totp(&self, account: AccountId) -> Result<bool> {
         self.db
-            .commit(|tx| tx.auth_of(self.engine.collection).remove_totp(account))
+            .commit(|tx| tx.auth_of(self.engine.collection()).remove_totp(account))
     }
 
     /// Check `password` for `identifier` inside the engine without issuing
@@ -4446,7 +5039,7 @@ impl Auth<'_> {
         let engine = self.engine();
         match engine.check(identifier, password)? {
             Checked::Verified(account) => {
-                engine.clear_failures(account);
+                engine.clear_failures(account)?;
                 if engine.needs_second_factor(account)? {
                     return Ok(Login::NeedsSecondFactor { account });
                 }
@@ -4463,11 +5056,13 @@ impl Auth<'_> {
                 });
                 let now = now_ms();
                 let realm = engine.realm();
-                if engine.count_failure(account, now) >= realm.lockout_failures {
+                if engine.count_failure(account, now)? >= realm.lockout_failures {
                     let until = time_of(now.saturating_add(realm.lockout_ms));
-                    self.db
-                        .commit(|tx| tx.auth_of(self.engine.collection).lock_out(account, until))?;
-                    engine.clear_failures(account);
+                    self.db.commit(|tx| {
+                        tx.auth_of(self.engine.collection())
+                            .lock_out(account, until)
+                    })?;
+                    engine.clear_failures(account)?;
                     observers.security(SecurityEvent::LockedOut { account });
                 }
                 Ok(Login::Failed)
@@ -4492,8 +5087,8 @@ impl Auth<'_> {
     pub fn standing(&self, account: AccountId) -> Result<Option<Standing>> {
         Ok(self
             .engine()
-            .load_account(account)?
-            .map(|record| record.standing.at(now_ms())))
+            .account_view(account, None)?
+            .map(|view| view.standing.at(now_ms())))
     }
 
     /// Set an account's standing in its own commit. See
@@ -4509,7 +5104,7 @@ impl Auth<'_> {
         by: Option<AccountId>,
     ) -> Result<()> {
         self.db.commit(|tx| {
-            tx.auth_of(self.engine.collection)
+            tx.auth_of(self.engine.collection())
                 .set_standing(account, standing, by)
         })
     }
@@ -4542,7 +5137,7 @@ impl Auth<'_> {
         ttl: Duration,
     ) -> Result<Token> {
         self.db.commit(|tx| {
-            tx.auth_of(self.engine.collection)
+            tx.auth_of(self.engine.collection())
                 .single_use_token(purpose, account, ttl)
         })
     }
@@ -4562,13 +5157,10 @@ impl Auth<'_> {
         ttl: Duration,
     ) -> Result<Option<Token>> {
         let engine = self.engine();
-        let account = match normalize_identifier(identifier) {
-            Ok(normalized) => engine.account_for(&engine.identifier_digest(&normalized))?,
-            Err(_) => None,
-        };
+        let account = engine.account_named(identifier)?;
         let target = account.unwrap_or(AccountId::from_bytes([0; 16]));
         let token = self.db.commit(|tx| {
-            tx.auth_of(self.engine.collection)
+            tx.auth_of(self.engine.collection())
                 .stage_single_use(purpose, target, ttl)
         })?;
         Ok(account.map(|_| token))
@@ -4583,7 +5175,7 @@ impl Auth<'_> {
     pub fn redeem(&self, token: impl AsRef<str>, purpose: Purpose) -> Result<Option<AccountId>> {
         let token = token.as_ref();
         self.db
-            .commit(|tx| tx.auth_of(self.engine.collection).redeem(token, purpose))
+            .commit(|tx| tx.auth_of(self.engine.collection()).redeem(token, purpose))
     }
 
     /// The account, or `None` when it does not exist: its standing (as
@@ -4595,12 +5187,15 @@ impl Auth<'_> {
     /// [`Error::Corrupt`] when the record fails its check, and storage
     /// errors.
     pub fn account(&self, account: AccountId) -> Result<Option<Account>> {
-        Ok(self.engine().load_account(account)?.map(|record| Account {
-            id: account,
-            created_at: time_of(record.created_ms),
-            standing: record.standing.at(now_ms()),
-            roles: record.roles,
-        }))
+        Ok(self
+            .engine()
+            .account_view(account, None)?
+            .map(|view| Account {
+                id: account,
+                created_at: time_of(view.created_ms),
+                standing: view.standing.at(now_ms()),
+                roles: view.roles,
+            }))
     }
 
     /// The account's roles; none when the account does not exist.
@@ -4611,8 +5206,8 @@ impl Auth<'_> {
     pub fn roles(&self, account: AccountId) -> Result<Vec<RoleId>> {
         Ok(self
             .engine()
-            .load_account(account)?
-            .map(|record| record.roles)
+            .account_view(account, None)?
+            .map(|view| view.roles)
             .unwrap_or_default())
     }
 
@@ -4625,19 +5220,19 @@ impl Auth<'_> {
     /// As [`account`](Self::account).
     pub fn allowed(&self, account: AccountId, permission: &str) -> Result<bool> {
         let roles = self.roles(account)?;
-        Ok(self.engine().policy().allows(&roles, permission))
+        Ok(self.engine().policy()?.allows(&roles, permission))
     }
 
     /// The role with id `role`, if defined.
     #[must_use]
     pub fn role(&self, role: RoleId) -> Option<Role> {
-        self.engine().policy().get(role).cloned()
+        self.engine().policy().ok()?.get(role).cloned()
     }
 
     /// The id of the role named `name`, if defined.
     #[must_use]
     pub fn role_named(&self, name: &str) -> Option<RoleId> {
-        self.engine().policy().named(name)
+        self.engine().policy().ok()?.named(name)
     }
 
     /// Define a role in its own commit. See [`AuthTx::define_role`].
@@ -4646,8 +5241,10 @@ impl Auth<'_> {
     ///
     /// As [`AuthTx::define_role`], plus the errors of [`Database::commit`].
     pub fn define_role(&self, role: Role) -> Result<RoleId> {
-        self.db
-            .commit(|tx| tx.auth_of(self.engine.collection).define_role(role.clone()))
+        self.db.commit(|tx| {
+            tx.auth_of(self.engine.collection())
+                .define_role(role.clone())
+        })
     }
 
     /// Replace an account's roles in its own commit. See
@@ -4658,7 +5255,7 @@ impl Auth<'_> {
     /// As [`AuthTx::assign_roles`], plus the errors of [`Database::commit`].
     pub fn assign_roles(&self, account: AccountId, roles: &[RoleId]) -> Result<()> {
         self.db.commit(|tx| {
-            tx.auth_of(self.engine.collection)
+            tx.auth_of(self.engine.collection())
                 .assign_roles(account, roles)
         })
     }
@@ -4671,7 +5268,7 @@ impl Auth<'_> {
     /// As [`AuthTx::set_password`], plus the errors of [`Database::commit`].
     pub fn set_password(&self, account: AccountId, password: &HashedPassword) -> Result<()> {
         self.db.commit(|tx| {
-            tx.auth_of(self.engine.collection)
+            tx.auth_of(self.engine.collection())
                 .set_password(account, password)
         })
     }
@@ -4685,7 +5282,7 @@ impl Auth<'_> {
     /// [`Database::commit`].
     pub fn add_identifier(&self, account: AccountId, identifier: &str) -> Result<()> {
         self.db.commit(|tx| {
-            tx.auth_of(self.engine.collection)
+            tx.auth_of(self.engine.collection())
                 .add_identifier(account, identifier)
         })
     }
@@ -4699,7 +5296,7 @@ impl Auth<'_> {
     /// [`Database::commit`].
     pub fn remove_identifier(&self, account: AccountId, identifier: &str) -> Result<bool> {
         self.db.commit(|tx| {
-            tx.auth_of(self.engine.collection)
+            tx.auth_of(self.engine.collection())
                 .remove_identifier(account, identifier)
         })
     }
@@ -4711,7 +5308,7 @@ impl Auth<'_> {
 /// by design: a session revoked after the snapshot is revoked here too.
 #[derive(Debug)]
 pub struct AuthRead<'r> {
-    pub(crate) engine: &'r AuthEngine,
+    pub(crate) engine: AuthRef<'r>,
     pub(crate) snapshot: &'r SnapshotGuard<'r>,
 }
 
@@ -4725,7 +5322,7 @@ impl AuthRead<'_> {
         if self.snapshot.expired() {
             return Err(Error::SnapshotTooOld);
         }
-        Ok(self.engine.validate(token.as_ref()))
+        self.engine.validate(token.as_ref())
     }
 
     /// The account's standing as of the snapshot, or `None` when the account
@@ -4741,8 +5338,8 @@ impl AuthRead<'_> {
         }
         Ok(self
             .engine
-            .load_account_at(account, self.snapshot.seq())?
-            .map(|record| record.standing.at(now_ms())))
+            .account_view(account, Some(self.snapshot.seq()))?
+            .map(|view| view.standing.at(now_ms())))
     }
 }
 
@@ -5070,7 +5667,10 @@ mod tests {
             let db = crate::open(&dir).unwrap();
             let pw = db.auth().hash_password("pw").unwrap();
             let ann = db.auth().create_account("ann@example.com", &pw).unwrap();
-            let engine = db.auth_engine();
+            #[allow(irrefutable_let_patterns)]
+            let AuthRef::Local(engine) = db.auth().engine else {
+                unreachable!("an embedded database")
+            };
             let key = account_key(engine.collection, ann);
             // The bytes the log and the store hold: under the data key.
             let sealed = engine.accounts.get(&key).unwrap().unwrap();

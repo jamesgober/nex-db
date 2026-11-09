@@ -11,7 +11,7 @@ use std::{
 };
 
 #[cfg(feature = "auth")]
-use crate::auth::{Auth, AuthEngine, AuthRead, AuthStaged, AuthTx};
+use crate::auth::{Auth, AuthEngine, AuthPart, AuthRead, AuthSlot, AuthTx, mode::AuthMode};
 #[cfg(feature = "content")]
 use crate::content::{Content, ContentEngine, ContentRead, ContentStaged, ContentTx};
 use crate::{
@@ -67,16 +67,25 @@ const MAX_EXTRA: usize = 15;
 struct Engines {
     #[cfg_attr(not(any(feature = "auth", feature = "content")), allow(dead_code))]
     dir: PathBuf,
+    /// The root key; `None` with split auth, where only the auth process
+    /// holds it.
     #[cfg(feature = "auth")]
-    root: keys::RootKey,
+    root: Option<keys::RootKey>,
     #[cfg(feature = "auth")]
     max_sessions: usize,
+    /// The channel to the auth process, with split auth.
+    #[cfg(feature = "split-auth")]
+    channel: Option<Arc<crate::auth::split::Channel>>,
+    /// Keeps an auth process of this database that is still ending from
+    /// writing the auth files under an embedded engine.
     #[cfg(feature = "auth")]
-    auth: AuthEngine,
+    _auth_lock: Option<fs::DirLock>,
+    #[cfg(feature = "auth")]
+    auth: AuthSlot,
     /// Named realms, in the order they were hosted. A slot is set once and
     /// never moves, so a reference to its engine stays valid.
     #[cfg(feature = "auth")]
-    realms: [std::sync::OnceLock<AuthEngine>; MAX_EXTRA],
+    realms: [std::sync::OnceLock<AuthSlot>; MAX_EXTRA],
     #[cfg(feature = "content")]
     content: ContentEngine,
     #[cfg(feature = "content")]
@@ -91,7 +100,7 @@ struct Engines {
 
 impl Engines {
     #[cfg(feature = "auth")]
-    fn realm(&self, collection: u32) -> Option<&AuthEngine> {
+    fn realm(&self, collection: u32) -> Option<&AuthSlot> {
         if collection == DEFAULT_REALM.id {
             return Some(&self.auth);
         }
@@ -113,6 +122,31 @@ impl Engines {
     }
 }
 
+/// The default realm's engine: opened here, or hosted by the auth process.
+#[cfg(feature = "auth")]
+fn open_default_realm(
+    auth_dir: &Path,
+    root: Option<&keys::RootKey>,
+    #[cfg(feature = "split-auth")] channel: Option<&Arc<crate::auth::split::Channel>>,
+    max_sessions: usize,
+) -> Result<AuthSlot> {
+    #[cfg(feature = "split-auth")]
+    if let Some(channel) = channel {
+        return Ok(AuthSlot::Remote(crate::auth::split::RemoteAuth::host(
+            channel,
+            DEFAULT_REALM.id,
+            &[],
+        )?));
+    }
+    let root = root.ok_or(Error::KeyUnavailable)?;
+    Ok(AuthSlot::Local(AuthEngine::open(
+        &auth_dir.join("accounts"),
+        root,
+        DEFAULT_REALM.id,
+        max_sessions,
+    )?))
+}
+
 /// Put `engine` in the first free slot.
 #[cfg(any(feature = "auth", feature = "content"))]
 fn place<T>(slots: &[std::sync::OnceLock<T>; MAX_EXTRA], engine: T) -> Result<()> {
@@ -131,7 +165,7 @@ impl Registry for Engines {
         let _ = collection;
         match id {
             #[cfg(feature = "auth")]
-            EngineId::AUTH => self.realm(collection).map(|e| e as &dyn Engine),
+            EngineId::AUTH => self.realm(collection).map(AuthSlot::engine),
             #[cfg(feature = "content")]
             EngineId::CONTENT => self.space(collection).map(|e| e as &dyn Engine),
             _ => None,
@@ -146,6 +180,16 @@ impl Registry for Engines {
                 if let Some(engine) = self.realm(collection.id) {
                     return engine.adopt(&collection.definition);
                 }
+                #[cfg(feature = "split-auth")]
+                if let Some(channel) = &self.channel {
+                    let remote = crate::auth::split::RemoteAuth::host(
+                        channel,
+                        collection.id,
+                        &collection.definition,
+                    )?;
+                    return place(&self.realms, AuthSlot::Remote(remote));
+                }
+                let root = self.root.as_ref().ok_or(Error::KeyUnavailable)?;
                 let dir = self.dir.join("auth").join("realms");
                 fs::create_dir(&dir)?;
                 let dir = dir.join(collection.id.to_string());
@@ -154,12 +198,12 @@ impl Registry for Engines {
                 label.extend_from_slice(&collection.id.to_be_bytes());
                 let engine = AuthEngine::open(
                     &dir.join("accounts"),
-                    &self.root.sub(&label),
+                    &root.sub(&label),
                     collection.id,
                     self.max_sessions,
                 )?;
                 engine.adopt(&collection.definition)?;
-                place(&self.realms, engine)
+                place(&self.realms, AuthSlot::Local(engine))
             }
             #[cfg(feature = "content")]
             EngineId::CONTENT => {
@@ -182,9 +226,9 @@ impl Registry for Engines {
     fn each(&self, f: &mut dyn FnMut(&dyn Engine)) {
         #[cfg(feature = "auth")]
         {
-            f(&self.auth);
+            f(self.auth.engine());
             for engine in self.realms.iter().filter_map(std::sync::OnceLock::get) {
-                f(engine);
+                f(engine.engine());
             }
         }
         #[cfg(feature = "content")]
@@ -195,6 +239,16 @@ impl Registry for Engines {
             }
         }
         let _ = f;
+    }
+
+    #[cfg(feature = "split-auth")]
+    fn failed(&self) -> Option<Error> {
+        self.channel.as_ref().and_then(|c| c.failure())
+    }
+
+    #[cfg(feature = "split-auth")]
+    fn copies_root_key(&self) -> bool {
+        self.channel.is_none()
     }
 }
 
@@ -251,10 +305,22 @@ pub struct Builder {
     checkpoint_every: u64,
     #[cfg_attr(not(feature = "auth"), allow(dead_code))]
     max_sessions: usize,
+    #[cfg(feature = "auth")]
+    auth: AuthMode,
     observers: Observers,
 }
 
 impl Builder {
+    /// Where the auth engine runs: [`AuthMode::embedded`] (the default), or
+    /// with the `split-auth` feature
+    /// `AuthMode::separate_process`.
+    #[cfg(feature = "auth")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "auth")))]
+    pub fn auth(mut self, mode: AuthMode) -> Self {
+        self.auth = mode;
+        self
+    }
+
     /// Where the root key comes from. The default is a key file inside the
     /// database directory; see [`Keys`].
     pub fn keys(mut self, keys: Keys) -> Self {
@@ -358,6 +424,8 @@ impl Database {
             keys: Keys::default(),
             checkpoint_every: CHECKPOINT_EVERY,
             max_sessions: DEFAULT_MAX_SESSIONS,
+            #[cfg(feature = "auth")]
+            auth: AuthMode::default(),
             observers: Observers::default(),
         }
     }
@@ -368,24 +436,53 @@ impl Database {
         let dir = core.dir().to_path_buf();
         let auth_dir = dir.join("auth");
         fs::create_dir(&auth_dir)?;
+        #[cfg(feature = "split-auth")]
+        let channel = match &builder.auth.0 {
+            crate::auth::mode::Mode::Separate(program) => Some(crate::auth::split::start(
+                program.as_deref(),
+                &dir,
+                &builder.keys,
+                new_database,
+                builder.max_sessions,
+            )?),
+            crate::auth::mode::Mode::Embedded => None,
+        };
+        #[cfg(not(feature = "split-auth"))]
+        let channel: Option<()> = None;
         // A build without the auth engine still checks the key, so the
-        // database never opens under the wrong one.
+        // database never opens under the wrong one. With split auth only
+        // the auth process reads it.
         #[cfg_attr(not(feature = "auth"), allow(unused_variables))]
-        let root = keys::root_key(&builder.keys, &auth_dir, new_database)?;
+        let root = match &channel {
+            Some(_) => None,
+            None => Some(keys::root_key(&builder.keys, &auth_dir, new_database)?),
+        };
+        #[cfg(feature = "auth")]
+        let auth_lock = match &root {
+            Some(_) => Some(crate::auth::lock_auth(&auth_dir)?),
+            None => None,
+        };
+        #[cfg(feature = "auth")]
+        let auth = open_default_realm(
+            &auth_dir,
+            root.as_ref(),
+            #[cfg(feature = "split-auth")]
+            channel.as_ref(),
+            builder.max_sessions,
+        )?;
 
         #[cfg(feature = "content")]
         let wake = Arc::new(crate::content::schedule::Wake::default());
         let engines = Engines {
             dir: dir.clone(),
             #[cfg(feature = "auth")]
-            auth: AuthEngine::open(
-                &auth_dir.join("accounts"),
-                &root,
-                DEFAULT_REALM.id,
-                builder.max_sessions,
-            )?,
+            auth,
+            #[cfg(feature = "auth")]
+            _auth_lock: auth_lock,
             #[cfg(feature = "auth")]
             root,
+            #[cfg(feature = "split-auth")]
+            channel,
             #[cfg(feature = "auth")]
             max_sessions: builder.max_sessions,
             #[cfg(feature = "auth")]
@@ -504,7 +601,7 @@ impl Database {
     /// failed write, until the process restarts.
     #[must_use]
     pub fn health(&self) -> Health {
-        if self.inner.core.halted() {
+        if self.inner.core.halted() || self.inner.engines.failed().is_some() {
             Health::ReadOnly {
                 reason: "a write could not be made durable; restart to recover",
             }
@@ -559,8 +656,16 @@ impl Database {
     pub fn auth(&self) -> Auth<'_> {
         Auth {
             db: self,
-            engine: &self.inner.engines.auth,
+            engine: self.inner.engines.auth.get(),
         }
+    }
+
+    /// The auth process's id, with split auth.
+    #[cfg(feature = "split-auth")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn auth_process_id(&self) -> Option<u32> {
+        self.inner.engines.channel.as_ref().map(|c| c.pid())
     }
 
     /// The content engine: entities and routes.
@@ -574,19 +679,15 @@ impl Database {
         }
     }
 
-    #[cfg(feature = "auth")]
-    pub(crate) fn auth_engine(&self) -> &AuthEngine {
-        &self.inner.engines.auth
-    }
-
     /// The engine of realm `collection`; the default realm's when there is
     /// none (callers pass ids of realms they found).
     #[cfg(feature = "auth")]
-    pub(crate) fn realm_engine(&self, collection: u32) -> &AuthEngine {
+    pub(crate) fn realm_engine(&self, collection: u32) -> crate::auth::AuthRef<'_> {
         self.inner
             .engines
             .realm(collection)
             .unwrap_or(&self.inner.engines.auth)
+            .get()
     }
 
     /// The engine of space `collection`; the default space's when there is
@@ -704,7 +805,10 @@ impl Database {
             .filter(|c| c.engine == EngineId::AUTH)
             .and_then(|c| self.inner.engines.realm(c.id))
             .ok_or_else(|| Error::invalid("realm", "no such realm"))?;
-        Ok(Auth { db: self, engine })
+        Ok(Auth {
+            db: self,
+            engine: engine.get(),
+        })
     }
 
     /// Define a space named `name`: content of its own (entities, routes,
@@ -972,7 +1076,7 @@ impl Read<'_> {
     #[must_use]
     pub fn auth(&self) -> AuthRead<'_> {
         AuthRead {
-            engine: self.db.auth_engine(),
+            engine: self.db.inner.engines.auth.get(),
             snapshot: &self.snapshot,
         }
     }
@@ -1025,7 +1129,7 @@ pub struct Transaction<'db> {
     serializable: bool,
     /// One part per realm touched.
     #[cfg(feature = "auth")]
-    auth: Vec<AuthStaged<'db>>,
+    auth: Vec<AuthPart<'db>>,
     /// One part per space touched.
     #[cfg(feature = "content")]
     content: Vec<ContentStaged<'db>>,
@@ -1082,13 +1186,12 @@ impl<'db> Transaction<'db> {
         {
             Some(at) => at,
             None => {
-                self.auth
-                    .push(AuthStaged::new(engine).serializable(self.serializable));
+                self.auth.push(AuthPart::new(engine, self.serializable));
                 self.auth.len() - 1
             }
         };
         AuthTx {
-            staged: &mut self.auth[at],
+            part: &mut self.auth[at],
         }
     }
 
@@ -1138,7 +1241,7 @@ impl<'db> Transaction<'db> {
         let mut staged: Vec<&dyn Staged> = Vec::new();
         #[cfg(feature = "auth")]
         for work in &self.auth {
-            staged.push(work);
+            staged.push(work.staged());
         }
         #[cfg(feature = "content")]
         for work in &self.content {

@@ -15,6 +15,8 @@ All notable changes to `nex-db` are documented in this file. The format is based
 - Backups and point-in-time restore: `Database::backup`, `restore`, `BackupInfo`, and `RestorePoint`. Later backups into the same directory add the commits since; revocations after the restore point are applied again.
 - Per-account data keys and `erase_account`: an account's private records are sealed under its own key, kept in `auth/account-keys` and never in the log; erasing the account removes its records and destroys the key. `RevokeReason::Erased` and `Change::AccountErased`.
 - Search: `Type::searchable`, `Content::search`, `Search`, `Hit`, and `Hits`: every word of a query in a published body of one locale, ranked by BM25 over weighted fields; English locales stem and skip common words.
+- Split auth, feature `split-auth`: `Builder::auth`, `AuthMode` (`embedded`, `separate_process`, `separate_process_program`), and `serve_auth_process`. The auth engines run in a process of their own, started from the application's program and reached over its standard input and output; the application process holds no auth key, session, or password hash, and the auth parts of the one commit log stay sealed. The same calls work in both modes, and a database opens in either.
+- `auth/LOCK`: the auth files are locked by the process that opens them.
 
 ### Changed
 

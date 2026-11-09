@@ -68,6 +68,7 @@
 //! |---|---|---|
 //! | `auth` | yes | the auth engine |
 //! | `content` | yes | the content engine |
+//! | `split-auth` | no | the auth engine in a process of its own (`AuthMode::separate_process`) |
 //!
 //! ## Status
 //!
@@ -113,11 +114,15 @@ mod observe;
 mod table;
 mod wheel;
 
+#[cfg(feature = "split-auth")]
+#[cfg_attr(docsrs, doc(cfg(feature = "split-auth")))]
+pub use crate::auth::split::serve_auth_process;
 #[cfg(feature = "auth")]
 #[cfg_attr(docsrs, doc(cfg(feature = "auth")))]
 pub use crate::auth::{
     Auth, AuthRead, AuthTx,
     keys::{ApiKey, ApiKeyCheck, ApiKeyId},
+    mode::AuthMode,
     realm::RealmPolicy,
     recovery::RecoveryCodes,
     roles::{Account, Role, RoleId},
@@ -149,6 +154,9 @@ pub use crate::content::{
     search::{Hit, Hits, Search},
     types::{FieldType, Rule, Type},
 };
+#[cfg(feature = "split-auth")]
+#[doc(hidden)]
+pub use crate::core::keys::root_keys_loaded;
 pub use crate::{
     backup::{BackupInfo, RestorePoint, restore},
     core::keys::Keys,

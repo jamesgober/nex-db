@@ -67,6 +67,14 @@ impl Token {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// A token the auth process issued, when `text` is a token this version
+    /// issues.
+    #[cfg(feature = "split-auth")]
+    pub(crate) fn from_text(text: String) -> Option<Token> {
+        let token = Token(text);
+        parse(token.as_str()).map(|_| token)
+    }
 }
 
 impl AsRef<str> for Token {

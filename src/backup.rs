@@ -230,7 +230,7 @@ fn encode_pair(key: &[u8], value: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Writes the base of a first backup, or the key files of a later one.
-struct Sink<'a> {
+pub(crate) struct Sink<'a> {
     root: &'a Path,
     base: PathBuf,
     items: Vec<(u8, String)>,
@@ -238,7 +238,42 @@ struct Sink<'a> {
     keys_only: bool,
 }
 
+#[cfg(feature = "split-auth")]
+impl<'a> Sink<'a> {
+    /// A sink for the auth process, which writes its engines' files into
+    /// the backup the application takes.
+    pub(crate) fn new(root: &'a Path, base: PathBuf, keys_only: bool) -> Self {
+        Sink {
+            root,
+            base,
+            items: Vec::new(),
+            keys_only,
+        }
+    }
+
+    /// What it wrote, for the application's manifest.
+    pub(crate) fn into_items(self) -> Vec<(u8, String)> {
+        self.items
+    }
+}
+
 impl BackupSink for Sink<'_> {
+    fn target(&self) -> (&Path, &Path, bool) {
+        (self.root, &self.base, self.keys_only)
+    }
+
+    fn merge(&mut self, items: Vec<(u8, String)>) -> Result<()> {
+        for (kind, rel) in items {
+            if !matches!(kind, ITEM_FILE | ITEM_STORE | ITEM_KEYS) {
+                return Err(Error::corrupt("a backup item from the auth process", 0));
+            }
+            if !self.items.iter().any(|(_, r)| *r == rel) {
+                self.items.push((kind, rel));
+            }
+        }
+        Ok(())
+    }
+
     fn file(&mut self, path: &Path) -> Result<()> {
         if self.keys_only || !path.exists() {
             return Ok(());
@@ -337,7 +372,9 @@ pub(crate) fn backup(
             sink.file(&key_check)?;
             let key = root.join("auth").join(crate::core::keys::KEY_FILE);
             let holds_key = key.exists();
-            sink.file(&key)?;
+            if engines.copies_root_key() {
+                sink.file(&key)?;
+            }
             let mut failed = None;
             engines.each(&mut |engine| {
                 if failed.is_none() {

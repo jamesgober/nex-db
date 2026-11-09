@@ -83,6 +83,7 @@
 ## 0.5.0 Feature complete
 
 - Split auth (FR-11), per-account keys and erasure (FR-12), search (FR-13), backup and restore (FR-14).
+  - [x] Search: per-locale text index, BM25 over weighted fields, English stemming (`PLAN.md` D-100).
 - From 0.4: sticky entities, `get_many`, outdated translations, `stream`, `add_redirect` and `remove_route`.
   - [x] Sticky entities and `sticky_first` (`PLAN.md` D-097).
   - [x] `Listing::outdated` (D-098); `add_redirect`, `remove_route`, `get_many`, `stream` (D-099).

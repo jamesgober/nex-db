@@ -19,10 +19,14 @@ use crate::{
     ids::Rid,
 };
 
-/// Format of the stored types: 2 adds the taxonomy of each terms field.
-const TYPES_FORMAT: u8 = 2;
-/// The format before, read only.
+/// Format of the stored types: 2 adds the taxonomy of each terms field, 3
+/// the searchable fields and their weights.
+const TYPES_FORMAT: u8 = 3;
+/// The formats before, read only.
 const TYPES_FORMAT_1: u8 = 1;
+const TYPES_FORMAT_2: u8 = 2;
+/// The highest weight of a searchable field.
+const MAX_WEIGHT: u8 = 10;
 /// Most types a space declares.
 const MAX_TYPES: usize = 256;
 /// Most fields a type declares.
@@ -151,6 +155,8 @@ pub struct Type {
     pub(crate) fields: Vec<(String, FieldType, u8)>,
     /// Each terms field and the taxonomy (a type) its terms are of.
     pub(crate) taxonomies: Vec<(String, String)>,
+    /// Each searchable field and its weight.
+    pub(crate) search: Vec<(String, u8)>,
 }
 
 impl Type {
@@ -161,7 +167,38 @@ impl Type {
             singleton: false,
             fields: Vec::new(),
             taxonomies: Vec::new(),
+            search: Vec::new(),
         }
+    }
+
+    /// The field declared last (a [`FieldType::Text`] or
+    /// [`FieldType::List`] of texts) is part of the text index
+    /// ([`Content::search`](crate::Content::search)) with `weight`, 1 to
+    /// 10: a word in a field of weight 3 counts three times. A
+    /// redefinition may change a weight, and the index follows.
+    ///
+    /// ```
+    /// use nex_db::{FieldType, Type};
+    /// let post = Type::new("post")
+    ///     .field("title", FieldType::Text)
+    ///     .searchable(3)
+    ///     .field("body", FieldType::Text)
+    ///     .searchable(1);
+    /// assert_eq!(post.weight("title"), Some(3));
+    /// ```
+    pub fn searchable(mut self, weight: u8) -> Type {
+        if let Some((name, _, _)) = self.fields.last() {
+            let name = name.clone();
+            self.search.retain(|(n, _)| *n != name);
+            self.search.push((name, weight.clamp(1, MAX_WEIGHT)));
+        }
+        self
+    }
+
+    /// The weight of searchable field `name`, if it is one.
+    #[must_use]
+    pub fn weight(&self, name: &str) -> Option<u8> {
+        self.search.iter().find(|(n, _)| n == name).map(|(_, w)| *w)
     }
 
     /// Declare field `name` as a list of terms of `taxonomy`: references
@@ -286,6 +323,18 @@ impl Types {
                 return Err(Error::invalid("type", "a list field cannot be unique"));
             }
         }
+        for (name, _) in &next.search {
+            let text = next
+                .fields
+                .iter()
+                .any(|(n, k, _)| n == name && matches!(k, FieldType::Text | FieldType::List));
+            if !text {
+                return Err(Error::invalid(
+                    "type",
+                    "a searchable field holds text or a list",
+                ));
+            }
+        }
         if let Some(old) = self.get(&next.name) {
             // A reference rule may change; a unique flag stays.
             for (name, kind, flags) in &old.fields {
@@ -350,6 +399,31 @@ impl Types {
         Ok(())
     }
 
+    /// The searchable fields of type `kind` and their weights.
+    pub(crate) fn searchable(&self, kind: &str) -> &[(String, u8)] {
+        self.get(kind).map_or(&[][..], |t| t.search.as_slice())
+    }
+
+    /// True when the searchable fields or weights of any type differ
+    /// between these types and `next`.
+    pub(crate) fn search_differs(&self, next: &Types) -> bool {
+        let of = |types: &Types| -> Vec<(String, Vec<(String, u8)>)> {
+            let mut all: Vec<_> = types
+                .types
+                .iter()
+                .filter(|t| !t.search.is_empty())
+                .map(|t| {
+                    let mut fields = t.search.clone();
+                    fields.sort();
+                    (t.name.clone(), fields)
+                })
+                .collect();
+            all.sort();
+            all
+        };
+        of(self) != of(next)
+    }
+
     /// True when type `kind` declares a unique field.
     pub(crate) fn has_unique(&self, kind: &str) -> bool {
         self.get(kind)
@@ -390,6 +464,11 @@ impl Types {
                 w.str16(name)?;
                 w.str16(taxonomy)?;
             }
+            w.u16(ty.search.len() as u16);
+            for (name, weight) in &ty.search {
+                w.str16(name)?;
+                w.u8(*weight);
+            }
         }
         Ok(out)
     }
@@ -397,7 +476,7 @@ impl Types {
     pub(crate) fn decode(bytes: &[u8], at: u64) -> Result<Types> {
         let mut r = Reader::new(bytes, "the content types", at);
         let format = r.u8()?;
-        if format != TYPES_FORMAT && format != TYPES_FORMAT_1 {
+        if !matches!(format, TYPES_FORMAT | TYPES_FORMAT_1 | TYPES_FORMAT_2) {
             return Err(Error::corrupt("the content types format", at));
         }
         let mut types = Vec::new();
@@ -418,10 +497,21 @@ impl Types {
                 fields.push((field, kind, flags));
             }
             let mut taxonomies = Vec::new();
-            if format == TYPES_FORMAT {
+            if format != TYPES_FORMAT_1 {
                 for _ in 0..r.u16()? {
                     let field = r.str16()?.to_owned();
                     taxonomies.push((field, r.str16()?.to_owned()));
+                }
+            }
+            let mut search = Vec::new();
+            if format == TYPES_FORMAT {
+                for _ in 0..r.u16()? {
+                    let field = r.str16()?.to_owned();
+                    let weight = r.u8()?;
+                    if !(1..=MAX_WEIGHT).contains(&weight) {
+                        return Err(Error::corrupt("a field's weight", at));
+                    }
+                    search.push((field, weight));
                 }
             }
             types.push(Type {
@@ -429,6 +519,7 @@ impl Types {
                 singleton,
                 fields,
                 taxonomies,
+                search,
             });
         }
         r.finish()?;

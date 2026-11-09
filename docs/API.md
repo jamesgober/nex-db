@@ -587,8 +587,10 @@ second published entity with the same value is
 reads the rule back; a redefinition may change a rule). The other
 declarations arrive with what gives them meaning: `Float`, `Time`, and
 `Blob` with their values, `.indexed`
-with filtered listings, `.translatable` with shared fields, `.searchable`
-with search (0.5), `.revisions` with revision pruning.
+with filtered listings, `.translatable` with shared fields, and `.revisions`
+with revision pruning. `.searchable(weight)` (0.5) puts the field declared
+last, a text or a list, in the text index with a weight of 1 to 10;
+`Type::weight(name)` reads it back, and a redefinition may change it.
 
 ### Drafts, revisions, and publishing (0.4)
 
@@ -803,8 +805,18 @@ or not.
 | `children(rid) -> Vec<Rid>`, `ancestors(rid) -> Result<Vec<Rid>>` | 0.4 | P1 |
 | `referenced_by(rid) -> Result<Vec<Rid>>` | 0.4 | P1 |
 | `stream(Listing) -> Stream`, an iterator of `Result<Entry>` reading page by page, for sitemaps and feeds | 0.5 | P1 |
-| `search(locale, query) -> Result<Page<Hit>>` | 0.5 | P1 |
+| `search(locale, &Search) -> Result<Hits>` | 0.5 | P1 |
 | `related(rid, limit)` | 0.5 | P2 |
+
+`search` finds the published entities of a locale holding every word of the
+query in a field their type declares `.searchable(weight)` (text, or a list of
+texts), ranked by BM25 over the weighted fields. Words are runs of letters and
+digits without case; each CJK ideograph is a word. English locales (`en`,
+`en-*`) also match word forms (Porter stemming) and skip common words; other
+locales match words as they are. `Search::new(text)` (at most 1,024 bytes and
+16 words) with `.kind(k)`, `.site(s)`, `.term(t)`, `.limit(n)` (1 to 1,000,
+default 10), and `.offset(n)`; `Hits` gives `items()` (each `Hit` has `rid()`
+and `score()`) and `total()`. Read the entries with `get_many`.
 
 Listings return pages of at most 1,000 (default 100) with an opaque `Cursor`;
 its text form (`to_string()`, `Cursor::parse`) can travel in a URL.

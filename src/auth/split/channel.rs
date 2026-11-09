@@ -226,7 +226,12 @@ impl Channel {
         op: u16,
         f: impl FnOnce(&mut Writer<'_>) -> Result<()>,
     ) -> Result<Reply> {
-        self.exchange(op, f, REQUEST_WAIT, "it did not answer in two minutes, and was ended")
+        self.exchange(
+            op,
+            f,
+            REQUEST_WAIT,
+            "it did not answer in two minutes, and was ended",
+        )
     }
 
     fn exchange(

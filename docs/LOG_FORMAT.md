@@ -70,8 +70,9 @@ Format 1 has no time field: its sections start at offset 30. Both read.
   section for each of its collections the commit touched (0.4: realms and
   spaces besides the defaults). Records written before 0.4 hold one section
   per engine.
-- **time** is the system clock when the commit was numbered. It orders
-  nothing; a restore to a time uses it (see `docs/API.md`).
+- **time** is the system clock when the commit was numbered, or the time of
+  the record before when the clock reads earlier, so times never go back. It
+  orders nothing; a restore to a time uses it (see `docs/API.md`).
 - No bytes follow the last section.
 
 ### Kinds

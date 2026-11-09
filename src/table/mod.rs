@@ -60,7 +60,7 @@ const HI: u64 = 0x8080_8080_8080_8080;
 #[cfg(not(all(nex_loom, test)))]
 const FIRST_CHUNK: usize = 64;
 #[cfg(not(all(nex_loom, test)))]
-const LAST_CHUNK: usize = 8192;
+const LAST_CHUNK: usize = 1024;
 #[cfg(all(nex_loom, test))]
 const FIRST_CHUNK: usize = 2;
 #[cfg(all(nex_loom, test))]

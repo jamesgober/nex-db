@@ -68,6 +68,66 @@ fn get_hit(c: &mut Criterion) {
             });
         });
         group.finish();
+        // The comparison: the standard map behind a read-write lock, the
+        // same keys and values.
+        let mut map = std::collections::HashMap::with_capacity(n as usize);
+        for i in 0..n {
+            let _ = map.insert(key(i), [i; 14]);
+        }
+        let map = std::sync::RwLock::new(map);
+        let mut group = c.benchmark_group("table/std_hashmap_rwlock_hit");
+        let _ = group.bench_function(format!("{n}"), |b| {
+            b.iter(|| {
+                i = (i + 7_919) % keys.len();
+                let map = map.read().unwrap();
+                black_box(map.get(black_box(&keys[i])).copied())
+            });
+        });
+        group.finish();
+        // Eight threads reading at once, 10,000 reads each per iteration:
+        // the table's readers write nothing shared, the lock's readers all
+        // write its count.
+        const THREADS: usize = 8;
+        const READS: usize = 10_000;
+        let mut group = c.benchmark_group("table/get_hit_8_threads");
+        let _ = group.throughput(criterion::Throughput::Elements((THREADS * READS) as u64));
+        let _ = group.bench_function(format!("{n}"), |b| {
+            b.iter(|| {
+                std::thread::scope(|s| {
+                    for t in 0..THREADS {
+                        let (table, keys) = (&table, &keys);
+                        s.spawn(move || {
+                            let mut j = t * 104_729;
+                            for _ in 0..READS {
+                                j = (j + 7_919) % keys.len();
+                                black_box(table.get(&keys[j]));
+                            }
+                        });
+                    }
+                });
+            });
+        });
+        group.finish();
+        let mut group = c.benchmark_group("table/std_hashmap_rwlock_hit_8_threads");
+        let _ = group.throughput(criterion::Throughput::Elements((THREADS * READS) as u64));
+        let _ = group.bench_function(format!("{n}"), |b| {
+            b.iter(|| {
+                std::thread::scope(|s| {
+                    for t in 0..THREADS {
+                        let (map, keys) = (&map, &keys);
+                        s.spawn(move || {
+                            let mut j = t * 104_729;
+                            for _ in 0..READS {
+                                j = (j + 7_919) % keys.len();
+                                let map = map.read().unwrap();
+                                black_box(map.get(&keys[j]).copied());
+                            }
+                        });
+                    }
+                });
+            });
+        });
+        group.finish();
     }
 }
 

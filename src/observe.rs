@@ -72,6 +72,10 @@ pub enum SecurityEvent {
     SignInBlocked,
     /// A revoked session's token was presented again.
     RevokedSessionPresented,
+    /// A canary path was resolved ([`ContentTx::add_canary`](crate::ContentTx::add_canary)):
+    /// most likely a scanner. The path is the one the application just
+    /// resolved on this thread.
+    CanaryRequested,
 }
 
 /// Receives commits, errors, and security events. Every method has an

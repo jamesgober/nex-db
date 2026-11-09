@@ -787,7 +787,8 @@ redirects again is shortened, so a chain is never followed.
 |---|---|---|
 | `resolve(site, path) -> Result<Option<RouteEntry>>` | P0 | 0.1 |
 | `set_path(rid, path)`, `set_path_in(rid, locale, path)` (tx) | P0 | the old path redirects with 301 |
-| `add_redirect(site, from, to: Rid, status) -> Result<()>` (tx), `remove_route(site, path) -> Result<bool>` (tx) | P1 | 0.5; a redirect to an entity, never over a page; it stays when its target is deleted; `remove_route` takes away a redirect or gone marker, not a page. Redirects to other sites are the application's |
+| `add_redirect(site, from, to: Rid, status) -> Result<()>` (tx), `remove_route(site, path) -> Result<bool>` (tx) | P1 | 0.5; a redirect to an entity, never over a page; it stays when its target is deleted; `remove_route` takes away a redirect, gone marker, or canary, not a page. Redirects to other sites are the application's |
+| `add_canary(site, path) -> Result<()>` (tx) | defence | 0.6; a path nothing is served at: `resolve` answers `None` for it, as for any unknown path, and raises `SecurityEvent::CanaryRequested`; never over a page; a page published there later takes it over |
 | `routes(rid) -> Result<Vec<(String, String)>>` | P2 | every path of an entity |
 | `resolve_draft(site, path) -> Result<Option<RouteEntry>>` | P2 | 0.6; drafts at their real paths, for previews |
 
@@ -930,8 +931,9 @@ Security events (repeated failures, a lock-out, a revoked session presented
 again) always reach the observer, with ids and kinds only, never an
 identifier; nex-db never keeps one to itself. `SecurityEvent`
 (non-exhaustive): `SignInFailed { account: Option<AccountId> }` (`None` for an
-identifier no account has), `LockedOut { account }`, `SignInBlocked`, and
-`RevokedSessionPresented`. Observers run on the calling thread, so they hand
+identifier no account has), `LockedOut { account }`, `SignInBlocked`,
+`RevokedSessionPresented`, and `CanaryRequested` (a canary path was resolved;
+the path is the one the application resolved on that thread). Observers run on the calling thread, so they hand
 slow work to another thread. `Recovering` is not seen through this API in
 0.4, since `open` returns once recovery is done; it is for split auth.
 

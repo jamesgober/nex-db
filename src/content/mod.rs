@@ -636,6 +636,17 @@ fn published_body(
     }
 }
 
+/// `route` as a reader gets it: `None`, and an event, for a canary.
+fn served(observers: &crate::observe::Observers, route: Option<RouteEntry>) -> Option<RouteEntry> {
+    match route {
+        Some(route) if route.canary => {
+            observers.security(crate::SecurityEvent::CanaryRequested);
+            None
+        }
+        route => route,
+    }
+}
+
 /// The page route of `head` in `locale` at `revision`.
 fn page(head: &Head, locale: Locale, revision: u32) -> RouteEntry {
     RouteEntry {
@@ -644,6 +655,7 @@ fn page(head: &Head, locale: Locale, revision: u32) -> RouteEntry {
         kind: RouteKind::Page,
         visibility: head.visibility,
         locale,
+        canary: false,
     }
 }
 
@@ -1440,6 +1452,7 @@ impl ContentTx<'_, '_> {
                 },
                 visibility: head.visibility,
                 locale,
+                canary: false,
             };
             self.put_route(&head.site, old, Some(moved));
         }
@@ -1846,6 +1859,7 @@ impl ContentTx<'_, '_> {
                 kind: RouteKind::Gone,
                 visibility: head.visibility,
                 locale: *locale,
+                canary: false,
             };
             self.put_route(&site, path, Some(entry));
         }
@@ -2138,13 +2152,49 @@ impl ContentTx<'_, '_> {
             kind: RouteKind::Redirect { to, status },
             visibility: target.visibility,
             locale: target.base().locale,
+            canary: false,
         };
         self.put_route(site, from, Some(entry));
         Ok(())
     }
 
-    /// Remove the redirect or gone marker at `path` on `site`, so the path
-    /// resolves to nothing. Returns `false` when there is none.
+    /// Make `path` on `site` a canary: a path nothing is served at, which
+    /// only a scanner or someone guessing would request (an old admin
+    /// path, a backup file name). [`Content::resolve`](crate::Content::resolve)
+    /// answers `None` for it, as for any unknown path, and raises
+    /// [`SecurityEvent::CanaryRequested`](crate::SecurityEvent::CanaryRequested)
+    /// on the observer, on the thread that resolved it. Remove it with
+    /// [`remove_route`](Self::remove_route); a page published at the path
+    /// later takes it over.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Invalid`] when `site` or `path` is not valid.
+    /// - [`Error::AlreadyExists`] when an entity is served at `path`.
+    pub fn add_canary(&mut self, site: &str, path: &str) -> Result<()> {
+        entity::check_site(site)?;
+        entity::check_path(path)?;
+        if let Some(RouteEntry {
+            kind: RouteKind::Page,
+            ..
+        }) = self.route(site, path)
+        {
+            return Err(Error::AlreadyExists { what: "path" });
+        }
+        let entry = RouteEntry {
+            entity: Rid::from_bytes([0; 16]),
+            revision: 0,
+            kind: RouteKind::Gone,
+            visibility: Visibility::Public,
+            locale: self.staged.engine.default_locale(),
+            canary: true,
+        };
+        self.put_route(site, path, Some(entry));
+        Ok(())
+    }
+
+    /// Remove the redirect, gone marker, or canary at `path` on `site`, so
+    /// the path resolves to nothing. Returns `false` when there is none.
     ///
     /// # Errors
     ///
@@ -2473,7 +2523,10 @@ impl Content<'_> {
     /// None in this version; the `Result` leaves room for routes that are
     /// not held in memory.
     pub fn resolve(&self, site: &str, path: &str) -> Result<Option<RouteEntry>> {
-        Ok(self.engine().routes.get(site, path))
+        Ok(served(
+            self.db.observers(),
+            self.engine().routes.get(site, path),
+        ))
     }
 
     /// The first page of `listing`: published entities only, read from an
@@ -2631,6 +2684,18 @@ impl Content<'_> {
             tx.content_of(self.engine.collection)
                 .add_redirect(site, from, to, status)
         })
+    }
+
+    /// Make `path` on `site` a canary in its own commit. See
+    /// [`ContentTx::add_canary`].
+    ///
+    /// # Errors
+    ///
+    /// As [`ContentTx::add_canary`], plus the errors of
+    /// [`Database::commit`].
+    pub fn add_canary(&self, site: &str, path: &str) -> Result<()> {
+        self.db
+            .commit(|tx| tx.content_of(self.engine.collection).add_canary(site, path))
     }
 
     /// Remove a redirect or gone marker in its own commit. See
@@ -2914,6 +2979,7 @@ impl Iterator for Stream<'_> {
 pub struct ContentRead<'r> {
     pub(crate) engine: &'r ContentEngine,
     pub(crate) snapshot: &'r SnapshotGuard<'r>,
+    pub(crate) observers: &'r crate::observe::Observers,
 }
 
 impl ContentRead<'_> {
@@ -2962,7 +3028,10 @@ impl ContentRead<'_> {
     /// [`Error::SnapshotTooOld`] past the snapshot age limit.
     pub fn resolve(&self, site: &str, path: &str) -> Result<Option<RouteEntry>> {
         let at = self.at()?;
-        Ok(self.engine.routes.get_at(site, path, at))
+        Ok(served(
+            self.observers,
+            self.engine.routes.get_at(site, path, at),
+        ))
     }
 }
 

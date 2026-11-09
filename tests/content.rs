@@ -1608,3 +1608,94 @@ fn test_search_ranks_published_bodies_per_locale() {
             .is_err()
     );
 }
+
+#[test]
+fn test_a_canary_resolves_to_nothing_and_raises_an_event() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    };
+    struct Count(Arc<AtomicU32>);
+    impl nex_db::Observer for Count {
+        fn on_security_event(&self, event: &nex_db::SecurityEvent) {
+            if *event == nex_db::SecurityEvent::CanaryRequested {
+                let _ = self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    let dir = TempDir::new("canary");
+    let hits = Arc::new(AtomicU32::new(0));
+    let db = Database::builder(&dir.0)
+        .observer(Count(Arc::clone(&hits)))
+        .open()
+        .unwrap();
+    let rid = db
+        .content()
+        .create(Entity::new("page").path("/real"))
+        .unwrap();
+    let _ = db.content().publish(rid).unwrap();
+    // A path an entity is served at cannot be a canary.
+    assert!(matches!(
+        db.content().add_canary(DEFAULT_SITE, "/real"),
+        Err(Error::AlreadyExists { .. })
+    ));
+    db.content().add_canary(DEFAULT_SITE, "/wp-admin").unwrap();
+    assert!(
+        db.content()
+            .resolve(DEFAULT_SITE, "/wp-admin")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        db.content()
+            .resolve(DEFAULT_SITE, "/unknown")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(hits.load(Ordering::Relaxed), 1);
+    // A snapshot read raises it too.
+    let seen = db
+        .read(|r| r.content().resolve(DEFAULT_SITE, "/wp-admin"))
+        .unwrap();
+    assert!(seen.is_none());
+    assert_eq!(hits.load(Ordering::Relaxed), 2);
+    // It survives a reopen, and removing it ends it.
+    drop(db);
+    let db = Database::builder(&dir.0)
+        .observer(Count(Arc::clone(&hits)))
+        .open()
+        .unwrap();
+    assert!(
+        db.content()
+            .resolve(DEFAULT_SITE, "/wp-admin")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(hits.load(Ordering::Relaxed), 3);
+    assert!(
+        db.content()
+            .remove_route(DEFAULT_SITE, "/wp-admin")
+            .unwrap()
+    );
+    assert!(
+        db.content()
+            .resolve(DEFAULT_SITE, "/wp-admin")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(hits.load(Ordering::Relaxed), 3);
+    // A page published at a canary's path takes it over.
+    db.content().add_canary(DEFAULT_SITE, "/later").unwrap();
+    let page = db
+        .content()
+        .create(Entity::new("page").path("/later"))
+        .unwrap();
+    let _ = db.content().publish(page).unwrap();
+    let route = db
+        .content()
+        .resolve(DEFAULT_SITE, "/later")
+        .unwrap()
+        .unwrap();
+    assert_eq!(route.entity(), page);
+    assert_eq!(hits.load(Ordering::Relaxed), 3);
+}

@@ -1255,7 +1255,7 @@ pub(crate) fn encode_route(entry: &RouteEntry) -> Vec<u8> {
             w.bytes(to.as_bytes());
         }
         RouteKind::Gone => {
-            w.u8(3);
+            w.u8(if entry.canary { 4 } else { 3 });
             w.u16(0);
             w.bytes(entry.entity.as_bytes());
         }
@@ -1280,10 +1280,11 @@ pub(crate) fn decode_route(bytes: &[u8], at: u64) -> Result<RouteEntry> {
     let visibility = Visibility::of(r.u8()?, at)?;
     let locale = Locale::read(&mut r, at)?;
     r.finish()?;
-    let kind = match kind {
-        1 => RouteKind::Page,
-        2 => RouteKind::Redirect { to: target, status },
-        3 => RouteKind::Gone,
+    let (kind, canary) = match kind {
+        1 => (RouteKind::Page, false),
+        2 => (RouteKind::Redirect { to: target, status }, false),
+        3 => (RouteKind::Gone, false),
+        4 => (RouteKind::Gone, true),
         _ => return Err(Error::corrupt("a route kind", at)),
     };
     Ok(RouteEntry {
@@ -1292,6 +1293,7 @@ pub(crate) fn decode_route(bytes: &[u8], at: u64) -> Result<RouteEntry> {
         kind,
         visibility,
         locale,
+        canary,
     })
 }
 
@@ -1498,6 +1500,10 @@ pub struct RouteEntry {
     pub(crate) kind: RouteKind,
     pub(crate) visibility: Visibility,
     pub(crate) locale: Locale,
+    /// A canary: a path nothing is served at, whose request raises
+    /// [`SecurityEvent::CanaryRequested`](crate::SecurityEvent::CanaryRequested).
+    /// Resolving it answers `None`, as for any unknown path.
+    pub(crate) canary: bool,
 }
 
 impl RouteEntry {
@@ -1684,14 +1690,17 @@ mod tests {
             },
             RouteKind::Gone,
         ] {
-            let entry = RouteEntry {
-                entity: rid(),
-                revision: 4,
-                kind,
-                visibility: Visibility::Members,
-                locale: Locale::EN,
-            };
-            assert_eq!(decode_route(&encode_route(&entry), 0).unwrap(), entry);
+            for canary in [false, matches!(kind, RouteKind::Gone)] {
+                let entry = RouteEntry {
+                    entity: rid(),
+                    revision: 4,
+                    kind,
+                    visibility: Visibility::Members,
+                    locale: Locale::EN,
+                    canary,
+                };
+                assert_eq!(decode_route(&encode_route(&entry), 0).unwrap(), entry);
+            }
         }
         let head = Entity::new("p")
             .path("/x")

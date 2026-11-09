@@ -51,9 +51,9 @@ nex-db is not published. Depend on it from its repository:
 
 ```toml
 [dependencies]
-nex-db = { git = "https://github.com/jamesgober/nex-db", tag = "v0.4.1" }
+nex-db = { git = "https://github.com/jamesgober/nex-db", tag = "v0.5.0" }
 # or pick engines:
-# nex-db = { git = "...", tag = "v0.4.1", default-features = false, features = ["auth"] }
+# nex-db = { git = "...", tag = "v0.5.0", default-features = false, features = ["auth"] }
 ```
 
 | Feature | Default | Adds |

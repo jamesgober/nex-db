@@ -2,7 +2,7 @@
 
 > One milestone at a time, each ending with something that runs. Work only on the current milestone. Requirements (FR, NFR) are in [`PLAN.md`](./PLAN.md).
 
-**Current milestone: 0.5.0 (feature complete). 0.1.0 to 0.4.1 are released (GitHub pre-releases).**
+**Current milestone: 0.6.0 (optimisation). 0.1.0 to 0.5.0 are released (GitHub pre-releases).**
 
 ---
 
@@ -93,7 +93,8 @@
 - From 0.4: TOTP and passkeys (crypt-io 1.5), released in 0.4.1.
   - [x] TOTP, feature `mfa` (`PLAN.md` D-094).
   - [x] Passkeys, feature `mfa` (`PLAN.md` D-095).
-- **Exit:** every P0 and P1 item in `docs/API.md` exists.
+- **Exit:** every P0 and P1 item in `docs/API.md` exists. Released 2026-11-09.
+- Moved to 0.6: devices, `revert`, descendant paths following a moved parent, releases, assets, `Keys::vault` (P2 or ungraded); the shared-memory channel for split auth (`validate` over the pipe measures about 55 us).
 
 ## 0.6.0 Optimisation
 

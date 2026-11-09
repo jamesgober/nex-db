@@ -15,6 +15,7 @@ All notable changes to `nex-db` are documented in this file. The format is based
 ### Fixed
 
 - Two reads of one entity or account in one `db.read` could disagree when a commit applied between them.
+- A read could see a commit that was applied but not yet visible, and then an older version on the next read.
 
 ## [0.5.0] - 2026-11-09
 

@@ -12,6 +12,7 @@ All notable changes to `nex-db` are documented in this file. The format is based
 - `Listing::outdated(locale)`: translations made from an older revision than their source publishes.
 - `get_many`, one snapshot for many entities, and `stream`, every entry of a listing.
 - `add_redirect` and `remove_route`.
+- Per-account data keys and `erase_account`: an account's private records are sealed under its own key, kept in `auth/account-keys` and never in the log; erasing the account removes its records and destroys the key. `RevokeReason::Erased` and `Change::AccountErased`.
 - Search: `Type::searchable`, `Content::search`, `Search`, `Hit`, and `Hits`: every word of a query in a published body of one locale, ranked by BM25 over weighted fields; English locales stem and skip common words.
 
 ### Changed

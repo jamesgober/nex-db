@@ -40,10 +40,11 @@ length, then the bytes).
 │   ├─ keys              the root key (default key source only)
 │   ├─ key.check         a check of the root key
 │   ├─ sessions.ckpt     sessions and epochs, as of the last checkpoint
+│   ├─ account-keys      each account's data key (0.5)
 │   ├─ audit.chain       the audit chain
 │   ├─ accounts/         the account store (lsm-db)
 │   └─ realms/<id>/      each further realm (0.4): its own sessions.ckpt,
-│                        audit.chain, and accounts/
+│                        account-keys, audit.chain, and accounts/
 └─ content/
     ├─ store/            the content store (lsm-db)
     └─ spaces/<id>/store/  each further space's store (0.4)
@@ -178,7 +179,11 @@ tag [16]
 ```
 
 with the store key as associated data, so a record copied to another key
-fails to open. The file key is `keyed BLAKE3(root key, "nex-db 2026 auth
+fails to open. From 0.5 an account's private records (the account record,
+its TOTP record, and its recovery codes) are sealed with key id 2, the
+account's data key from `auth/account-keys`, made when the account is
+created; a record written before 0.5 stays under key id 1 until the account
+next changes. The file key is `keyed BLAKE3(root key, "nex-db 2026 auth
 file")`. Inside, the credential travels with the account:
 
 ```text
@@ -212,6 +217,23 @@ credential record         kind u8 (1 = password), password hash str16
 ```
 
 Sessions are not stored here; see [auth/sessions.ckpt](#authsessionsckpt).
+
+## auth/account-keys
+
+Each account's data key (0.5), in fixed slots that are overwritten in place:
+
+```text
+header    "NXDBKEYS" [8], format u16 (1), slot size u16 (96), [4] zero
+slot      account [16], created ms u64, nonce [24], key [32], tag [16]
+```
+
+An all-zero slot is free. The 32-byte key is random, sealed with
+XChaCha20-Poly1305 under the file key with the account id as associated
+data. A key is written and synced while the commit that first uses it is
+staged, before that commit reaches the log; it never travels in the log.
+Erasing an account overwrites its slot with zeros and syncs. A key whose
+account was never created (its commit did not land) is dropped at a
+checkpoint a minute or more later.
 
 ## auth/sessions.ckpt
 

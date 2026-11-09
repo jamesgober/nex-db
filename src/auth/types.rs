@@ -373,6 +373,8 @@ pub enum RevokeReason {
     /// Ended by [`revoke_all`](crate::Auth::revoke_all): the account was
     /// signed out everywhere.
     SignedOutEverywhere,
+    /// The account was erased ([`erase_account`](crate::Auth::erase_account)).
+    Erased,
 }
 
 /// The outcome of validating a token. Every outcome except `Valid` means the

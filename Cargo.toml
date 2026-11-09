@@ -173,3 +173,7 @@ strip         = "symbols"
 [[test]]
 name = "realms"
 required-features = ["auth", "content"]
+
+[[test]]
+name = "erasure"
+required-features = ["auth"]

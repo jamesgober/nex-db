@@ -68,11 +68,21 @@ pub(crate) struct Place(At);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Full;
 
+/// Why a session older than its account's `epoch` ended.
+fn ended_by(epoch: u32) -> RevokeReason {
+    if epoch == super::ERASED_EPOCH {
+        RevokeReason::Erased
+    } else {
+        RevokeReason::SignedOutEverywhere
+    }
+}
+
 fn reason_code(reason: RevokeReason) -> u64 {
     match reason {
         RevokeReason::Revoked => 1,
         RevokeReason::Rotated => 2,
         RevokeReason::SignedOutEverywhere => 3,
+        RevokeReason::Erased => 4,
     }
 }
 
@@ -81,6 +91,7 @@ fn reason_of(code: u64) -> Option<RevokeReason> {
         1 => RevokeReason::Revoked,
         2 => RevokeReason::Rotated,
         3 => RevokeReason::SignedOutEverywhere,
+        4 => RevokeReason::Erased,
         _ => return None,
     })
 }
@@ -265,7 +276,7 @@ impl SessionTable {
         let (words, ext) = if live {
             encode_live(&session)
         } else {
-            let reason = RevokeReason::SignedOutEverywhere;
+            let reason = ended_by(epoch);
             (
                 encode_revoked(session.account, reason, session.expires_ms),
                 None,
@@ -343,11 +354,7 @@ impl SessionTable {
             };
             match decode(&found.words, found.ext.as_ref()) {
                 Some(Slot::Live(session)) if session.epoch < epoch => {
-                    let words = encode_revoked(
-                        account,
-                        RevokeReason::SignedOutEverywhere,
-                        session.expires_ms,
-                    );
+                    let words = encode_revoked(account, ended_by(epoch), session.expires_ms);
                     let _ = self.table.update(at, &words, None);
                 }
                 Some(Slot::Live(_)) => kept.push(place),

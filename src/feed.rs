@@ -86,6 +86,11 @@ pub enum Change {
         /// The account.
         account: AccountId,
     },
+    /// An account was erased.
+    AccountErased {
+        /// The account.
+        account: AccountId,
+    },
 }
 
 #[derive(Debug, Default)]

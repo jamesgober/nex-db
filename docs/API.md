@@ -684,9 +684,9 @@ assert_eq!(db.content().get(rid)?.expect("published").locale(), en);
 | `draft(rid)`, `draft_in(rid, locale) -> Result<Option<Entry>>` | P0 | the working draft, for editors |
 | `get_in(rid, locale) -> Result<Option<Entry>>` | P0 | follows the fallback chain; `Entry::fallback()` says when it did |
 | `publish_in(rid, &[Locale])`, `unpublish_in(rid, &[Locale])`, `set_path_in(rid, locale, path)` (tx) | P0 | per locale; `publish`, `unpublish`, and `set_path` act on the entity's own locale (`unpublish`: every locale) |
-| `get_many(&[Rid], locale) -> Result<Vec<Option<Entry>>>` | P1 | one snapshot |
-| `translate(rid, locale, Patch)` (tx) | P0 | starts a translation from the entity's own fields (without a path) and records the published revision it was translated from |
-| `list(Listing::outdated(locale))` | P1 | translations older than their source |
+| `get_many(&[Rid], locale) -> Result<Vec<Option<Entry>>>` | P1 | 0.5; one snapshot, in order, at most 1,000 |
+| `translate(rid, locale, Patch)` (tx) | P0 | starts a translation from the entity's own fields (without a path); each call records the published revision of the entity's own locale as the one it was translated from |
+| `list(Listing::outdated(locale))` | P1 | 0.5; entities of every type whose translation into `locale` was made from an older revision than their own locale publishes, newest source first; the entries are the translations' drafts, in any status |
 
 Each locale has its own path; all of them point at the same `Rid`.
 
@@ -726,7 +726,7 @@ assert!(db.content().resolve("other.example", "/about")?.is_none());
 | Kind | Since | Answer |
 |---|---|---|
 | `Page` | 0.1 | serve the entity |
-| `Redirect { to, status }` | 0.4 | 301, 302, 307, or 308 to the entity `to` (its current path is `get(to)?.route()`); to a URL with `add_redirect` |
+| `Redirect { to, status }` | 0.4 | 301, 302, 307, or 308 to the entity `to` (its current path is `get(to)?.route()`) |
 | `Gone` | 0.4 | 410 |
 | `Alias { canonical }` | 0.4 | serve the entity; link to the canonical path |
 | `Term` | 0.4 | a taxonomy archive page |
@@ -739,7 +739,7 @@ redirects again is shortened, so a chain is never followed.
 |---|---|---|
 | `resolve(site, path) -> Result<Option<RouteEntry>>` | P0 | 0.1 |
 | `set_path(rid, path)`, `set_path_in(rid, locale, path)` (tx) | P0 | the old path redirects with 301 |
-| `add_redirect(site, from, to, status)` (tx), `remove_route(site, path)` (tx) | P1 | |
+| `add_redirect(site, from, to: Rid, status) -> Result<()>` (tx), `remove_route(site, path) -> Result<bool>` (tx) | P1 | 0.5; a redirect to an entity, never over a page; it stays when its target is deleted; `remove_route` takes away a redirect or gone marker, not a page. Redirects to other sites are the application's |
 | `routes(rid) -> Result<Vec<(String, String)>>` | P2 | every path of an entity |
 | `resolve_draft(site, path) -> Result<Option<RouteEntry>>` | P2 | 0.6; drafts at their real paths, for previews |
 
@@ -799,10 +799,10 @@ or not.
 | `Listing::latest(kind)`, `.updated()`, `.site(s)`, `.limit(n)` | 0.4 | P0 |
 | `.by_author(a)` | 0.4 | P0 |
 | `.term(t)` | 0.4 | P0 |
-| `.sticky_first()` | 0.4 (to come) | P0 |
+| `.sticky_first()`: sticky entities (`Entity::sticky()`, `set_sticky(rid, bool)`, `Entry::sticky()`) first, then the others, each in the listing's order | 0.5 | P0 |
 | `children(rid) -> Vec<Rid>`, `ancestors(rid) -> Result<Vec<Rid>>` | 0.4 | P1 |
 | `referenced_by(rid) -> Result<Vec<Rid>>` | 0.4 | P1 |
-| `stream(Listing)` for sitemaps and feeds | 0.4 | P1 |
+| `stream(Listing) -> Stream`, an iterator of `Result<Entry>` reading page by page, for sitemaps and feeds | 0.5 | P1 |
 | `search(locale, query) -> Result<Page<Hit>>` | 0.5 | P1 |
 | `related(rid, limit)` | 0.5 | P2 |
 

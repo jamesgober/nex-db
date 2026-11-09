@@ -490,6 +490,12 @@ impl Database {
         Feed::new(self, from)
     }
 
+    /// A snapshot at the last visible commit, for a group of reads.
+    #[cfg_attr(not(feature = "content"), allow(dead_code))]
+    pub(crate) fn snapshot(&self) -> crate::core::pipeline::SnapshotGuard<'_> {
+        self.inner.core.snapshot()
+    }
+
     /// The last visible commit: single reads see the state through it.
     #[cfg_attr(not(feature = "content"), allow(dead_code))]
     pub(crate) fn visible(&self) -> Seq {

@@ -29,11 +29,15 @@ const HEAD_FORMAT_3: u8 = 3;
 /// As [`HEAD_FORMAT`] without schedules: builds before 0.4.0 was
 /// released. Read only.
 const HEAD_FORMAT_4: u8 = 4;
-/// Stored entity record format from 0.4: per locale, the working draft,
+/// As [`HEAD_FORMAT`] without the flags: 0.4. Read only.
+const HEAD_FORMAT_5: u8 = 5;
+/// Stored entity record format from 0.5: per locale, the working draft,
 /// what is published (with the entities the published body refers to), and
-/// its schedule; then the authors, the parent, and the order among its
-/// siblings.
-const HEAD_FORMAT: u8 = 5;
+/// its schedule; then the authors, the parent, the order among its
+/// siblings, and the flags (bit 0: sticky).
+const HEAD_FORMAT: u8 = 6;
+/// Head flag: listed first by [`Listing::sticky_first`](crate::Listing::sticky_first).
+const FLAG_STICKY: u8 = 1;
 /// Most authors one entity has.
 pub(crate) const MAX_AUTHORS: usize = 16;
 /// Most locales one entity has.
@@ -233,6 +237,7 @@ pub struct Entity {
     authors: Vec<AccountId>,
     parent: Option<Rid>,
     order: i64,
+    sticky: bool,
 }
 
 impl Entity {
@@ -248,7 +253,17 @@ impl Entity {
             authors: Vec::new(),
             parent: None,
             order: 0,
+            sticky: false,
         }
+    }
+
+    /// Mark the entity sticky: listings with
+    /// [`Listing::sticky_first`](crate::Listing::sticky_first) put it
+    /// ahead of the others. Shared by every locale.
+    #[must_use]
+    pub fn sticky(mut self) -> Self {
+        self.sticky = true;
+        self
     }
 
     /// Add `account` to the entity's authors, in order (at most 16).
@@ -329,15 +344,7 @@ impl Entity {
     ) -> Result<Head> {
         check_name("type", &self.kind)?;
         let site = self.site_name().to_owned();
-        if site.is_empty()
-            || site.len() > MAX_SITE
-            || site.chars().any(|c| c.is_control() || c.is_whitespace())
-        {
-            return Err(Error::invalid(
-                "site",
-                "must be 1 to 253 bytes without spaces",
-            ));
-        }
+        check_site(&site)?;
         if self.authors.len() > MAX_AUTHORS {
             return Err(Error::invalid("authors", "at most 16"));
         }
@@ -350,6 +357,7 @@ impl Entity {
             authors: self.authors,
             parent: self.parent,
             order: self.order,
+            sticky: self.sticky,
             rid,
             kind: self.kind,
             site,
@@ -387,7 +395,21 @@ impl Entity {
     }
 }
 
-fn check_path(path: &str) -> Result<()> {
+/// Refuse a site name that is empty, over 253 bytes, or holds a space.
+pub(crate) fn check_site(site: &str) -> Result<()> {
+    if site.is_empty()
+        || site.len() > MAX_SITE
+        || site.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(Error::invalid(
+            "site",
+            "must be 1 to 253 bytes without spaces",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn check_path(path: &str) -> Result<()> {
     if !path.starts_with('/')
         || path.len() > MAX_PATH
         || path.chars().any(|c| c.is_control() || c.is_whitespace())
@@ -774,6 +796,8 @@ pub(crate) struct Head {
     pub(crate) parent: Option<Rid>,
     /// Its place among its parent's children.
     pub(crate) order: i64,
+    /// Listed first by sticky-first listings.
+    pub(crate) sticky: bool,
 }
 
 impl Head {
@@ -896,6 +920,7 @@ impl Head {
             None => w.u8(0),
         }
         w.i64(self.order);
+        w.u8(if self.sticky { FLAG_STICKY } else { 0 });
         Ok(out)
     }
 
@@ -940,10 +965,12 @@ impl Head {
                     authors: Vec::new(),
                     parent: None,
                     order: 0,
+                    sticky: false,
                 }
                 .with_draft_refs())
             }
-            format @ (HEAD_FORMAT_2 | HEAD_FORMAT_3 | HEAD_FORMAT_4 | HEAD_FORMAT) => {
+            format @ (HEAD_FORMAT_2 | HEAD_FORMAT_3 | HEAD_FORMAT_4 | HEAD_FORMAT_5
+            | HEAD_FORMAT) => {
                 let rid = Rid::from_bytes(r.fixed()?);
                 let created_ms = r.u64()?;
                 let updated_ms = r.u64()?;
@@ -972,7 +999,7 @@ impl Head {
                     }
                     let draft_path = Some(r.str16()?.to_owned()).filter(|p| !p.is_empty());
                     let fields = read_fields(&mut r, at)?;
-                    let schedule = if format == HEAD_FORMAT {
+                    let schedule = if format == HEAD_FORMAT || format == HEAD_FORMAT_5 {
                         match Action::of(r.u8()?, at)? {
                             Some(action) => Some((action, r.u64()?)),
                             None => None,
@@ -1004,7 +1031,8 @@ impl Head {
                 let mut authors = Vec::new();
                 let mut parent = None;
                 let mut order = 0;
-                if format == HEAD_FORMAT || format == HEAD_FORMAT_4 {
+                let mut sticky = false;
+                if matches!(format, HEAD_FORMAT_4 | HEAD_FORMAT_5 | HEAD_FORMAT) {
                     let count = usize::from(r.u8()?);
                     if count > MAX_AUTHORS {
                         return Err(Error::corrupt("an entity's authors", at));
@@ -1019,11 +1047,19 @@ impl Head {
                     };
                     order = r.i64()?;
                 }
+                if format == HEAD_FORMAT {
+                    let flags = r.u8()?;
+                    if flags & !FLAG_STICKY != 0 {
+                        return Err(Error::corrupt("an entity's flags", at));
+                    }
+                    sticky = flags & FLAG_STICKY != 0;
+                }
                 r.finish()?;
                 let head = Head {
                     authors,
                     parent,
                     order,
+                    sticky,
                     rid,
                     kind,
                     site,
@@ -1069,7 +1105,7 @@ impl Head {
     pub(crate) fn is_current(bytes: &[u8]) -> bool {
         matches!(
             bytes.first(),
-            Some(&(HEAD_FORMAT_3 | HEAD_FORMAT_4 | HEAD_FORMAT))
+            Some(&(HEAD_FORMAT_3 | HEAD_FORMAT_4 | HEAD_FORMAT_5 | HEAD_FORMAT))
         )
     }
 
@@ -1106,6 +1142,7 @@ impl Head {
             authors: self.authors.clone(),
             parent: self.parent,
             order: self.order,
+            sticky: self.sticky,
         }
     }
 }
@@ -1294,6 +1331,7 @@ pub struct Entry {
     authors: Vec<AccountId>,
     parent: Option<Rid>,
     order: i64,
+    sticky: bool,
     schedule: Option<(Action, u64)>,
 }
 
@@ -1321,6 +1359,12 @@ impl Entry {
     #[must_use]
     pub const fn order(&self) -> i64 {
         self.order
+    }
+
+    /// True when the entity is sticky ([`Entity::sticky`]).
+    #[must_use]
+    pub const fn sticky(&self) -> bool {
+        self.sticky
     }
 
     /// The locale of this entry.
@@ -1506,6 +1550,7 @@ mod tests {
         head.authors = vec![account];
         head.parent = Some(Rid::from_bytes([4; 16]));
         head.order = -7;
+        head.sticky = true;
         head.variants[1].schedule = Some((Action::Unpublish, 99));
         head.first_published_ms = 4;
         let back = Head::decode(&head.encode().unwrap(), 0).unwrap();

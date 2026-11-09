@@ -268,7 +268,7 @@ sessions.
 
 | Key | Value |
 |---|---|
-| `collection, 'e', rid [16]` | entity head (format 5; formats 2 to 4 from builds before 0.4.0 still read), or a 0.1 to 0.3 entity record (format 1) |
+| `collection, 'e', rid [16]` | entity head (format 6; format 5 from 0.4 and formats 2 to 4 from builds before 0.4.0 still read), or a 0.1 to 0.3 entity record (format 1) |
 | `collection, 'v', rid [16], number u32 (big-endian)` | a fixed revision |
 | `collection, 'r', site, 0, path` | a route |
 | `collection, 'b', target rid [16], source rid [16]` | empty: `source` refers to `target` (a draft or published field); `referenced_by` reads the target's prefix |
@@ -283,10 +283,10 @@ paths of format 1 entity records, which have none. Reference records of
 format 1 and format 2 heads, which have none, are written at open from the
 heads (format 2 published references taken from the drafts).
 
-### Entity head (format 5)
+### Entity head (format 6)
 
 ```text
-format u8                 5
+format u8                 6
 rid [16]
 created ms u64
 updated ms u64
@@ -315,6 +315,7 @@ gone count u16            paths left gone (410) by a trash, then each:
 author count u8           at most 16, then each account [16], in order
 has parent u8             1, then parent rid [16]; 0 for none
 order i64                 its place among its parent's children
+flags u8                  bit 0: sticky; the other bits 0 (format 5: absent)
 ```
 
 Format 3 ends after the gone paths (no authors, no parent, order 0).

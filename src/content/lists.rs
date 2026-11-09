@@ -3,16 +3,22 @@
 //! Derived, like the route index: rebuilt from the entity heads at open and
 //! updated as commits apply. Two orders per site and type: by first
 //! publication (`latest`) and by the last publish (`updated`), and the same
-//! per author and per entity referred to (a term). A page is a range read of
-//! an ordered set, so a listing never scans entities.
+//! per author and per entity referred to (a term), and translations older
+//! than their source per locale. A page is a range read of an ordered set,
+//! so a listing never scans entities.
+//!
+//! Sticky entities have a second row in each order with the top bit of the
+//! inverted time cleared, so they sort ahead of every other row. A listing
+//! that is not sticky-first starts at the top bit; one that is skips the
+//! ordinary rows of sticky entities.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     fmt,
     sync::{PoisonError, RwLock},
 };
 
-use super::entity::Head;
+use super::{entity::Head, locale::Locale};
 use crate::{
     error::{Error, Result},
     ids::{AccountId, Rid},
@@ -25,6 +31,9 @@ const DEFAULT_PAGE: usize = 100;
 
 const ORDER_LATEST: u8 = 1;
 const ORDER_UPDATED: u8 = 2;
+/// The top bit of an inverted time: set in every ordinary row (a time in
+/// milliseconds is below 2^63), cleared in the rows of sticky entities.
+const TOP: u64 = 1 << 63;
 
 /// A listing to read with [`Content::list`](crate::Content::list).
 ///
@@ -41,14 +50,17 @@ pub struct Listing {
     pub(crate) order: u8,
     pub(crate) limit: usize,
     pub(crate) filter: Option<Filter>,
+    pub(crate) sticky: bool,
 }
 
-/// What a listing keeps: entities of an author, or entities whose
-/// published body refers to an entity (a term).
+/// What a listing keeps: entities of an author, entities whose published
+/// body refers to an entity (a term), or entities whose translation into a
+/// locale is older than their published source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Filter {
     Author(AccountId),
     Refers(Rid),
+    Outdated(Locale),
 }
 
 impl Listing {
@@ -61,7 +73,36 @@ impl Listing {
             order: ORDER_LATEST,
             limit: DEFAULT_PAGE,
             filter: None,
+            sticky: false,
         }
+    }
+
+    /// Entities of every type whose translation into `locale` was made
+    /// from an older revision than the one their own locale publishes, the
+    /// most recently published source first. Its entries are the
+    /// translations' working drafts, for translators. Any status.
+    pub fn outdated(locale: Locale) -> Listing {
+        Listing {
+            kind: String::new(),
+            site: crate::DEFAULT_SITE.to_owned(),
+            order: ORDER_UPDATED,
+            limit: DEFAULT_PAGE,
+            filter: Some(Filter::Outdated(locale)),
+            sticky: false,
+        }
+    }
+
+    /// Sticky entities ([`Entity::sticky`](crate::Entity::sticky)) first,
+    /// in the listing's order, then the others.
+    pub fn sticky_first(mut self) -> Listing {
+        self.sticky = true;
+        self
+    }
+
+    /// The order code a cursor carries: 1 and 2, or 3 and 4 when sticky
+    /// entities come first.
+    fn code(&self) -> u8 {
+        self.order + if self.sticky { 2 } else { 0 }
     }
 
     /// Only entities `account` is an author of
@@ -116,7 +157,9 @@ impl fmt::Display for Cursor {
         write!(
             f,
             "{}.{}.{:x}.",
-            self.listing.order, self.listing.limit, self.after.0
+            self.listing.code(),
+            self.listing.limit,
+            self.after.0
         )?;
         for b in self.after.1 {
             write!(f, "{b:02x}")?;
@@ -129,10 +172,11 @@ impl fmt::Display for Cursor {
         for b in self.listing.kind.as_bytes() {
             write!(f, "{b:02x}")?;
         }
-        let (tag, id) = match self.listing.filter {
+        let (tag, id): (char, &[u8]) = match &self.listing.filter {
             None => return Ok(()),
-            Some(Filter::Author(a)) => ('a', *a.as_bytes()),
-            Some(Filter::Refers(r)) => ('t', *r.as_bytes()),
+            Some(Filter::Author(a)) => ('a', a.as_bytes()),
+            Some(Filter::Refers(r)) => ('t', r.as_bytes()),
+            Some(Filter::Outdated(l)) => ('o', l.as_str().as_bytes()),
         };
         write!(f, ".{tag}")?;
         for b in id {
@@ -176,15 +220,21 @@ impl Cursor {
                 match text.split_at_checked(1) {
                     Some(("a", hex)) => Some(Filter::Author(AccountId::from_bytes(id(hex)?))),
                     Some(("t", hex)) => Some(Filter::Refers(Rid::from_bytes(id(hex)?))),
+                    Some(("o", hex)) => {
+                        let tag =
+                            String::from_utf8(unhex(hex).ok_or_else(bad)?).map_err(|_| bad())?;
+                        Some(Filter::Outdated(Locale::new(&tag).map_err(|_| bad())?))
+                    }
                     _ => return Err(bad()),
                 }
             }
             None => None,
         };
-        let order: u8 = order.parse().map_err(|_| bad())?;
-        if order != ORDER_LATEST && order != ORDER_UPDATED {
+        let code: u8 = order.parse().map_err(|_| bad())?;
+        if !(1..=4).contains(&code) {
             return Err(bad());
         }
+        let (order, sticky) = ((code - 1) % 2 + 1, code > 2);
         let limit: usize = limit.parse().map_err(|_| bad())?;
         let inv = u64::from_str_radix(inv, 16).map_err(|_| bad())?;
         let rid: [u8; 16] = unhex(rid).and_then(|b| b.try_into().ok()).ok_or_else(bad)?;
@@ -197,6 +247,7 @@ impl Cursor {
                 order,
                 limit: limit.clamp(1, MAX_PAGE),
                 filter,
+                sticky,
             },
             after: (inv, rid),
         })
@@ -243,6 +294,8 @@ struct Inner {
     groups: HashMap<Group, u32>,
     /// Each listed entity's rows, to remove them when it changes.
     placed: HashMap<Rid, Vec<Row>>,
+    /// The listed entities that are sticky.
+    sticky: HashSet<[u8; 16]>,
 }
 
 impl Inner {
@@ -271,6 +324,7 @@ impl ListIndex {
                 let _ = inner.rows.remove(&row);
             }
         }
+        let _ = inner.sticky.remove(rid.as_bytes());
     }
 
     /// Place `head` as it now is: listed when published, not otherwise.
@@ -299,6 +353,25 @@ impl ListIndex {
             rows.push((group, ORDER_LATEST, latest, rid));
             rows.push((group, ORDER_UPDATED, updated, rid));
         }
+        // Translations made from an older revision than the source
+        // publishes.
+        if let Some(source) = head.base().published.as_ref() {
+            for v in head.variants.iter().skip(1) {
+                if v.source < source.revision {
+                    let filter = Some(Filter::Outdated(v.locale));
+                    let group = inner.group((head.site.clone(), String::new(), filter));
+                    rows.push((group, ORDER_UPDATED, updated, rid));
+                }
+            }
+        }
+        if head.sticky {
+            let ahead: Vec<Row> = rows
+                .iter()
+                .map(|&(g, o, inv, r)| (g, o, inv & !TOP, r))
+                .collect();
+            rows.extend(ahead);
+            let _ = inner.sticky.insert(rid);
+        }
         for row in &rows {
             let _ = inner.rows.insert(*row);
         }
@@ -320,14 +393,24 @@ impl ListIndex {
         else {
             return (Vec::new(), None);
         };
+        let first = if listing.sticky { 0 } else { TOP };
         let start = match after {
-            Some((inv, rid)) => std::ops::Bound::Excluded((group, listing.order, inv, rid)),
-            None => std::ops::Bound::Included((group, listing.order, 0, [0; 16])),
+            Some((inv, rid)) => {
+                std::ops::Bound::Excluded((group, listing.order, inv.max(first), rid))
+            }
+            None => std::ops::Bound::Included((group, listing.order, first, [0; 16])),
         };
         let end = std::ops::Bound::Included((group, listing.order, u64::MAX, [u8::MAX; 16]));
         let mut ids = Vec::with_capacity(listing.limit);
         let mut last = None;
-        for &(_, _, inv, rid) in inner.rows.range((start, end)).take(listing.limit + 1) {
+        let rows = inner
+            .rows
+            .range((start, end))
+            // The ordinary row of a sticky entity, already listed ahead.
+            .filter(|(_, _, inv, rid)| {
+                !(listing.sticky && inv & TOP != 0 && inner.sticky.contains(rid))
+            });
+        for &(_, _, inv, rid) in rows.take(listing.limit + 1) {
             if ids.len() == listing.limit {
                 return (ids, last);
             }

@@ -1244,3 +1244,187 @@ fn test_reads_never_see_a_head_before_its_revision() {
     done.store(true, Ordering::Release);
     assert!(reader.join().unwrap() > 0);
 }
+
+#[test]
+fn test_sticky_entities_lead_sticky_first_listings_across_pages() {
+    let dir = TempDir::new("sticky");
+    let db = Database::open(&dir.0).unwrap();
+    let mut rids = Vec::new();
+    for i in 0..5 {
+        let mut entity = Entity::new("post").field("title", format!("p{i}"));
+        if i == 1 {
+            entity = entity.sticky();
+        }
+        let rid = db.content().create(entity).unwrap();
+        let _ = db.content().publish(rid).unwrap();
+        rids.push(rid);
+    }
+    db.content().set_sticky(rids[3], true).unwrap();
+    assert!(db.content().get(rids[3]).unwrap().unwrap().sticky());
+    let ids = |listing: Listing| -> Vec<nex_db::Rid> {
+        db.content()
+            .stream(listing)
+            .map(|e| e.unwrap().rid())
+            .collect()
+    };
+    // Newest first; sticky ones first only when asked, and once each.
+    let plain = ids(Listing::latest("post").limit(2));
+    assert_eq!(plain, [rids[4], rids[3], rids[2], rids[1], rids[0]]);
+    let sticky = ids(Listing::latest("post").sticky_first().limit(2));
+    assert_eq!(sticky, [rids[3], rids[1], rids[4], rids[2], rids[0]]);
+    // The cursor keeps the sticky order through its text form.
+    let first = db
+        .content()
+        .list(&Listing::latest("post").sticky_first().limit(1))
+        .unwrap();
+    let cursor = Cursor::parse(&first.next().unwrap().to_string()).unwrap();
+    let second = db.content().next_page(&cursor).unwrap();
+    assert_eq!(second.items()[0].rid(), rids[1]);
+    db.content().set_sticky(rids[3], false).unwrap();
+    let sticky = ids(Listing::latest("post").sticky_first());
+    assert_eq!(sticky, [rids[1], rids[4], rids[3], rids[2], rids[0]]);
+    // The flag survives a reopen.
+    drop(db);
+    let db = Database::open(&dir.0).unwrap();
+    assert!(db.content().get(rids[1]).unwrap().unwrap().sticky());
+    assert!(!db.content().get(rids[3]).unwrap().unwrap().sticky());
+}
+
+#[test]
+fn test_outdated_lists_translations_older_than_their_source() {
+    use nex_db::Locale;
+    let fr = Locale::new("fr").unwrap();
+    let dir = TempDir::new("outdated");
+    let db = Database::open(&dir.0).unwrap();
+    let rid = db
+        .content()
+        .create(Entity::new("page").field("title", "Hello"))
+        .unwrap();
+    let _ = db.content().publish(rid).unwrap();
+    db.commit(|tx| {
+        tx.content()
+            .translate(rid, fr, Patch::new().set("title", "Bonjour"))
+    })
+    .unwrap();
+    let outdated = |db: &Database| -> Vec<(nex_db::Rid, Locale)> {
+        db.content()
+            .list(&Listing::outdated(fr))
+            .unwrap()
+            .items()
+            .iter()
+            .map(|e| (e.rid(), e.locale()))
+            .collect()
+    };
+    assert!(outdated(&db).is_empty());
+    db.content()
+        .save_draft(rid, Patch::new().set("title", "Hello again"))
+        .unwrap();
+    let _ = db.content().publish(rid).unwrap();
+    assert_eq!(outdated(&db), [(rid, fr)]);
+    // Updating the translation brings it up to date.
+    db.commit(|tx| {
+        tx.content()
+            .translate(rid, fr, Patch::new().set("title", "Rebonjour"))
+    })
+    .unwrap();
+    assert!(outdated(&db).is_empty());
+}
+
+#[test]
+fn test_get_many_reads_in_order_with_gaps() {
+    use nex_db::Locale;
+    let dir = TempDir::new("many");
+    let db = Database::open(&dir.0).unwrap();
+    let a = db
+        .content()
+        .create(Entity::new("post").field("title", "a"))
+        .unwrap();
+    let b = db
+        .content()
+        .create(Entity::new("post").field("title", "b"))
+        .unwrap();
+    let _ = db.content().publish(a).unwrap();
+    let got = db.content().get_many(&[b, a, b], Locale::EN).unwrap();
+    assert!(got[0].is_none() && got[2].is_none());
+    assert_eq!(got[1].as_ref().map(nex_db::Entry::rid), Some(a));
+    let many = vec![a; 1001];
+    assert!(matches!(
+        db.content().get_many(&many, Locale::EN),
+        Err(Error::Invalid { .. })
+    ));
+}
+
+#[test]
+fn test_manual_redirects_resolve_and_can_be_removed() {
+    let dir = TempDir::new("redirects");
+    let db = Database::open(&dir.0).unwrap();
+    let rid = db
+        .content()
+        .create(Entity::new("page").field("title", "Home").path("/home"))
+        .unwrap();
+    let _ = db.content().publish(rid).unwrap();
+    db.content()
+        .add_redirect(DEFAULT_SITE, "/old-home", rid, 308)
+        .unwrap();
+    let route = db
+        .content()
+        .resolve(DEFAULT_SITE, "/old-home")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        route.kind(),
+        RouteKind::Redirect {
+            to: rid,
+            status: 308
+        }
+    );
+    // Not over a page, not with another status, not to nothing.
+    assert!(matches!(
+        db.content().add_redirect(DEFAULT_SITE, "/home", rid, 301),
+        Err(Error::AlreadyExists { what: "path" })
+    ));
+    assert!(
+        db.content()
+            .add_redirect(DEFAULT_SITE, "/x", rid, 200)
+            .is_err()
+    );
+    assert!(
+        db.content()
+            .add_redirect(DEFAULT_SITE, "/x", nex_db::Rid::from_bytes([9; 16]), 301)
+            .is_err()
+    );
+    assert!(db.content().remove_route(DEFAULT_SITE, "/home").is_err());
+    assert!(
+        db.content()
+            .remove_route(DEFAULT_SITE, "/old-home")
+            .unwrap()
+    );
+    assert!(
+        !db.content()
+            .remove_route(DEFAULT_SITE, "/old-home")
+            .unwrap()
+    );
+    assert!(
+        db.content()
+            .resolve(DEFAULT_SITE, "/old-home")
+            .unwrap()
+            .is_none()
+    );
+    // A redirect survives a reopen.
+    db.content()
+        .add_redirect(DEFAULT_SITE, "/start", rid, 302)
+        .unwrap();
+    drop(db);
+    let db = Database::open(&dir.0).unwrap();
+    assert_eq!(
+        db.content()
+            .resolve(DEFAULT_SITE, "/start")
+            .unwrap()
+            .unwrap()
+            .kind(),
+        RouteKind::Redirect {
+            to: rid,
+            status: 302
+        }
+    );
+}

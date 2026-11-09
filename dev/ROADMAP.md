@@ -83,6 +83,9 @@
 ## 0.5.0 Feature complete
 
 - Split auth (FR-11), per-account keys and erasure (FR-12), search (FR-13), backup and restore (FR-14).
+- From 0.4: sticky entities, `get_many`, outdated translations, `stream`, `add_redirect` and `remove_route`.
+  - [x] Sticky entities and `sticky_first` (`PLAN.md` D-097).
+  - [x] `Listing::outdated` (D-098); `add_redirect`, `remove_route`, `get_many`, `stream` (D-099).
 - From 0.4: TOTP and passkeys (crypt-io 1.5), released in 0.4.1.
   - [x] TOTP, feature `mfa` (`PLAN.md` D-094).
   - [x] Passkeys, feature `mfa` (`PLAN.md` D-095).

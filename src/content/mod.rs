@@ -1464,8 +1464,9 @@ impl ContentTx<'_, '_> {
 
     /// Change the draft of the `locale` translation, starting it when there
     /// is none: a new translation starts from the fields of the entity's
-    /// own draft, without a path, and records the revision of its own
-    /// locale it was translated from.
+    /// own draft, without a path. Each call records the revision its own
+    /// locale publishes as the one the translation was made from, so it
+    /// leaves [`Listing::outdated`].
     ///
     /// # Errors
     ///
@@ -1473,14 +1474,16 @@ impl ContentTx<'_, '_> {
     /// or the result breaks a rule of [`create`](Self::create).
     pub fn translate(&mut self, rid: Rid, locale: Locale, patch: Patch) -> Result<()> {
         let mut head = self.head(rid)?;
-        if head.variant(locale).is_none() {
-            let base = head.base();
-            let source = base.published.as_ref().map_or(0, |p| p.revision);
-            let draft = Body {
-                path: None,
-                fields: base.draft.fields.clone(),
-            };
-            head.add_variant(locale, draft, source)?;
+        let source = head.base().published.as_ref().map_or(0, |p| p.revision);
+        match head.variant_mut(locale) {
+            Some(variant) => variant.source = source,
+            None => {
+                let draft = Body {
+                    path: None,
+                    fields: head.base().draft.fields.clone(),
+                };
+                head.add_variant(locale, draft, source)?;
+            }
         }
         self.patch_variant(&mut head, locale, patch)?;
         self.put_head(head)?;
@@ -1984,6 +1987,77 @@ impl ContentTx<'_, '_> {
         self.put_head(head)
     }
 
+    /// Mark the entity sticky or not ([`Entity::sticky`]). Takes effect at
+    /// once, published or not.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the entity does not exist.
+    pub fn set_sticky(&mut self, rid: Rid, sticky: bool) -> Result<()> {
+        let mut head = self.head(rid)?;
+        head.sticky = sticky;
+        self.put_head(head)
+    }
+
+    /// Redirect `from` on `site` to the entity `to` with `status` (301,
+    /// 302, 307, or 308): [`Content::resolve`] answers
+    /// [`RouteKind::Redirect`], and the entity's current path is
+    /// `get(to)?.route()`. Replaces a redirect or a gone marker at `from`.
+    /// A redirect stays when its target is deleted; remove it with
+    /// [`remove_route`](Self::remove_route).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::AlreadyExists`] (`what = "path"`) when an entity is
+    ///   served at `from`.
+    /// - [`Error::Invalid`] when the site, the path, or the status breaks
+    ///   its rule, or `to` names no entity.
+    pub fn add_redirect(&mut self, site: &str, from: &str, to: Rid, status: u16) -> Result<()> {
+        entity::check_site(site)?;
+        entity::check_path(from)?;
+        if !matches!(status, 301 | 302 | 307 | 308) {
+            return Err(Error::invalid("status", "must be 301, 302, 307, or 308"));
+        }
+        let target = self.head(to)?;
+        if let Some(RouteEntry {
+            kind: RouteKind::Page,
+            ..
+        }) = self.route(site, from)
+        {
+            return Err(Error::AlreadyExists { what: "path" });
+        }
+        let entry = RouteEntry {
+            entity: to,
+            revision: target.base().published.as_ref().map_or(0, |p| p.revision),
+            kind: RouteKind::Redirect { to, status },
+            visibility: target.visibility,
+            locale: target.base().locale,
+        };
+        self.put_route(site, from, Some(entry));
+        Ok(())
+    }
+
+    /// Remove the redirect or gone marker at `path` on `site`, so the path
+    /// resolves to nothing. Returns `false` when there is none.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when an entity is served at `path`: unpublish it
+    /// or give it another path instead.
+    pub fn remove_route(&mut self, site: &str, path: &str) -> Result<bool> {
+        match self.route(site, path) {
+            None => Ok(false),
+            Some(RouteEntry {
+                kind: RouteKind::Page,
+                ..
+            }) => Err(Error::invalid("path", "an entity is served there")),
+            Some(_) => {
+                self.put_route(site, path, None);
+                Ok(true)
+            }
+        }
+    }
+
     /// Replace the entity's authors, in order (at most 16; a repeat counts
     /// once). Takes effect at once, published or not.
     ///
@@ -2335,9 +2409,16 @@ impl Content<'_> {
         let engine = self.engine();
         let (ids, last) = engine.lists.page(listing, after);
         let mut items = Vec::with_capacity(ids.len());
+        let at = self.db.visible();
         for rid in ids {
-            // Unpublished since the index was read: left out.
-            if let Some(entry) = engine.published_in(rid, None, self.db.visible())? {
+            // Unpublished (or deleted) since the index was read: left out.
+            let entry = match listing.filter {
+                Some(lists::Filter::Outdated(locale)) => engine
+                    .draft_in(rid, Some(locale), at)?
+                    .filter(|e| e.locale() == locale),
+                _ => engine.published_in(rid, None, at)?,
+            };
+            if let Some(entry) = entry {
                 items.push(entry);
             }
         }
@@ -2347,6 +2428,91 @@ impl Content<'_> {
                 listing: listing.clone(),
                 after,
             }),
+        })
+    }
+
+    /// Every entry of `listing`, page by page, for sitemaps and feeds. Each
+    /// page is read when the one before it runs out; an entity published
+    /// meanwhile may be missed or, when it moves, seen twice.
+    ///
+    /// ```no_run
+    /// # fn main() -> nex_db::Result<()> {
+    /// use nex_db::Listing;
+    /// let db = nex_db::open("data/site")?;
+    /// for entry in db.content().stream(Listing::latest("post").limit(1000)) {
+    ///     let entry = entry?;
+    ///     # let _ = entry;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn stream(&self, listing: Listing) -> Stream<'_> {
+        Stream {
+            content: *self,
+            listing,
+            after: None,
+            buffer: std::collections::VecDeque::new(),
+            done: false,
+        }
+    }
+
+    /// The published revisions of `rids` in `locale` (as
+    /// [`get_in`](Self::get_in)), all read at one snapshot, in order;
+    /// `None` where nothing is published.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] for more than 1,000 ids, and the errors of
+    /// [`get`](Self::get).
+    pub fn get_many(&self, rids: &[Rid], locale: Locale) -> Result<Vec<Option<Entry>>> {
+        if rids.len() > lists::MAX_PAGE {
+            return Err(Error::invalid("ids", "at most 1,000"));
+        }
+        let snapshot = self.db.snapshot();
+        let at = snapshot.seq();
+        rids.iter()
+            .map(|rid| self.engine().published_in(*rid, Some(locale), at))
+            .collect()
+    }
+
+    /// Mark an entity sticky or not in its own commit. See
+    /// [`ContentTx::set_sticky`].
+    ///
+    /// # Errors
+    ///
+    /// As [`ContentTx::set_sticky`], plus the errors of
+    /// [`Database::commit`].
+    pub fn set_sticky(&self, rid: Rid, sticky: bool) -> Result<()> {
+        self.db.commit(|tx| {
+            tx.content_of(self.engine.collection)
+                .set_sticky(rid, sticky)
+        })
+    }
+
+    /// Add a redirect in its own commit. See [`ContentTx::add_redirect`].
+    ///
+    /// # Errors
+    ///
+    /// As [`ContentTx::add_redirect`], plus the errors of
+    /// [`Database::commit`].
+    pub fn add_redirect(&self, site: &str, from: &str, to: Rid, status: u16) -> Result<()> {
+        self.db.commit(|tx| {
+            tx.content_of(self.engine.collection)
+                .add_redirect(site, from, to, status)
+        })
+    }
+
+    /// Remove a redirect or gone marker in its own commit. See
+    /// [`ContentTx::remove_route`].
+    ///
+    /// # Errors
+    ///
+    /// As [`ContentTx::remove_route`], plus the errors of
+    /// [`Database::commit`].
+    pub fn remove_route(&self, site: &str, path: &str) -> Result<bool> {
+        self.db.commit(|tx| {
+            tx.content_of(self.engine.collection)
+                .remove_route(site, path)
         })
     }
 
@@ -2568,6 +2734,45 @@ impl Content<'_> {
     pub fn set_path(&self, rid: Rid, path: &str) -> Result<()> {
         self.db
             .commit(|tx| tx.content_of(self.engine.collection).set_path(rid, path))
+    }
+}
+
+/// Every entry of a listing, page by page: an iterator from
+/// [`Content::stream`].
+#[derive(Debug)]
+pub struct Stream<'db> {
+    content: Content<'db>,
+    listing: Listing,
+    after: Option<(u64, [u8; 16])>,
+    buffer: std::collections::VecDeque<Entry>,
+    done: bool,
+}
+
+impl Iterator for Stream<'_> {
+    type Item = Result<Entry>;
+
+    fn next(&mut self) -> Option<Result<Entry>> {
+        loop {
+            if let Some(entry) = self.buffer.pop_front() {
+                return Some(Ok(entry));
+            }
+            if self.done {
+                return None;
+            }
+            match self.content.page(&self.listing, self.after) {
+                Ok(page) => {
+                    match page.next {
+                        Some(cursor) => self.after = Some(cursor.after),
+                        None => self.done = true,
+                    }
+                    self.buffer.extend(page.items);
+                }
+                Err(err) => {
+                    self.done = true;
+                    return Some(Err(err));
+                }
+            }
+        }
     }
 }
 

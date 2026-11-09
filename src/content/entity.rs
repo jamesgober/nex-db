@@ -1,6 +1,6 @@
 //! Entities: what the content engine stores.
 
-use std::{collections::HashSet, time::SystemTime};
+use std::{collections::HashSet, sync::Arc, time::SystemTime};
 
 use super::locale::Locale;
 use crate::{
@@ -1126,20 +1126,22 @@ impl Head {
         Entry {
             schedule,
             rid: self.rid,
-            kind: self.kind.clone(),
             created_ms: self.created_ms,
             updated_ms: self.updated_ms,
             revision,
-            site: self.site.clone(),
-            path: body.path,
-            fields: body.fields,
+            shared: Arc::new(Shared {
+                kind: self.kind.clone(),
+                site: self.site.clone(),
+                path: body.path,
+                fields: body.fields,
+                authors: self.authors.clone(),
+            }),
             status: self.status,
             visibility: self.visibility,
             published_ms,
             first_published_ms: self.first_published_ms,
             locale,
             fallback: asked.filter(|a| *a != locale),
-            authors: self.authors.clone(),
             parent: self.parent,
             order: self.order,
             sticky: self.sticky,
@@ -1312,27 +1314,35 @@ pub(crate) fn check_name(what: &'static str, name: &str) -> Result<()> {
 /// An entity as a reader sees it: the published revision from
 /// [`Content::get`](crate::Content::get), or the working draft from
 /// [`Content::draft`](crate::Content::draft).
+///
+/// Cloning is cheap: the type, route, fields, and authors are shared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     rid: Rid,
-    kind: String,
     created_ms: u64,
     updated_ms: u64,
     revision: u32,
-    site: String,
-    path: Option<String>,
-    fields: Vec<(String, Value)>,
+    shared: Arc<Shared>,
     status: Status,
     visibility: Visibility,
     published_ms: u64,
     first_published_ms: u64,
     locale: Locale,
     fallback: Option<Locale>,
-    authors: Vec<AccountId>,
     parent: Option<Rid>,
     order: i64,
     sticky: bool,
     schedule: Option<(Action, u64)>,
+}
+
+/// The parts of an [`Entry`] that live on the heap, shared by its clones.
+#[derive(Debug, PartialEq, Eq)]
+struct Shared {
+    kind: String,
+    site: String,
+    path: Option<String>,
+    fields: Vec<(String, Value)>,
+    authors: Vec<AccountId>,
 }
 
 impl Entry {
@@ -1346,7 +1356,7 @@ impl Entry {
     /// The entity's authors, in order.
     #[must_use]
     pub fn authors(&self) -> &[AccountId] {
-        &self.authors
+        &self.shared.authors
     }
 
     /// The entity's parent in the page tree, if it has one.
@@ -1389,7 +1399,7 @@ impl Entry {
     /// The entity's type.
     #[must_use]
     pub fn kind(&self) -> &str {
-        &self.kind
+        &self.shared.kind
     }
 
     /// The revision number: the one published, or for a draft the newest
@@ -1438,18 +1448,25 @@ impl Entry {
     /// The site and path the entity is served at, if it has a path.
     #[must_use]
     pub fn route(&self) -> Option<(&str, &str)> {
-        self.path.as_deref().map(|p| (self.site.as_str(), p))
+        self.shared
+            .path
+            .as_deref()
+            .map(|p| (self.shared.site.as_str(), p))
     }
 
     /// The value of field `name`.
     #[must_use]
     pub fn field(&self, name: &str) -> Option<&Value> {
-        self.fields.iter().find(|(n, _)| n == name).map(|(_, v)| v)
+        self.shared
+            .fields
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v)
     }
 
     /// Every field, in the order they were set.
     pub fn fields(&self) -> impl Iterator<Item = (&str, &Value)> {
-        self.fields.iter().map(|(n, v)| (n.as_str(), v))
+        self.shared.fields.iter().map(|(n, v)| (n.as_str(), v))
     }
 }
 

@@ -105,6 +105,7 @@ crypt-io = { version = "1.5", default-features = false, features = ["prebuilt-na
 # #################################
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+mod-alloc = { version = "1.0", default-features = false, features = ["counters"] }
 
 # Concurrency models of the lock-free table and the commit turnstile, built
 # only with `RUSTFLAGS="--cfg nex_loom" cargo test --release --lib loom`.
@@ -187,4 +188,9 @@ required-features = ["auth"]
 
 [[test]]
 name = "backup"
+required-features = ["auth", "content"]
+
+[[test]]
+name = "alloc"
+harness = false
 required-features = ["auth", "content"]

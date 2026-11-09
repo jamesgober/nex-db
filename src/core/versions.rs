@@ -15,14 +15,24 @@
 //!
 //! Cost: one store read per written key in `apply` (for the value before),
 //! and memory for the keys written while a snapshot runs. Pruned after every
-//! commit, so without running snapshots the overlay stays empty.
+//! commit, so without running snapshots the overlay stays empty, and a read
+//! then takes no lock: it sees a count of zero and goes to the store.
+//!
+//! A reader reads the store first and asks the overlay second. An apply
+//! records a key here before it writes the store, so a reader that saw the
+//! store's new value finds the key tracked and takes its version instead;
+//! asking first would leave a window where the key is not tracked yet but
+//! the store already holds a value the snapshot must not see.
 
 // A build with no engine feature keeps no versions outside the tests.
 #![cfg_attr(not(any(feature = "auth", feature = "content")), allow(dead_code))]
 
 use std::{
     collections::HashMap,
-    sync::{Arc, PoisonError, RwLock},
+    sync::{
+        Arc, PoisonError, RwLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use super::record::Seq;
@@ -32,10 +42,26 @@ use crate::error::Result;
 /// key was first written while tracked, at sequence number 0.
 type Chain = Vec<(Seq, Option<Arc<[u8]>>)>;
 
+/// What [`Versions::lookup`] found.
+#[derive(Debug)]
+pub(crate) enum Lookup {
+    /// Not tracked: read the store.
+    Untracked,
+    /// Tracked: the value at the snapshot (`None`: did not exist), and
+    /// whether it is the key's newest version.
+    Tracked {
+        value: Option<Arc<[u8]>>,
+        newest: bool,
+    },
+}
+
 /// Recent versions by key.
 #[derive(Debug, Default)]
 pub(crate) struct Versions {
     keys: RwLock<HashMap<Vec<u8>, Chain>>,
+    /// Keys tracked, set under the write lock: zero lets a reader skip the
+    /// lock.
+    tracked: AtomicUsize,
 }
 
 impl Versions {
@@ -65,13 +91,43 @@ impl Versions {
             }
             chain.push((seq, value.map(Arc::from)));
         }
+        self.tracked.store(keys.len(), Ordering::Release);
         Ok(())
+    }
+
+    /// True when any key is tracked; false lets a caller skip building a
+    /// key to ask with.
+    pub(crate) fn tracks_any(&self) -> bool {
+        self.tracked.load(Ordering::Acquire) != 0
+    }
+
+    /// What a snapshot at `at` sees of `key`: whether the key is tracked,
+    /// and if so its value then and whether that is its newest version (so
+    /// the store's latest state as well).
+    pub(crate) fn lookup(&self, key: &[u8], at: Seq) -> Lookup {
+        if self.tracked.load(Ordering::Acquire) == 0 {
+            return Lookup::Untracked;
+        }
+        let keys = self.keys.read().unwrap_or_else(PoisonError::into_inner);
+        let Some(chain) = keys.get(key) else {
+            return Lookup::Untracked;
+        };
+        match chain.iter().rposition(|(seq, _)| *seq <= at) {
+            Some(i) => Lookup::Tracked {
+                value: chain[i].1.clone(),
+                newest: i + 1 == chain.len(),
+            },
+            None => Lookup::Untracked,
+        }
     }
 
     /// The value `key` had at snapshot `at`, when the key is tracked:
     /// `Some(None)` means it did not exist then. `None` means not tracked:
     /// read the store.
     pub(crate) fn at(&self, key: &[u8], at: Seq) -> Option<Option<Arc<[u8]>>> {
+        if self.tracked.load(Ordering::Acquire) == 0 {
+            return None;
+        }
         let keys = self.keys.read().unwrap_or_else(PoisonError::into_inner);
         let chain = keys.get(key)?;
         chain
@@ -97,6 +153,7 @@ impl Versions {
             let _ = chain.drain(..keep_from);
             true
         });
+        self.tracked.store(keys.len(), Ordering::Release);
     }
 
     /// Keys tracked now.

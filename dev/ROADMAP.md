@@ -100,6 +100,7 @@
 
 - Benchmarks for every hot path with baselines; zero allocations on read hits proved.
   - [x] Session table: cells that never move, one index probe per lookup (`PLAN.md` D-111); token parsing by table (D-112).
+  - [x] Published entries cached decoded, `Entry` shares its heap parts (`PLAN.md` D-113); snapshot reads read the store before the overlay (D-114); allocation tests for the read hits (D-115).
 - **Exit:** every performance target met, or the gap recorded with a plan.
 
 ## 0.7.0 Hardening

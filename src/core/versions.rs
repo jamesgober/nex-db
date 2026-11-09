@@ -85,11 +85,14 @@ impl Versions {
             let _ = keys.insert(key.to_vec(), vec![(0, old)]);
         }
         if let Some(chain) = keys.get_mut(key) {
-            // A replayed record is already there.
-            if chain.last().is_some_and(|(last, _)| *last >= seq) {
-                return Ok(());
+            match chain.last_mut() {
+                // A later commit is recorded already (a replay).
+                Some((last, _)) if *last > seq => return Ok(()),
+                // A second write to the key in one commit: a snapshot at
+                // `seq` sees the last one, as the store will.
+                Some((last, held)) if *last == seq => *held = value.map(Arc::from),
+                _ => chain.push((seq, value.map(Arc::from))),
             }
-            chain.push((seq, value.map(Arc::from)));
         }
         self.tracked.store(keys.len(), Ordering::Release);
         Ok(())
@@ -209,10 +212,24 @@ mod tests {
     }
 
     #[test]
-    fn test_replayed_record_is_ignored() {
+    fn test_a_second_write_in_one_commit_replaces_the_first() {
         let versions = Versions::new();
         versions.record(b"k", 5, Some(b"x"), || Ok(None)).unwrap();
         versions.record(b"k", 5, Some(b"y"), || Ok(None)).unwrap();
-        assert_eq!(bytes(&versions.at(b"k", 5)), Some(Some(&b"x"[..])));
+        assert_eq!(bytes(&versions.at(b"k", 5)), Some(Some(&b"y"[..])));
+        assert_eq!(bytes(&versions.at(b"k", 4)), Some(None));
+        assert!(matches!(
+            versions.lookup(b"k", 5),
+            Lookup::Tracked { newest: true, .. }
+        ));
+    }
+
+    #[test]
+    fn test_a_replayed_earlier_record_is_ignored() {
+        let versions = Versions::new();
+        versions.record(b"k", 7, Some(b"seven"), || Ok(None)).unwrap();
+        versions.record(b"k", 5, Some(b"five"), || Ok(None)).unwrap();
+        assert_eq!(bytes(&versions.at(b"k", 7)), Some(Some(&b"seven"[..])));
+        assert_eq!(bytes(&versions.at(b"k", 6)), Some(None));
     }
 }

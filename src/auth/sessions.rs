@@ -40,7 +40,7 @@ const KIND_REVOKED: u64 = 2;
 
 /// How long a tombstone of a session whose expiry is unknown is kept.
 const TOMBSTONE_MS: u64 = 24 * 60 * 60 * 1000;
-/// Shards of the table, and the slots in the first level of each.
+/// Shards of the table, and the slots in the first index of each.
 const SHARDS: usize = 16;
 const BASE_SLOTS: usize = 512;
 /// The wheel's tick: a slot is reclaimed at most this long after its time.

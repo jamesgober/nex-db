@@ -95,6 +95,7 @@
 
 #[cfg(feature = "auth")]
 mod auth;
+mod backup;
 #[cfg(feature = "content")]
 mod content;
 mod core;
@@ -149,6 +150,7 @@ pub use crate::content::{
     types::{FieldType, Rule, Type},
 };
 pub use crate::{
+    backup::{BackupInfo, RestorePoint, restore},
     core::keys::Keys,
     db::{Builder, CollectionInfo, CollectionKind, Database, Read, Transaction, open},
     error::{Error, Result},

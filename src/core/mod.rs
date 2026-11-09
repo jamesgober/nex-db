@@ -26,7 +26,6 @@ pub(crate) fn time_of(ms: u64) -> std::time::SystemTime {
 }
 
 /// Milliseconds since the Unix epoch, or 0 if the clock is before it.
-#[cfg(any(feature = "auth", feature = "content"))]
 pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

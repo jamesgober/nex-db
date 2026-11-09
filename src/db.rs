@@ -428,6 +428,9 @@ impl Database {
             #[cfg(feature = "content")]
             scheduler: None,
         };
+        // A restored database applies again the revocations made after its
+        // restore point, before anything else.
+        crate::backup::reapply(&db)?;
         #[cfg(feature = "content")]
         {
             db.scheduler = Some(crate::content::schedule::Scheduler::start(Arc::clone(
@@ -446,6 +449,49 @@ impl Database {
             owner: false,
             scheduler: None,
         }
+    }
+
+    /// Back the database up into `to` while it runs.
+    ///
+    /// Into an empty directory (or one that does not exist), this writes a
+    /// full backup: every engine's files as of the last commit. Writes wait
+    /// while it is taken; reads go on. Into a directory that already holds
+    /// a backup of this database, it adds the commits made since, which is
+    /// quick, and [`restore`](crate::restore) can then reach any commit in
+    /// between. Data stays as the database stores it: auth records sealed,
+    /// content as stored. The root key is copied only for a database whose
+    /// key lives in its own directory ([`BackupInfo::holds_key`]).
+    ///
+    /// ```no_run
+    /// # fn main() -> nex_db::Result<()> {
+    /// let db = nex_db::open("data/site")?;
+    /// let first = db.backup("backups/site")?;
+    /// // Later: add what was committed since.
+    /// let later = db.backup("backups/site")?;
+    /// assert!(later.incremental() && later.base() == first.base());
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Invalid`] when `to` holds something that is not a backup, a
+    ///   backup of another database, or one the log has moved past (a
+    ///   checkpoint dropped commits it lacks): back up into a new directory.
+    /// - [`Error::Storage`] when a file cannot be read or written.
+    pub fn backup(&self, to: impl AsRef<Path>) -> Result<crate::BackupInfo> {
+        crate::backup::backup(
+            &self.inner.core,
+            &self.inner.engines,
+            self.inner.core.dir(),
+            to.as_ref(),
+        )
+    }
+
+    /// True when the catalog holds collection `id` of `engine`.
+    #[cfg_attr(not(feature = "auth"), allow(dead_code))]
+    pub(crate) fn catalog_binds(&self, id: u32, engine: crate::engine::EngineId) -> bool {
+        self.inner.core.catalog().binds(id, engine)
     }
 
     /// The directory the database lives in.

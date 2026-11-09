@@ -335,6 +335,34 @@ impl Core {
         self.write_or_fail(engines, Kind::Catalog, self.visible(), &[&staged])
     }
 
+    /// Stop writes for a backup: no checkpoint runs, no commit is
+    /// sequenced, and every commit sequenced before is visible, until the
+    /// guard is dropped. Reads go on.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Storage`] when writes stopped after a failed write.
+    #[cfg_attr(not(any(feature = "auth", feature = "content")), allow(dead_code))]
+    pub(crate) fn freeze(&self) -> Result<Frozen<'_>> {
+        let checkpointing = self
+            .checkpointing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let commit = self.commit.lock().unwrap_or_else(PoisonError::into_inner);
+        let last = commit.last;
+        // A commit in flight applies without the sequencer lock.
+        self.order.wait_visible(last);
+        if self.halted() {
+            return Err(halted_error());
+        }
+        Ok(Frozen {
+            core: self,
+            last,
+            _checkpointing: checkpointing,
+            _commit: commit,
+        })
+    }
+
     /// Start a checkpoint after `bytes` more log bytes (at least 1).
     pub(crate) fn set_checkpoint_every(&self, bytes: u64) {
         self.checkpoint_every.store(bytes.max(1), Ordering::Release);
@@ -482,7 +510,7 @@ impl Core {
         };
         let ids: Vec<EngineId> = staged.iter().map(|w| w.engine()).collect();
         // One buffer per commit: it must outlive the lock until its apply.
-        let mut record = RecordWriter::new(seq, kind, class, &ids, Vec::new())?;
+        let mut record = RecordWriter::new(seq, kind, class, &ids, super::now_ms(), Vec::new())?;
         for work in staged {
             let format = self
                 .engine(engines, work.engine(), work.collection())?
@@ -653,6 +681,38 @@ fn stopped(stop: Stop<Error>) -> Error {
     match stop {
         Stop::Halted => halted_error(),
         Stop::Failed(err) => err,
+    }
+}
+
+/// Writes stopped by [`Core::freeze`].
+pub(crate) struct Frozen<'c> {
+    core: &'c Core,
+    last: Seq,
+    _checkpointing: MutexGuard<'c, ()>,
+    _commit: MutexGuard<'c, CommitState>,
+}
+
+#[cfg_attr(not(any(feature = "auth", feature = "content")), allow(dead_code))]
+impl Frozen<'_> {
+    /// The last commit: everything the database holds.
+    pub(crate) fn last(&self) -> Seq {
+        self.last
+    }
+
+    /// Make every engine's files hold everything through the last commit.
+    pub(crate) fn checkpoint(&self, engines: &dyn Registry) -> Result<()> {
+        let mut failed = None;
+        engines.each(&mut |engine| {
+            if let Err(err) = engine.checkpoint(self.last) {
+                failed = failed.take().or(Some(err));
+            }
+        });
+        failed.map_or(Ok(()), Err)
+    }
+
+    /// Each record of the log, in order.
+    pub(crate) fn records(&self, f: impl FnMut(u64, &[u8]) -> Result<()>) -> Result<()> {
+        self.core.log.replay(f)
     }
 }
 

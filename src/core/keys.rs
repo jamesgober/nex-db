@@ -27,7 +27,7 @@ use crate::error::{Error, Result};
 pub(crate) const KEY_FILE: &str = "keys";
 
 /// Key check file name, inside `auth/`.
-const CHECK_FILE: &str = "key.check";
+pub(crate) const CHECK_FILE: &str = "key.check";
 
 /// Label of the key check.
 const CHECK_LABEL: &[u8] = b"nex-db 2026 root key check";

@@ -366,7 +366,7 @@ fields                    as in the entity record below
 
 ```text
 format u8                 1
-kind u8                   1 page, 2 redirect, 3 gone
+kind u8                   1 page, 2 redirect, 3 gone, 4 canary (0.6)
 status u16                the redirect's HTTP status; 0 otherwise
 target [16]               the entity a redirect points at
 entity [16]

@@ -6,6 +6,10 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 ## [Unreleased]
 
+### Added
+
+- Canary routes: `add_canary(site, path)` marks a path nothing is served at. `resolve` answers `None` for it, as for any unknown path, and raises `SecurityEvent::CanaryRequested`. Route records gain kind 4.
+
 ### Changed
 
 - The session table keeps entries in place and finds them with one index probe: about half the memory per session, and faster checks of unknown tokens.

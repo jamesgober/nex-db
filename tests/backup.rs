@@ -112,22 +112,22 @@ fn test_a_full_backup_restores_every_engine() {
 fn test_later_backups_add_commits_and_restores_pick_a_point() {
     let t = TempDir::new("points");
     let backup = t.at("backup");
-    let (first, middle, last, between) = {
+    let (first, middle, last) = {
         let db = open(&t.at("live"));
         let _ = page(&db, "/one");
         let first = db.backup(&backup).unwrap();
         let _ = page(&db, "/two");
         let middle = db.backup(&backup).unwrap();
         assert!(middle.incremental() && middle.base() == first.base());
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let between = std::time::SystemTime::now();
-        std::thread::sleep(std::time::Duration::from_millis(20));
         let _ = page(&db, "/three");
         let last = db.backup(&backup).unwrap();
         // Nothing new: the same position.
         assert_eq!(db.backup(&backup).unwrap().position(), last.position());
-        (first, middle, last, between)
+        (first, middle, last)
     };
+    // Times that do not depend on the clock's steps: after every commit,
+    // and before the backup.
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
     let cases = [
         (
             "base",
@@ -139,7 +139,7 @@ fn test_later_backups_add_commits_and_restores_pick_a_point() {
             RestorePoint::Position(middle.position()),
             [true, true, false],
         ),
-        ("time", RestorePoint::At(between), [true, true, false]),
+        ("time", RestorePoint::At(later), [true, true, true]),
         ("latest", RestorePoint::Latest, [true, true, true]),
     ];
     for (name, point, want) in cases {
@@ -150,6 +150,14 @@ fn test_later_backups_add_commits_and_restores_pick_a_point() {
         assert_eq!(got, want, "{name}");
     }
     // Points outside the backup, a used directory, and no backup.
+    assert!(matches!(
+        nex_db::restore(
+            &backup,
+            t.at("early"),
+            RestorePoint::At(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
+        ),
+        Err(Error::Invalid { .. })
+    ));
     let outside = Position::from_u64(last.position().get() + 1);
     assert!(matches!(
         nex_db::restore(&backup, t.at("x"), RestorePoint::Position(outside)),

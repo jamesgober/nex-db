@@ -11,7 +11,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, criterion_group};
 use nex_db::{Database, Entity, SessionSpec};
 
 struct TempDb {
@@ -254,5 +254,44 @@ fn core(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, auth, content, core);
-criterion_main!(benches);
+/// `auth/validate_split`: a session check with the auth engine in its own
+/// process (feature `split-auth`), one round trip over the pipe.
+#[cfg(feature = "split-auth")]
+fn split(c: &mut Criterion) {
+    let t = TempDb::with("split", |b| b.auth(nex_db::AuthMode::separate_process()));
+    let db = t.db();
+    let password = db.auth().hash_password("bench password").unwrap();
+    let account = db
+        .auth()
+        .create_account("bench@example.com", &password)
+        .unwrap();
+    let token = db
+        .auth()
+        .issue_session(account, SessionSpec::web())
+        .unwrap();
+    c.bench_function("auth/validate_split", |b| {
+        b.iter(|| db.auth().validate(black_box(token.as_str())).unwrap());
+    });
+    c.bench_function("auth/issue_durable_split", |b| {
+        b.iter(|| {
+            db.auth()
+                .issue_session(account, SessionSpec::web())
+                .unwrap()
+        });
+    });
+}
+
+#[cfg(not(feature = "split-auth"))]
+fn split(_: &mut Criterion) {}
+
+criterion_group!(benches, auth, split, content, core);
+
+// The bench program is also the auth process of `auth/validate_split`.
+fn main() {
+    #[cfg(feature = "split-auth")]
+    if nex_db::serve_auth_process().unwrap() {
+        return;
+    }
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+}

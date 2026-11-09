@@ -83,6 +83,7 @@
 ## 0.5.0 Feature complete
 
 - Split auth (FR-11), per-account keys and erasure (FR-12), search (FR-13), backup and restore (FR-14).
+  - [x] Split auth: the auth engines in their own process, feature `split-auth` (`PLAN.md` D-104 to D-110).
   - [x] Search: per-locale text index, BM25 over weighted fields, English stemming (`PLAN.md` D-100).
   - [x] Per-account data keys and `erase_account` (`PLAN.md` D-101).
   - [x] Backups and point-in-time restore; revocations survive a restore (`PLAN.md` D-102, D-103).

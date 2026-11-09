@@ -37,6 +37,7 @@ length, then the bytes).
 │   ├─ log/              the commit log (wal-db segments)
 │   └─ catalog.ckpt      the catalog
 ├─ auth/
+│   ├─ LOCK              ownership of the auth files (0.5)
 │   ├─ keys              the root key (default key source only)
 │   ├─ key.check         a check of the root key
 │   ├─ sessions.ckpt     sessions and epochs, as of the last checkpoint
@@ -76,6 +77,11 @@ when the process ends however it ends. With Rust 1.89 or later nex-db uses
 the standard file lock; with older compilers it opens the file without
 sharing on Windows, and on Unix treats the file as held while the process it
 names is alive.
+
+`auth/LOCK` (0.5) is the same kind of lock on the auth files, held by the
+process that opens the auth stores: the database's own process, or with
+split auth its auth process. A database opening waits up to ten seconds for
+it, for an auth process of the same database that is still ending.
 
 ## core/catalog.ckpt
 

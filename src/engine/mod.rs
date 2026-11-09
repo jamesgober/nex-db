@@ -183,6 +183,7 @@ pub(crate) trait BackupSink {
     fn file(&mut self, path: &Path) -> Result<()>;
     /// A file copied again by every later backup into the same directory:
     /// one that changes outside the log (data keys).
+    #[cfg_attr(not(feature = "auth"), allow(dead_code))]
     fn keys(&mut self, path: &Path) -> Result<()>;
     /// The contents of the store in `dir`: every key and value.
     fn store(
@@ -190,6 +191,18 @@ pub(crate) trait BackupSink {
         dir: &Path,
         pairs: &mut dyn Iterator<Item = (Vec<u8>, Vec<u8>)>,
     ) -> Result<()>;
+    /// For an engine in another process, which writes its own files: the
+    /// database directory, the backup's base directory, and whether only
+    /// key files are copied.
+    #[cfg_attr(not(feature = "split-auth"), allow(dead_code))]
+    fn target(&self) -> (&Path, &Path, bool);
+    /// The manifest items an engine in another process wrote.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] for an item of no known kind.
+    #[cfg_attr(not(feature = "split-auth"), allow(dead_code))]
+    fn merge(&mut self, items: Vec<(u8, String)>) -> Result<()>;
 }
 
 /// One transaction's work in one engine.
@@ -258,4 +271,18 @@ pub(crate) trait Registry {
 
     /// Call `f` with every hosted engine, in id order.
     fn each(&self, f: &mut dyn FnMut(&dyn Engine));
+
+    /// Why the engines can no longer take commits, when they cannot: the
+    /// auth process of split auth ended. The core then stops writes, as
+    /// after a failed log sync.
+    fn failed(&self) -> Option<Error> {
+        None
+    }
+
+    /// True when the core may copy the root key file into a backup; false
+    /// when an engine in another process does that, so this process never
+    /// reads the key.
+    fn copies_root_key(&self) -> bool {
+        true
+    }
 }

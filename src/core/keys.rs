@@ -105,6 +105,8 @@ impl fmt::Debug for Keys {
 /// [`Error::KeyUnavailable`] when the key cannot be read, is malformed, or
 /// is not the key this database was created with.
 pub(crate) fn root_key(keys: &Keys, auth_dir: &Path, new_database: bool) -> Result<RootKey> {
+    #[cfg(feature = "split-auth")]
+    let _ = LOADED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let root = match &keys.0 {
         Source::Directory => {
             let path = auth_dir.join(KEY_FILE);
@@ -123,6 +125,39 @@ pub(crate) fn root_key(keys: &Keys, auth_dir: &Path, new_database: bool) -> Resu
     };
     check(&root, auth_dir)?;
     Ok(root)
+}
+
+/// Root keys this process has loaded (or tried to): none, in an application
+/// that opens its databases with split auth.
+#[cfg(feature = "split-auth")]
+static LOADED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times this process has loaded a root key, for tests of split
+/// auth: the application process never does.
+#[cfg(feature = "split-auth")]
+#[doc(hidden)]
+#[must_use]
+pub fn root_keys_loaded() -> u64 {
+    LOADED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+impl Keys {
+    /// The source as the auth process's hello carries it: a kind (1 the
+    /// directory, 2 a file, 3 a variable) and its name.
+    #[cfg(feature = "split-auth")]
+    pub(crate) fn wire(&self) -> Result<(u8, Option<&str>)> {
+        Ok(match &self.0 {
+            Source::Directory => (1, None),
+            Source::File(path) => (
+                2,
+                Some(
+                    path.to_str()
+                        .ok_or(Error::invalid("key file", "must be UTF-8 with split auth"))?,
+                ),
+            ),
+            Source::Env(var) => (3, Some(var.as_str())),
+        })
+    }
 }
 
 /// Compare `root` with the directory's key check, writing the check when

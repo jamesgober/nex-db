@@ -53,6 +53,8 @@ default = ["auth", "content"]
 auth = ["dep:lsm-db", "dep:audit-trail", "crypt-io/kdf-argon2"]
 # The content engine: entities and routes.
 content = ["dep:lsm-db"]
+# The auth engines in a process of their own (`AuthMode::separate_process`).
+split-auth = ["auth"]
 # An observer that reports into metrics-lib (`nex_db::metrics::Recorder`).
 metrics = ["dep:metrics-lib"]
 # Second factors: TOTP and passkeys, through crypt-io's `otp` and `sign`
@@ -139,6 +141,11 @@ required-features = ["auth", "content"]
 [[test]]
 name = "kill"
 required-features = ["auth", "content"]
+
+[[test]]
+name = "split"
+harness = false
+required-features = ["split-auth", "content"]
 
 [[bench]]
 name = "core"

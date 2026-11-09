@@ -139,6 +139,27 @@ impl SessionSpec {
     pub(crate) fn ttl_ms(&self) -> u64 {
         u64::try_from(self.ttl.as_millis()).unwrap_or(u64::MAX)
     }
+
+    /// The idle limit and recheck time as given.
+    #[cfg(feature = "split-auth")]
+    pub(crate) fn limits(&self) -> (Option<Duration>, Option<Duration>) {
+        (self.idle, self.recheck)
+    }
+
+    /// A spec from its parts, checked as [`new`](Self::new) and
+    /// [`payload`](Self::payload) check them.
+    #[cfg(feature = "split-auth")]
+    pub(crate) fn from_parts(
+        ttl: Duration,
+        idle: Option<Duration>,
+        recheck: Option<Duration>,
+        payload: &[u8],
+    ) -> Result<Self> {
+        let mut spec = SessionSpec::new(ttl)?.payload(payload)?;
+        spec.idle = idle.filter(|d| !d.is_zero());
+        spec.recheck = recheck;
+        Ok(spec)
+    }
 }
 
 /// Up to [`MAX_PAYLOAD`] bytes, inline.
@@ -547,7 +568,38 @@ pub(crate) use crate::core::time_of;
 /// is wiped from memory when dropped. Hash before calling
 /// [`commit`](crate::Database::commit), because hashing takes tens of
 /// milliseconds by design and a commit closure may run more than once.
-pub struct HashedPassword(pub(crate) String);
+///
+/// With split auth the hash stays in the auth process, and this value is a
+/// handle to it: valid for ten minutes, and only for the database that made
+/// it.
+pub struct HashedPassword(pub(crate) Hashed);
+
+/// Where a hashed password is.
+pub(crate) enum Hashed {
+    /// The Argon2id string, here.
+    Phc(String),
+    /// A hash the auth process holds.
+    #[cfg(feature = "split-auth")]
+    Remote(super::split::HashHandle),
+}
+
+impl HashedPassword {
+    /// The Argon2id string, for the engine that stores it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] for a handle to a hash an auth process holds.
+    pub(crate) fn phc(&self) -> Result<&str> {
+        match &self.0 {
+            Hashed::Phc(phc) => Ok(phc),
+            #[cfg(feature = "split-auth")]
+            Hashed::Remote(_) => Err(Error::invalid(
+                "password",
+                "hashed by the auth process of another database",
+            )),
+        }
+    }
+}
 
 impl fmt::Debug for HashedPassword {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -557,8 +609,15 @@ impl fmt::Debug for HashedPassword {
 
 impl Drop for HashedPassword {
     fn drop(&mut self) {
-        let mut bytes = std::mem::take(&mut self.0).into_bytes();
-        crypt_io::wipe_vec(&mut bytes);
+        match &mut self.0 {
+            Hashed::Phc(phc) => {
+                let mut bytes = std::mem::take(phc).into_bytes();
+                crypt_io::wipe_vec(&mut bytes);
+            }
+            // Its handle tells the auth process to forget the hash.
+            #[cfg(feature = "split-auth")]
+            Hashed::Remote(_) => {}
+        }
     }
 }
 
@@ -590,7 +649,7 @@ mod tests {
 
     #[test]
     fn test_hashed_password_debug_hides_hash() {
-        let h = HashedPassword("$argon2id$secret".to_owned());
+        let h = HashedPassword(Hashed::Phc("$argon2id$secret".to_owned()));
         assert_eq!(format!("{h:?}"), "HashedPassword(..)");
     }
 }

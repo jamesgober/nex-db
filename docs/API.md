@@ -60,7 +60,7 @@ nex-db = { git = "https://github.com/jamesgober/nex-db", tag = "v0.4.1" }
 |---|---|---|
 | `auth` | yes | the auth engine: accounts, passwords, sessions |
 | `content` | yes | the content engine: entities, routes |
-| `split-auth` (0.5) | no | the auth engine in its own process |
+| `split-auth` (0.5) | no | the auth engine in its own process (see [Split auth](#split-auth-05)) |
 | `metrics` (0.4) | no | an observer that reports into metrics-lib |
 | `mfa` (0.4.1) | no | TOTP and passkeys, through crypt-io's AWS-LC backend: needs a C compiler; on Windows x86-64 no NASM |
 
@@ -170,7 +170,7 @@ From 0.3 the builder configures what `open` takes by default:
 | `Database::builder(dir)` | 0.3 | |
 | `.keys(Keys::file(path))`, `Keys::env(var)`, `Keys::in_directory()` | 0.3 | `Keys::in_directory()` |
 | `.keys(Keys::vault(name))`: the OS keychain | 0.4 | |
-| `.auth(AuthMode::embedded())`, `AuthMode::separate_process()` | 0.3 / 0.5 | embedded |
+| `.auth(AuthMode::embedded())`, `AuthMode::separate_process()`, `AuthMode::separate_process_program(path)` (feature `split-auth`) | 0.5 | embedded |
 | `.max_snapshot_age(Duration)` | 0.3 | 60 s |
 | `.checkpoint_every(bytes)`: log written between checkpoints, which bound the log and the time an open takes | 0.3 | 64 MiB |
 | `.max_sessions(n)`: sessions and revocations held at once; past it `issue_session` fails with `Busy` | 0.3 | 1,000,000 |
@@ -503,6 +503,52 @@ Inside `db.commit`, `tx.auth()` stages:
 
 A token staged with `tx.auth().issue_session` is valid only once the commit
 returns `Ok`.
+
+### Split auth (0.5)
+
+With the `split-auth` feature, `Database::builder(dir).auth(AuthMode::separate_process())`
+runs the auth engines in a process of their own, started from the running
+program (or from `AuthMode::separate_process_program(path)`). That process
+loads the root key, holds the sessions, the account stores, and the password
+hashes, and seals and opens the auth parts of the log. The application
+process keeps the commit log, the catalog, and the content engine, and holds
+no auth key: it stores the auth parts of each commit as they come sealed. A
+commit across auth and content is still one record of one log, so it stays
+atomic.
+
+| Call | Since | Grade |
+|---|---|---|
+| `nex_db::serve_auth_process() -> Result<bool>`: call first thing in `main`; `Ok(true)` in the auth process once the database closes (return from `main`), `Ok(false)` at once anywhere else | 0.5 | P1 |
+
+```rust,ignore
+fn main() -> nex_db::Result<()> {
+    if nex_db::serve_auth_process()? {
+        return Ok(());
+    }
+    let db = nex_db::Database::builder("data/site")
+        .auth(nex_db::AuthMode::separate_process())
+        .open()?;
+    # let _ = db;
+    Ok(())
+}
+```
+
+Every auth call is the same in both modes, with the same results. Each one
+crosses a pipe to the auth process (the child's standard input and output,
+which nothing else can reach): a session check is one round trip, a commit
+that touches auth one round trip per staged operation and two more. In split
+mode `hash_password` returns a handle to a hash the auth process keeps; it
+works with the database that made it for ten minutes, then gives
+`Error::Invalid { field: "password", .. }`: hash again. A database opens in
+either mode, and can change modes between opens.
+
+When the auth process ends or sends what does not parse, every auth call
+returns `Error::Storage` and the database stops writes, as after a failed log
+sync (`health()` is `ReadOnly`); reads of other engines go on. Restart the
+process to recover. Split mode keeps auth keys and state out of the
+application's memory; it does not keep files from a process running as the
+same user, so a key file in the directory (`Keys::in_directory`) stays as
+readable as before.
 
 ## The content engine
 

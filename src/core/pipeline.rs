@@ -487,6 +487,10 @@ impl Core {
         readers: &[&dyn Staged],
     ) -> std::result::Result<(Seq, Arc<[u8]>), Attempt> {
         let mut state = self.commit.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(err) = engines.failed() {
+            self.order.halt();
+            return Err(Attempt::Failed(err));
+        }
         if self.order.halted() {
             return Err(Attempt::Failed(halted_error()));
         }
@@ -522,7 +526,12 @@ impl Core {
                 .format();
             let flags = if work.sealed() { record::SEALED } else { 0 };
             let body = record.begin_section(work.engine(), flags, format, work.collection())?;
-            work.encode(seq, body)?;
+            // An engine that checks for conflicts as it encodes (split
+            // auth, in one round trip) reports one as `Error::Conflict`.
+            work.encode(seq, body).map_err(|err| match err {
+                Error::Conflict => Attempt::Conflict,
+                err => Attempt::Failed(err),
+            })?;
             record.end_section()?;
         }
         let bytes = record.finish()?;

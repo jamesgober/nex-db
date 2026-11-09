@@ -107,7 +107,7 @@ impl Role {
         &self.inherits
     }
 
-    fn check(&self) -> Result<()> {
+    pub(crate) fn check(&self) -> Result<()> {
         if !valid_name(&self.name) {
             return Err(Error::invalid("role name", "must be 1 to 64 bytes"));
         }

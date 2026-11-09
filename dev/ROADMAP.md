@@ -99,6 +99,7 @@
 ## 0.6.0 Optimisation
 
 - Benchmarks for every hot path with baselines; zero allocations on read hits proved.
+  - [x] Session table: cells that never move, one index probe per lookup (`PLAN.md` D-111); token parsing by table (D-112).
 - **Exit:** every performance target met, or the gap recorded with a plan.
 
 ## 0.7.0 Hardening

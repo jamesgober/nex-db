@@ -85,7 +85,7 @@ mod plain {
             table
                 .shards
                 .iter()
-                .any(|s| s.count.load(Ordering::Relaxed) > 1)
+                .any(|s| s.state.load(Ordering::Relaxed) & 0xFF > 0)
         );
         // Remove two thirds, then insert as many new ones.
         for n in (0..10_000u64).filter(|n| n % 3 != 1) {
@@ -116,25 +116,71 @@ mod plain {
     }
 
     #[test]
-    fn test_a_drained_level_is_reused() {
-        let table: Table<3, 0> = Table::new(1, 8, 64);
-        let ats: Vec<At> = (0..7u64)
-            .map(|n| table.insert(&key(n), &words(n), None, 0).unwrap())
-            .collect();
-        for at in ats {
-            assert!(table.remove(at));
+    fn test_churn_reuses_cells_and_keeps_the_index_small() {
+        let table: Table<3, 0> = Table::new(1, 8, 100_000);
+        let mut live: Vec<(u64, At)> = Vec::new();
+        for n in 0..200_000u64 {
+            let at = table.insert(&key(n), &words(n), None, 0).unwrap();
+            live.push((n, at));
+            if live.len() > 50 {
+                let (_, at) = live.remove(0);
+                assert!(table.remove(at));
+            }
         }
         let shard = &table.shards[0];
-        let level = shard.levels[0].get().unwrap();
-        assert!(
-            level
-                .ctrl
-                .iter()
-                .all(|g| g.load(Ordering::Relaxed) == u64::MAX)
-        );
-        for n in 100..107u64 {
-            let at = table.insert(&key(n), &words(n), None, 0).unwrap();
-            assert_eq!(at.level, 0);
+        let w = shard.writer.lock().unwrap();
+        // Cells come back from the free list; tombstones go at rebuilds.
+        assert!(w.next <= 51);
+        assert!(w.class <= 5, "class {}", w.class);
+        drop(w);
+        for (n, _) in &live {
+            assert_eq!(table.get(&key(*n)).unwrap().words, words(*n));
+        }
+        assert!(table.get(&key(0)).is_none());
+    }
+
+    #[test]
+    fn test_readers_never_miss_a_present_key_across_rebuilds() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let table: Arc<Table<1, 0>> = Arc::new(Table::new(1, 8, 200_000));
+        for n in 0..32u64 {
+            let _ = table.insert(&key(n), &[n], None, 0).unwrap();
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let table = Arc::clone(&table);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut reads = 0u64;
+                    while !stop.load(Ordering::Relaxed) || reads < 10_000 {
+                        let n = reads % 32;
+                        assert_eq!(table.get(&key(n)).map(|f| f.words), Some([n]));
+                        reads += 1;
+                    }
+                })
+            })
+            .collect();
+        // Growth, then churn that leaves tombstones, each forcing rebuilds.
+        let mut ats = Vec::new();
+        for n in 1_000..60_000u64 {
+            ats.push(table.insert(&key(n), &[n], None, 0).unwrap());
+        }
+        for at in ats.drain(..) {
+            assert!(table.remove(at));
+        }
+        for n in 100_000..160_000u64 {
+            let at = table.insert(&key(n), &[n], None, 0).unwrap();
+            if n % 2 == 0 {
+                assert!(table.remove(at));
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for r in readers {
+            r.join().unwrap();
         }
     }
 
@@ -184,10 +230,23 @@ mod plain {
     }
 
     #[test]
+    fn test_chunks_cover_every_item_once() {
+        let mut expect = (0, 0);
+        for n in 0..(GROWING + 3 * LAST_CHUNK) {
+            assert_eq!(chunk_of(n), expect, "item {n}");
+            expect.1 += 1;
+            if expect.1 == chunk_len(expect.0) {
+                expect = (expect.0 + 1, 0);
+            }
+            assert_eq!(chunks_for(n + 1), chunk_of(n).0 + 1);
+        }
+        assert_eq!(chunks_for(0), 0);
+    }
+
+    #[test]
     fn test_at_round_trips_through_u64() {
         let at = At {
             shard: 63,
-            level: 31,
             index: u32::MAX,
         };
         assert_eq!(At::from_u64(at.to_u64()), at);

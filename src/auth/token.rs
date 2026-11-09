@@ -96,41 +96,53 @@ impl Drop for Token {
     }
 }
 
-fn decode_char(c: u8) -> Option<u32> {
-    let v = match c {
-        b'A'..=b'Z' => c - b'A',
-        b'a'..=b'z' => c - b'a' + 26,
-        b'0'..=b'9' => c - b'0' + 52,
-        b'-' => 62,
-        b'_' => 63,
-        _ => return None,
-    };
-    Some(u32::from(v))
-}
+/// Each byte's 6-bit value in the alphabet; 0xFF for bytes outside it.
+const DECODE: [u8; 256] = {
+    let mut table = [0xFF; 256];
+    let mut i = 0;
+    while i < ALPHABET.len() {
+        table[ALPHABET[i] as usize] = i as u8;
+        i += 1;
+    }
+    table
+};
 
 /// The random part of a token in text form, or `None` when the text is not a
 /// token this version issues (wrong length, alphabet, or version).
-/// Allocates nothing.
+/// Allocates nothing, and decodes straight into the one buffer it wipes.
 pub(crate) fn parse(text: &str) -> Option<Zeroizing<[u8; 32]>> {
     let text = text.as_bytes();
     if text.len() != TEXT_LEN {
         return None;
     }
-    let mut binary = Zeroizing::new([0u8; BINARY_LEN]);
-    for (quad, out) in text.chunks_exact(4).zip(binary.chunks_exact_mut(3)) {
-        let mut n = 0u32;
-        for &c in quad {
-            n = (n << 6) | decode_char(c)?;
-        }
+    // Any byte outside the alphabet sets the top bit of `bad`.
+    let mut bad = 0u8;
+    let mut quad = |q: &[u8]| {
+        q.iter().fold(0u32, |n, &c| {
+            let v = DECODE[usize::from(c)];
+            bad |= v;
+            (n << 6) | u32::from(v & 63)
+        })
+    };
+    // The first quad is the version and the routing prefix's first two
+    // bytes; the second, the prefix's last byte and two random bytes.
+    let head = quad(&text[..4]);
+    let next = quad(&text[4..8]);
+    let mut random = Zeroizing::new([0u8; 32]);
+    random[0] = (next >> 8) as u8;
+    random[1] = next as u8;
+    for (q, out) in text[8..]
+        .chunks_exact(4)
+        .zip(random[2..].chunks_exact_mut(3))
+    {
+        let n = quad(q);
         out[0] = (n >> 16) as u8;
         out[1] = (n >> 8) as u8;
         out[2] = n as u8;
     }
-    if binary[0] != VERSION {
+    if bad & 0x80 != 0 || (head >> 16) as u8 != VERSION {
         return None;
     }
-    let mut random = Zeroizing::new([0u8; 32]);
-    random.copy_from_slice(&binary[4..]);
     Some(random)
 }
 
@@ -171,6 +183,21 @@ mod tests {
     fn test_parse_wrong_version_is_none() {
         // Version byte 0: the first four characters encode 0x00 0x00 0x00.
         let text = format!("AAAA{}", "A".repeat(TEXT_LEN - 4));
+        assert!(parse(&text).is_none());
+    }
+
+    #[test]
+    fn test_parse_bytes_outside_the_alphabet_are_none() {
+        let (token, _) = Token::generate().unwrap();
+        for bad in ["=", "\0", " ", "\u{7f}"] {
+            let mut text = token.as_str().to_owned();
+            text.replace_range(40..41, bad);
+            assert!(parse(&text).is_none(), "{bad:?}");
+        }
+        // Two bytes of one character in place of two characters.
+        let mut text = token.as_str().to_owned();
+        text.replace_range(20..22, "\u{e9}");
+        assert_eq!(text.len(), TEXT_LEN);
         assert!(parse(&text).is_none());
     }
 

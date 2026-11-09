@@ -460,7 +460,7 @@ impl Database {
     /// quick, and [`restore`](crate::restore) can then reach any commit in
     /// between. Data stays as the database stores it: auth records sealed,
     /// content as stored. The root key is copied only for a database whose
-    /// key lives in its own directory ([`BackupInfo::holds_key`]).
+    /// key lives in its own directory ([`BackupInfo::holds_key`](crate::BackupInfo::holds_key)).
     ///
     /// ```no_run
     /// # fn main() -> nex_db::Result<()> {

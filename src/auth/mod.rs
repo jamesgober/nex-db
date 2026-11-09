@@ -789,10 +789,15 @@ impl AuthEngine {
     /// The account's record as a snapshot at `at` sees it.
     fn load_account_at(&self, account: AccountId, at: Seq) -> Result<Option<AccountRecord>> {
         let key = account_key(self.collection, account);
+        // The store first, the versions second (see `core::versions`).
+        let stored = self.accounts.get(&key)?;
         match self.versions.at(&key, at) {
             Some(Some(value)) => self.decode_account(account, &key, &value),
             Some(None) => Ok(None),
-            None => self.load_account(account),
+            None => match stored {
+                Some(value) => self.decode_account(account, &key, &value),
+                None => Ok(None),
+            },
         }
     }
 

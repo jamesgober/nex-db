@@ -10,6 +10,12 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 - The session table keeps entries in place and finds them with one index probe: about half the memory per session, and faster checks of unknown tokens.
 - Session tokens parse through a lookup table.
+- Content reads of entries served before come from a cache of decoded entries (up to 4,096 entities per space), and cloning an `Entry` no longer copies its fields.
+
+### Fixed
+
+- Two reads of one entity or account in one `db.read` could disagree when a commit applied between them.
+- A read could see a commit that was applied but not yet visible, and then an older version on the next read.
 
 ## [0.5.0] - 2026-11-09
 

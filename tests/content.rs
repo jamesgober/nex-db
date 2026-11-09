@@ -263,6 +263,84 @@ fn test_a_snapshot_keeps_the_routes_of_its_time() {
     assert!(db.content().resolve(DEFAULT_SITE, "/s").unwrap().is_none());
 }
 
+#[test]
+fn test_cached_entries_follow_every_change_and_snapshots_keep_theirs() {
+    let dir = TempDir::new("cache");
+    let db = Database::open(&dir.0).unwrap();
+    let rid = db
+        .content()
+        .create(Entity::new("page").field("title", "One").path("/c"))
+        .unwrap();
+    let _ = db.content().publish(rid).unwrap();
+    // Read twice: the second read is served from the cache.
+    assert_eq!(title(&db, rid).as_deref(), Some("One"));
+    assert_eq!(title(&db, rid).as_deref(), Some("One"));
+    let seen = db
+        .read(|r| {
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    db.content()
+                        .save_draft(rid, Patch::new().set("title", "Two"))
+                        .unwrap();
+                    let _ = db.content().publish(rid).unwrap();
+                    // The latest, read (and cached) while the snapshot runs.
+                    assert_eq!(title(&db, rid).as_deref(), Some("Two"));
+                    assert_eq!(title(&db, rid).as_deref(), Some("Two"));
+                })
+                .join()
+                .unwrap()
+            });
+            let entry = r.content().get(rid)?.unwrap();
+            Ok(entry
+                .field("title")
+                .and_then(Value::as_text)
+                .map(str::to_owned))
+        })
+        .unwrap();
+    assert_eq!(seen.as_deref(), Some("One"));
+    assert_eq!(title(&db, rid).as_deref(), Some("Two"));
+    db.content().unpublish(rid).unwrap();
+    assert!(db.content().get(rid).unwrap().is_none());
+    let _ = db.content().publish(rid).unwrap();
+    assert_eq!(title(&db, rid).as_deref(), Some("Two"));
+    db.content().trash(rid).unwrap();
+    assert!(db.content().get(rid).unwrap().is_none());
+}
+
+#[test]
+fn test_cached_entries_survive_concurrent_publishing() {
+    let dir = TempDir::new("cache-race");
+    let db = Database::open(&dir.0).unwrap();
+    let rid = db
+        .content()
+        .create(Entity::new("page").field("title", "0").path("/r"))
+        .unwrap();
+    let _ = db.content().publish(rid).unwrap();
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|s| {
+        for _ in 0..3 {
+            s.spawn(|| {
+                let mut last = 0u32;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Titles only grow: a stale entry served after a newer
+                    // one would go back.
+                    let n: u32 = title(&db, rid).unwrap().parse().unwrap();
+                    assert!(n >= last, "{n} after {last}");
+                    last = n;
+                }
+            });
+        }
+        for i in 1..=200u32 {
+            db.content()
+                .save_draft(rid, Patch::new().set("title", i.to_string().as_str()))
+                .unwrap();
+            let _ = db.content().publish(rid).unwrap();
+            assert_eq!(title(&db, rid), Some(i.to_string()));
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
 fn titles(page: &nex_db::Page<nex_db::Entry>) -> Vec<String> {
     page.items()
         .iter()

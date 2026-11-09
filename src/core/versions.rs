@@ -15,14 +15,33 @@
 //!
 //! Cost: one store read per written key in `apply` (for the value before),
 //! and memory for the keys written while a snapshot runs. Pruned after every
-//! commit, so without running snapshots the overlay stays empty.
+//! commit, so without running snapshots the overlay stays empty, and a read
+//! then takes no lock: it sees a count of zero and goes to the store.
+//!
+//! A read that is not a registered snapshot (a plain `get`) can hold a
+//! sequence number older than the watermark, so older than every version a
+//! key keeps. It gets the oldest kept version, the
+//! newest one at or below the watermark, which was visible when the
+//! watermark was taken. Reading the store instead would be wrong: the
+//! store may already hold a commit that is applied but not yet visible,
+//! and the reader's next read, at the visible sequence number, would then
+//! find the key tracked and go back to an older version.
+//!
+//! A reader reads the store first and asks the overlay second. An apply
+//! records a key here before it writes the store, so a reader that saw the
+//! store's new value finds the key tracked and takes its version instead;
+//! asking first would leave a window where the key is not tracked yet but
+//! the store already holds a value the snapshot must not see.
 
 // A build with no engine feature keeps no versions outside the tests.
 #![cfg_attr(not(any(feature = "auth", feature = "content")), allow(dead_code))]
 
 use std::{
     collections::HashMap,
-    sync::{Arc, PoisonError, RwLock},
+    sync::{
+        Arc, PoisonError, RwLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use super::record::Seq;
@@ -32,10 +51,26 @@ use crate::error::Result;
 /// key was first written while tracked, at sequence number 0.
 type Chain = Vec<(Seq, Option<Arc<[u8]>>)>;
 
+/// What [`Versions::lookup`] found.
+#[derive(Debug)]
+pub(crate) enum Lookup {
+    /// Not tracked: read the store.
+    Untracked,
+    /// Tracked: the value at the snapshot (`None`: did not exist), and
+    /// whether it is the key's newest version.
+    Tracked {
+        value: Option<Arc<[u8]>>,
+        newest: bool,
+    },
+}
+
 /// Recent versions by key.
 #[derive(Debug, Default)]
 pub(crate) struct Versions {
     keys: RwLock<HashMap<Vec<u8>, Chain>>,
+    /// Keys tracked, set under the write lock: zero lets a reader skip the
+    /// lock.
+    tracked: AtomicUsize,
 }
 
 impl Versions {
@@ -59,25 +94,64 @@ impl Versions {
             let _ = keys.insert(key.to_vec(), vec![(0, old)]);
         }
         if let Some(chain) = keys.get_mut(key) {
-            // A replayed record is already there.
-            if chain.last().is_some_and(|(last, _)| *last >= seq) {
-                return Ok(());
+            match chain.last_mut() {
+                // A later commit is recorded already (a replay).
+                Some((last, _)) if *last > seq => return Ok(()),
+                // A second write to the key in one commit: a snapshot at
+                // `seq` sees the last one, as the store will.
+                Some((last, held)) if *last == seq => *held = value.map(Arc::from),
+                _ => chain.push((seq, value.map(Arc::from))),
             }
-            chain.push((seq, value.map(Arc::from)));
         }
+        self.tracked.store(keys.len(), Ordering::Release);
         Ok(())
+    }
+
+    /// True when any key is tracked; false lets a caller skip building a
+    /// key to ask with.
+    pub(crate) fn tracks_any(&self) -> bool {
+        self.tracked.load(Ordering::Acquire) != 0
+    }
+
+    /// What a snapshot at `at` sees of `key`: whether the key is tracked,
+    /// and if so its value then and whether that is its newest version (so
+    /// the store's latest state as well).
+    pub(crate) fn lookup(&self, key: &[u8], at: Seq) -> Lookup {
+        if self.tracked.load(Ordering::Acquire) == 0 {
+            return Lookup::Untracked;
+        }
+        let keys = self.keys.read().unwrap_or_else(PoisonError::into_inner);
+        let Some(chain) = keys.get(key) else {
+            return Lookup::Untracked;
+        };
+        // A snapshot older than every kept version sees the oldest (see
+        // the module notes).
+        let i = chain.iter().rposition(|(seq, _)| *seq <= at).unwrap_or(0);
+        match chain.get(i) {
+            Some((_, value)) => Lookup::Tracked {
+                value: value.clone(),
+                newest: i + 1 == chain.len(),
+            },
+            None => Lookup::Untracked,
+        }
     }
 
     /// The value `key` had at snapshot `at`, when the key is tracked:
     /// `Some(None)` means it did not exist then. `None` means not tracked:
     /// read the store.
     pub(crate) fn at(&self, key: &[u8], at: Seq) -> Option<Option<Arc<[u8]>>> {
+        if self.tracked.load(Ordering::Acquire) == 0 {
+            return None;
+        }
         let keys = self.keys.read().unwrap_or_else(PoisonError::into_inner);
         let chain = keys.get(key)?;
+        // A snapshot older than every kept version sees the oldest (see
+        // the module notes).
         chain
             .iter()
             .rev()
             .find(|(seq, _)| *seq <= at)
+            .or_else(|| chain.first())
             .map(|(_, value)| value.clone())
     }
 
@@ -97,6 +171,7 @@ impl Versions {
             let _ = chain.drain(..keep_from);
             true
         });
+        self.tracked.store(keys.len(), Ordering::Release);
     }
 
     /// Keys tracked now.
@@ -152,10 +227,49 @@ mod tests {
     }
 
     #[test]
-    fn test_replayed_record_is_ignored() {
+    fn test_older_than_kept_sees_the_oldest_kept_version_not_the_store() {
+        let versions = Versions::new();
+        versions
+            .record(b"k", 2, Some(b"v2"), || Ok(Some(b"v1".to_vec())))
+            .unwrap();
+        versions.record(b"k", 3, Some(b"v3"), || Ok(None)).unwrap();
+        // The watermark passes 2 while 3 is applied and not yet visible.
+        versions.prune(2);
+        // A plain read that took its sequence number (1) before.
+        assert_eq!(bytes(&versions.at(b"k", 1)), Some(Some(&b"v2"[..])));
+        assert!(matches!(
+            versions.lookup(b"k", 1),
+            Lookup::Tracked { value: Some(v), newest: false } if &*v == b"v2"
+        ));
+        assert!(matches!(
+            versions.lookup(b"k", 3),
+            Lookup::Tracked { value: Some(v), newest: true } if &*v == b"v3"
+        ));
+    }
+
+    #[test]
+    fn test_a_second_write_in_one_commit_replaces_the_first() {
         let versions = Versions::new();
         versions.record(b"k", 5, Some(b"x"), || Ok(None)).unwrap();
         versions.record(b"k", 5, Some(b"y"), || Ok(None)).unwrap();
-        assert_eq!(bytes(&versions.at(b"k", 5)), Some(Some(&b"x"[..])));
+        assert_eq!(bytes(&versions.at(b"k", 5)), Some(Some(&b"y"[..])));
+        assert_eq!(bytes(&versions.at(b"k", 4)), Some(None));
+        assert!(matches!(
+            versions.lookup(b"k", 5),
+            Lookup::Tracked { newest: true, .. }
+        ));
+    }
+
+    #[test]
+    fn test_a_replayed_earlier_record_is_ignored() {
+        let versions = Versions::new();
+        versions
+            .record(b"k", 7, Some(b"seven"), || Ok(None))
+            .unwrap();
+        versions
+            .record(b"k", 5, Some(b"five"), || Ok(None))
+            .unwrap();
+        assert_eq!(bytes(&versions.at(b"k", 7)), Some(Some(&b"seven"[..])));
+        assert_eq!(bytes(&versions.at(b"k", 6)), Some(None));
     }
 }

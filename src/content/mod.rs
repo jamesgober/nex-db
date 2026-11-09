@@ -10,6 +10,7 @@
 //! Staging computes every record a commit writes (heads, revisions, routes);
 //! `apply` stores them as they are, so a replay writes the same bytes.
 
+mod cache;
 pub(crate) mod entity;
 pub(crate) mod lists;
 pub(crate) mod locale;
@@ -33,6 +34,7 @@ use std::{
 use lsm_db::{Batch, Lsm};
 
 use self::{
+    cache::EntryCache,
     entity::{
         Action, Body, Entity, Entry, Head, Patch, Published, Revision, RevisionInfo, RouteEntry,
         RouteKind, Status, Visibility, decode_route, encode_route, ref_set,
@@ -53,7 +55,7 @@ use crate::{
         now_ms,
         pipeline::SnapshotGuard,
         record::{Section, Seq},
-        versions::Versions,
+        versions::{Lookup, Versions},
     },
     engine::{Conflict, Engine, EngineId, Staged},
     error::{Error, Result},
@@ -63,6 +65,8 @@ use crate::{
 
 /// Deepest a page tree goes: an entity has at most 64 ancestors.
 const MAX_DEPTH: usize = 64;
+/// Entities whose published entries a space keeps decoded in memory.
+const ENTRY_CACHE: usize = 4096;
 
 /// Conflict key of an entity's place in the page tree: written by a parent
 /// change for the entity and each ancestor of its new parent, so two
@@ -124,6 +128,15 @@ fn entity_prefix(collection: u32) -> Vec<u8> {
 fn entity_key(collection: u32, rid: Rid) -> Vec<u8> {
     let mut key = entity_prefix(collection);
     key.extend_from_slice(rid.as_bytes());
+    key
+}
+
+/// [`entity_key`] on the stack, for reads that must not allocate.
+fn entity_key_array(collection: u32, rid: Rid) -> [u8; 21] {
+    let mut key = [0; 21];
+    key[..4].copy_from_slice(&collection.to_be_bytes());
+    key[4] = b'e';
+    key[5..].copy_from_slice(rid.as_bytes());
     key
 }
 
@@ -238,6 +251,8 @@ pub(crate) struct ContentEngine {
     type_index: Mutex<TypeIndex>,
     /// Entity head versions kept for running snapshots.
     versions: Versions,
+    /// Published entries read lately, decoded.
+    cache: EntryCache,
     conflicts: ConflictTable,
     /// The latest publication time given out or stored: each publication
     /// is later than it, so listings follow publication order even when
@@ -341,6 +356,7 @@ impl ContentEngine {
             types: RwLock::new(types),
             type_index: Mutex::new(type_index),
             versions: Versions::new(),
+            cache: EntryCache::new(ENTRY_CACHE),
             conflicts: ConflictTable::new(),
             published_ms: AtomicU64::new(published_ms),
         })
@@ -383,11 +399,27 @@ impl ContentEngine {
 
     /// The stored head bytes of `rid` as a snapshot at `at` sees them.
     fn head_bytes_at(&self, rid: Rid, at: Seq) -> Result<Option<Vec<u8>>> {
+        Ok(self.head_bytes_latest(rid, at)?.0)
+    }
+
+    /// As [`head_bytes_at`](Self::head_bytes_at), and whether they are the
+    /// store's latest (no version kept for snapshots stood in for them).
+    fn head_bytes_latest(&self, rid: Rid, at: Seq) -> Result<(Option<Vec<u8>>, bool)> {
         let key = entity_key(self.collection, rid);
-        match self.versions.at(&key, at) {
-            Some(value) => Ok(value.map(|v| v.to_vec())),
-            None => Ok(self.store.get(&key)?),
+        // The store first, the versions second (see `core::versions`).
+        let stored = self.store.get(&key)?;
+        match self.versions.lookup(&key, at) {
+            Lookup::Untracked => Ok((stored, true)),
+            Lookup::Tracked { value, newest } => Ok((value.map(|v| v.to_vec()), newest)),
         }
+    }
+
+    /// The space's default locale, without copying the settings.
+    fn default_locale(&self) -> Locale {
+        self.space
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .default_locale
     }
 
     fn head_at(&self, rid: Rid, at: Seq) -> Result<Option<Head>> {
@@ -464,12 +496,45 @@ impl ContentEngine {
     /// `asked` (the space's default locale when `None`), else along its
     /// fallback chain, else in the entity's own locale.
     fn published_in(&self, rid: Rid, asked: Option<Locale>, at: Seq) -> Result<Option<Entry>> {
-        let Some(bytes) = self.head_bytes_at(rid, at)? else {
+        let asked = asked.unwrap_or_else(|| self.default_locale());
+        // The cache holds the store's latest state, which is what `at` sees
+        // unless a version is kept for the entity (checked after the cache,
+        // see `cache`).
+        if let Some(entry) = self.cache.get(rid, asked) {
+            let sees_latest = !self.versions.tracks_any()
+                || match self
+                    .versions
+                    .lookup(&entity_key_array(self.collection, rid), at)
+                {
+                    Lookup::Untracked => true,
+                    Lookup::Tracked { newest, .. } => newest,
+                };
+            if sees_latest {
+                return Ok(Some(entry));
+            }
+        }
+        let ticket = self.cache.ticket(rid);
+        let (bytes, latest) = self.head_bytes_latest(rid, at)?;
+        let entry = self.published_from(rid, bytes, asked, at)?;
+        if let (Some(entry), true) = (&entry, latest) {
+            self.cache.fill(ticket, rid, asked, entry);
+        }
+        Ok(entry)
+    }
+
+    /// The published entry of `rid` from its head `bytes`.
+    fn published_from(
+        &self,
+        rid: Rid,
+        bytes: Option<Vec<u8>>,
+        asked: Locale,
+        at: Seq,
+    ) -> Result<Option<Entry>> {
+        let Some(bytes) = bytes else {
             return Ok(None);
         };
         let head = Head::decode(&bytes, at)?;
         let space = self.space();
-        let asked = asked.unwrap_or(space.default_locale);
         let found = space
             .order(asked)
             .chain(std::iter::once(head.base().locale))
@@ -757,6 +822,13 @@ impl Engine for ContentEngine {
             self.store.write(batch)?;
             self.applied.store(seq, Ordering::Release);
         }
+        // After the store holds the change, before the commit is visible.
+        for (head, _) in &heads {
+            self.cache.forget(head.rid);
+        }
+        for (rid, _) in &deleted {
+            self.cache.forget(*rid);
+        }
         for (site, path, entry) in routes {
             self.routes.set(&site, &path, seq, entry);
             changes.push(Change::RouteChanged { site, path });
@@ -778,6 +850,8 @@ impl Engine for ContentEngine {
         }
         if let Some(space) = space {
             *self.space.write().unwrap_or_else(PoisonError::into_inner) = space;
+            // Fallback chains and the default locale shape every entry.
+            self.cache.clear();
         }
         if let Some(types) = types {
             // New unique fields index entities already stored.
@@ -2895,6 +2969,98 @@ impl ContentRead<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A section that publishes `rid` with title `n` as revision `n`.
+    fn publish_section(rid: Rid, n: u32) -> Vec<u8> {
+        let mut head = Entity::new("page")
+            .field("title", n.to_string().as_str())
+            .into_head(rid, 1, Locale::EN)
+            .unwrap();
+        head.last_revision = n;
+        head.variants[0].published = Some(Published {
+            revision: n,
+            at_ms: u64::from(n),
+            path: None,
+            refs: Vec::new(),
+        });
+        let revision =
+            Revision::new(Locale::EN, u64::from(n), "", head.base().draft.clone()).unwrap();
+        let mut body = Vec::new();
+        let mut w = Writer::new(&mut body);
+        w.u8(OP_PUT_REVISION);
+        w.bytes(rid.as_bytes());
+        w.u32(n);
+        w.bytes32(&revision.encode().unwrap()).unwrap();
+        w.u8(OP_PUT_HEAD);
+        w.bytes(rid.as_bytes());
+        w.bytes32(&head.encode().unwrap()).unwrap();
+        body
+    }
+
+    fn apply_section(engine: &ContentEngine, seq: Seq, body: &[u8]) {
+        engine
+            .apply(
+                seq,
+                &Section {
+                    engine: EngineId::CONTENT,
+                    flags: 0,
+                    format: FORMAT,
+                    collection: 2,
+                    body,
+                },
+                &mut Vec::new(),
+            )
+            .unwrap();
+    }
+
+    fn title_at(engine: &ContentEngine, rid: Rid, at: Seq) -> Option<String> {
+        engine.published_in(rid, None, at).unwrap().and_then(|e| {
+            e.field("title")
+                .and_then(|v| v.as_text())
+                .map(str::to_owned)
+        })
+    }
+
+    /// The interleaving the reader-threads test found: a plain read takes
+    /// its sequence number (1); commit 2 becomes visible and the watermark
+    /// passes it; commit 3 is applied, not yet visible; the reader reads.
+    /// It must see commit 2, not the store's commit 3, or its next read (at
+    /// 2) goes back. Forced here by applying and reclaiming by hand.
+    #[test]
+    fn test_a_read_older_than_the_watermark_never_sees_an_invisible_commit() {
+        let dir = std::env::temp_dir().join(format!(
+            "nex-db-content-watermark-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        {
+            let engine = ContentEngine::open(&dir, 2, Arc::default()).unwrap();
+            let rid = Rid::from_bytes([5; 16]);
+            apply_section(&engine, 1, &publish_section(rid, 1));
+            engine.reclaim(1);
+            apply_section(&engine, 2, &publish_section(rid, 2));
+            // Cached as the latest while commit 2 is the newest.
+            assert_eq!(title_at(&engine, rid, 2).as_deref(), Some("2"));
+            apply_section(&engine, 3, &publish_section(rid, 3));
+            engine.reclaim(2);
+            // The reader that took 1 before any of this, then reads twice.
+            assert_eq!(title_at(&engine, rid, 1).as_deref(), Some("2"));
+            assert_eq!(title_at(&engine, rid, 2).as_deref(), Some("2"));
+            // Visible now: commit 3, from the store and then the cache.
+            assert_eq!(title_at(&engine, rid, 3).as_deref(), Some("3"));
+            assert_eq!(title_at(&engine, rid, 3).as_deref(), Some("3"));
+            assert_eq!(title_at(&engine, rid, 2).as_deref(), Some("2"));
+            engine.reclaim(3);
+            assert_eq!(title_at(&engine, rid, 1).as_deref(), Some("3"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_entity_key_array_matches_entity_key() {
+        let rid = Rid::from_bytes([7; 16]);
+        assert_eq!(entity_key_array(3, rid).to_vec(), entity_key(3, rid));
+    }
 
     #[test]
     fn test_route_key_separates_site_and_path() {

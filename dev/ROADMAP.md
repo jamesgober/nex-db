@@ -2,7 +2,7 @@
 
 > One milestone at a time, each ending with something that runs. Work only on the current milestone. Requirements (FR, NFR) are in [`PLAN.md`](./PLAN.md).
 
-**Current milestone: 0.6.0 (optimisation). 0.1.0 to 0.5.0 are released (GitHub pre-releases).**
+**Current milestone: 0.7.0 (hardening). 0.1.0 to 0.6.0 are released (GitHub pre-releases).**
 
 ---
 
@@ -104,7 +104,8 @@
   - [x] Split auth channel: buffered reads, one write per reply (`PLAN.md` D-117).
   - [x] Benchmarks for memory per session and page, recovery, uncached reads, and the standard map comparison (`PLAN.md` D-119); smaller last table chunk (D-118).
 - [x] Defence idea: canary routes (`PLAN.md` D-120).
-- **Exit:** every performance target met, or the gap recorded with a plan.
+- **Exit:** every performance target met, or the gap recorded with a plan. Released 2026-11-09. Targets not met yet, each with a plan: the session check (warm and at scale), the split-auth check, durable commit latency and throughput on the development machine's disks, route resolution, memory per session, and the session table against a standard map read-only.
+- Moved to 0.7: the remaining measurements (overlay flush cadence, sequencer throughput, group-commit window, route index against compiled routers, co-located locales, per-account key unwrap); the preview index for drafts; device-bound sessions; the P2 items moved from 0.5 (devices, `revert`, descendant paths, releases, assets, `Keys::vault`).
 
 ## 0.7.0 Hardening
 

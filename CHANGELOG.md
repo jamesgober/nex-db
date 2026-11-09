@@ -6,6 +6,10 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-09
+
+Optimisation: the session table, a cache of published entries, allocation-free read hits, and canary routes.
+
 ### Added
 
 - Canary routes: `add_canary(site, path)` marks a path nothing is served at. `resolve` answers `None` for it, as for any unknown path, and raises `SecurityEvent::CanaryRequested`. Route records gain kind 4.
@@ -165,7 +169,8 @@ The walking skeleton.
 - Repository scaffold: `Cargo.toml` (edition 2024, MSRV 1.85), `src/lib.rs` with `VERSION`, CI on Linux, macOS, and Windows (stable and 1.85), `cargo deny` configuration.
 - `dev/PLAN.md`, `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/nex-db/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/jamesgober/nex-db/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/jamesgober/nex-db/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/nex-db/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/jamesgober/nex-db/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/jamesgober/nex-db/compare/v0.3.0...v0.4.0

@@ -11,6 +11,7 @@
 //! or identifiers. The operations below are the whole surface.
 
 mod audit;
+mod datakeys;
 pub(crate) mod keys;
 #[cfg(feature = "mfa")]
 pub(crate) mod passkey;
@@ -129,6 +130,18 @@ const PASSKEY_REGISTRATION_PAYLOAD: [u8; 4] = [b'S', 0xF1, 0, 0];
 const PASSKEY_SIGN_IN_PAYLOAD: [u8; 4] = [b'S', 0xF2, 0, 0];
 /// How long a second-factor challenge lasts: five minutes.
 const CHALLENGE_MS: u64 = 5 * 60 * 1000;
+/// Create an account whose record is sealed under its data key, with the
+/// time it was made in the clear: replaying the log never needs the key.
+const OP_CREATE_KEYED_ACCOUNT: u8 = 15;
+/// Erase an account: its records go, and its data key is destroyed.
+const OP_ERASE_ACCOUNT: u8 = 16;
+/// The epoch of an erased account: its sessions end as `Erased`.
+pub(crate) const ERASED_EPOCH: u32 = u32::MAX;
+/// The data key file, next to the account store.
+const KEYS_FILE: &str = "account-keys";
+/// A data key made this long ago whose account was never created is
+/// dropped at the next checkpoint.
+const ORPHAN_KEY_MS: u64 = 60 * 1000;
 
 /// What an account update changed, for the audit chain.
 const UPDATE_STANDING: u8 = 1;
@@ -184,6 +197,8 @@ const SLOT_REVOKED: u8 = 2;
 /// A revocation by `revoke_all`, kept only in checkpoints (the log raises
 /// the epoch instead).
 const REASON_SIGNED_OUT_EVERYWHERE: u8 = 3;
+/// An erased account's session, kept only in checkpoints.
+const REASON_ERASED: u8 = 4;
 
 /// Account record format.
 const ACCOUNT_FORMAT: u8 = 1;
@@ -220,11 +235,25 @@ const VALUE_SEALED: u8 = 2;
 /// Id of the key that seals account-store values: XChaCha20-Poly1305 under
 /// the file key.
 const FILE_KEY_ID: u32 = 1;
+/// Id of the per-account data key, for an account's private records.
+const DATA_KEY_ID: u32 = 2;
 
 /// Format of the plaintext inside a sealed account record (0.3).
 const ACCOUNT_FORMAT_SEALED: u8 = 2;
 /// The same with the account's further identifiers and its roles (0.4).
 const ACCOUNT_FORMAT_SEALED_ROLES: u8 = 3;
+
+/// The first key after every key starting with `start`.
+fn prefix_end(start: &[u8]) -> Vec<u8> {
+    let mut end = start.to_vec();
+    while let Some(last) = end.pop() {
+        if last < u8::MAX {
+            end.push(last + 1);
+            break;
+        }
+    }
+    end
+}
 
 fn store_key(collection: u32, tag: u8, id: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(5 + id.len());
@@ -388,6 +417,8 @@ pub(crate) struct AuthEngine {
     seal_key: Zeroizing<[u8; 32]>,
     /// Seals and opens account-store values.
     file_key: Zeroizing<[u8; 32]>,
+    /// Each account's data key.
+    keys: datakeys::DataKeys,
     accounts: Lsm,
     /// Highest seq whose account changes the account store holds.
     applied: AtomicU64,
@@ -442,6 +473,7 @@ impl AuthEngine {
         let sessions_file = auth_dir.join(SESSIONS_FILE);
         let file_key = root.derive(FILE_KEY_LABEL);
         let checkpoint = read_checkpoint(&sessions_file, &file_key)?;
+        let keys = datakeys::DataKeys::open(&auth_dir.join(KEYS_FILE), file_key.clone())?;
         let audit = AuditChain::open(
             &auth_dir,
             root.derive(AUDIT_KEY_LABEL),
@@ -475,6 +507,7 @@ impl AuthEngine {
             identifier_key: root.derive(IDENTIFIER_KEY_LABEL),
             seal_key: root.derive(SEAL_KEY_LABEL),
             file_key,
+            keys,
             accounts,
             applied: AtomicU64::new(applied),
             accounts_durable: AtomicU64::new(applied),
@@ -553,6 +586,7 @@ impl AuthEngine {
                     w.u8(match reason {
                         RevokeReason::Rotated => REASON_ROTATED,
                         RevokeReason::SignedOutEverywhere => REASON_SIGNED_OUT_EVERYWHERE,
+                        RevokeReason::Erased => REASON_ERASED,
                         _ => REASON_REVOKED,
                     });
                 }
@@ -625,11 +659,10 @@ impl AuthEngine {
     fn totp_record(&self, account: AccountId) -> Result<Option<totp::TotpRecord>> {
         let key = totp_key(self.collection, account);
         match self.accounts.get(&key)? {
-            Some(value) => Ok(Some(totp::TotpRecord::decode(&open_value(
-                &self.file_key,
-                &key,
-                &value,
-            )?)?)),
+            Some(value) => match self.open_private(account, &key, &value)? {
+                Some(plain) => Ok(Some(totp::TotpRecord::decode(&plain)?)),
+                None => Ok(None),
+            },
             None => Ok(None),
         }
     }
@@ -652,7 +685,10 @@ impl AuthEngine {
     fn recovery_digests(&self, account: AccountId) -> Result<Vec<[u8; 32]>> {
         let key = recovery_key(self.collection, account);
         match self.accounts.get(&key)? {
-            Some(value) => recovery::decode(&open_value(&self.file_key, &key, &value)?),
+            Some(value) => match self.open_private(account, &key, &value)? {
+                Some(plain) => recovery::decode(&plain),
+                None => Ok(Vec::new()),
+            },
             None => Ok(Vec::new()),
         }
     }
@@ -732,7 +768,7 @@ impl AuthEngine {
     fn load_account_at(&self, account: AccountId, at: Seq) -> Result<Option<AccountRecord>> {
         let key = account_key(self.collection, account);
         match self.versions.at(&key, at) {
-            Some(Some(value)) => self.decode_account(account, &key, &value).map(Some),
+            Some(Some(value)) => self.decode_account(account, &key, &value),
             Some(None) => Ok(None),
             None => self.load_account(account),
         }
@@ -744,18 +780,89 @@ impl AuthEngine {
         let Some(value) = self.accounts.get(&key)? else {
             return Ok(None);
         };
-        self.decode_account(account, &key, &value).map(Some)
+        self.decode_account(account, &key, &value)
     }
 
+    /// Stage into `batch` the removal of every record of `account`: its
+    /// record and credential, the identifiers that still name it, its TOTP
+    /// record, recovery codes, passkeys, and API keys.
+    fn stage_erasure(
+        &self,
+        seq: Seq,
+        account: AccountId,
+        identifiers: &[[u8; 32]],
+        batch: &mut Batch,
+    ) -> Result<()> {
+        let key = account_key(self.collection, account);
+        self.versions
+            .record(&key, seq, None, || Ok(self.accounts.get(&key)?))?;
+        batch.delete(key);
+        batch.delete(credential_key(self.collection, account));
+        for digest in identifiers {
+            if self.account_for(digest)? == Some(account) {
+                batch.delete(identifier_key(self.collection, digest));
+            }
+        }
+        batch.delete(totp_key(self.collection, account));
+        batch.delete(recovery_key(self.collection, account));
+        let start = store_key(self.collection, b'W', account.as_bytes());
+        for (index, _) in self.accounts.scan(start.clone()..prefix_end(&start))? {
+            if let Some(digest) = index.get(start.len()..) {
+                batch.delete(store_key(self.collection, b'w', digest));
+            }
+            batch.delete(index);
+        }
+        // API keys have no index by account: every key record is read, which
+        // an erasure, a rare call, can afford.
+        let start = store_key(self.collection, b'k', b"");
+        for (key, value) in self.accounts.scan(start.clone()..prefix_end(&start))? {
+            let record = keys::KeyRecord::decode(&open_value(&self.file_key, &key, &value)?)?;
+            if record.account == account {
+                batch.delete(api_key_id_key(self.collection, &record.id));
+                batch.delete(key);
+            }
+        }
+        Ok(())
+    }
+
+    /// Seal `plain`, a private record of `account` stored at `store_key`,
+    /// under the account's data key, made (and synced) when it has none.
+    fn seal_private(&self, account: AccountId, store_key: &[u8], plain: &[u8]) -> Result<Vec<u8>> {
+        let key = self.keys.get_or_make(account, now_ms())?;
+        seal_with(&key, DATA_KEY_ID, store_key, plain)
+    }
+
+    /// Open a private record of `account`: sealed under its data key, or
+    /// (records from before 0.5) under the file key. `None` when its data
+    /// key was destroyed: the account was erased.
+    fn open_private(
+        &self,
+        account: AccountId,
+        store_key: &[u8],
+        value: &[u8],
+    ) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        match key_id(value)? {
+            FILE_KEY_ID => open_with(&self.file_key, FILE_KEY_ID, store_key, value).map(Some),
+            _ => match self.keys.get(account)? {
+                Some(key) => open_with(&key, DATA_KEY_ID, store_key, value).map(Some),
+                None => Ok(None),
+            },
+        }
+    }
+
+    /// The account record in `value`; `None` when the account was erased
+    /// (an older snapshot still holds its sealed record).
     fn decode_account(
         &self,
         account: AccountId,
         key: &[u8],
         value: &[u8],
-    ) -> Result<AccountRecord> {
+    ) -> Result<Option<AccountRecord>> {
         if value.first() == Some(&VALUE_SEALED) {
-            let plain = open_value(&self.file_key, key, value)?;
-            return AccountRecord::decode(&plain);
+            return match self.open_private(account, key, value)? {
+                Some(plain) => AccountRecord::decode(&plain).map(Some),
+                None => Ok(None),
+            };
         }
         // A plain account keeps its credential apart.
         let mut r = Reader::new(value, "an account record", 0);
@@ -780,14 +887,14 @@ impl AuthEngine {
         }
         let phc = Zeroizing::new(r.str16()?.to_owned());
         r.finish()?;
-        Ok(AccountRecord {
+        Ok(Some(AccountRecord {
             created_ms,
             digest,
             standing,
             phc,
             identifiers: Vec::new(),
             roles: Vec::new(),
-        })
+        }))
     }
 
     /// Add the audit record of the `n`-th operation of commit `seq`. Called
@@ -802,13 +909,24 @@ impl AuthEngine {
                 ..
             } => (*created_ms, "account.created", account(*a)),
             Op::CreateSealedAccount {
-                account: a, value, ..
+                account: a,
+                value,
+                created_ms,
+                ..
             } => {
-                let key = account_key(self.collection, *a);
-                let created =
-                    AccountRecord::decode(&open_value(&self.file_key, &key, value)?)?.created_ms;
+                let created = match created_ms {
+                    Some(ms) => *ms,
+                    // 0.3 and 0.4 logs: the record is under the file key.
+                    None => {
+                        let key = account_key(self.collection, *a);
+                        AccountRecord::decode(&open_value(&self.file_key, &key, value)?)?.created_ms
+                    }
+                };
                 (created, "account.created", account(*a))
             }
+            Op::EraseAccount {
+                account: a, at_ms, ..
+            } => (*at_ms, "account.erased", account(*a)),
             Op::IssueSession { session, .. } => (
                 session.created_ms,
                 "session.issued",
@@ -938,6 +1056,7 @@ impl AuthEngine {
                 ..
             } => Change::StandingChanged { account: *account },
             Op::UpdateAccount { account, .. } => Change::AccountChanged { account: *account },
+            Op::EraseAccount { account, .. } => Change::AccountErased { account: *account },
             Op::IssueSession { .. }
             | Op::SetIdentifier { .. }
             | Op::SetPolicy { .. }
@@ -1107,6 +1226,13 @@ enum Op<'a> {
         account: AccountId,
         digest: [u8; 32],
         value: &'a [u8],
+        /// In the clear from 0.5 (the record is under the data key).
+        created_ms: Option<u64>,
+    },
+    EraseAccount {
+        account: AccountId,
+        identifiers: Vec<[u8; 32]>,
+        at_ms: u64,
     },
     IssueSession {
         digest: [u8; 32],
@@ -1182,7 +1308,35 @@ fn decode_ops(seq: Seq, body: &[u8]) -> Result<Vec<Op<'_>>> {
                 account: AccountId::from_bytes(r.fixed()?),
                 digest: r.fixed()?,
                 value: r.bytes32()?,
+                created_ms: None,
             },
+            OP_CREATE_KEYED_ACCOUNT => {
+                let account = AccountId::from_bytes(r.fixed()?);
+                let digest = r.fixed()?;
+                let created_ms = Some(r.u64()?);
+                Op::CreateSealedAccount {
+                    account,
+                    digest,
+                    value: r.bytes32()?,
+                    created_ms,
+                }
+            }
+            OP_ERASE_ACCOUNT => {
+                let account = AccountId::from_bytes(r.fixed()?);
+                let count = r.u8()?;
+                if usize::from(count) > MAX_IDENTIFIERS {
+                    return Err(Error::corrupt("an erased account's identifiers", seq));
+                }
+                let mut identifiers = Vec::with_capacity(usize::from(count));
+                for _ in 0..count {
+                    identifiers.push(r.fixed()?);
+                }
+                Op::EraseAccount {
+                    account,
+                    identifiers,
+                    at_ms: r.u64()?,
+                }
+            }
             OP_ISSUE_SESSION => {
                 let digest = r.fixed()?;
                 let account = AccountId::from_bytes(r.fixed()?);
@@ -1359,6 +1513,7 @@ impl Engine for AuthEngine {
         if seq > self.applied.load(Ordering::Acquire) {
             let mut batch = Batch::new();
             let mut policy = None;
+            let mut erased = Vec::new();
             for op in &ops {
                 if let Op::SetIdentifier {
                     digest, account, ..
@@ -1425,10 +1580,20 @@ impl Engine for AuthEngine {
                         .record(&key, seq, Some(value), || Ok(self.accounts.get(&key)?))?;
                     batch.put(key, *value);
                 }
+                if let Op::EraseAccount {
+                    account,
+                    identifiers,
+                    ..
+                } = op
+                {
+                    self.stage_erasure(seq, *account, identifiers, &mut batch)?;
+                    erased.push(*account);
+                }
                 if let Op::CreateSealedAccount {
                     account,
                     digest,
                     value,
+                    ..
                 } = op
                 {
                     let key = account_key(self.collection, *account);
@@ -1465,6 +1630,16 @@ impl Engine for AuthEngine {
                 let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
                 self.accounts.write(batch)?;
                 self.applied.store(seq, Ordering::Release);
+            }
+            // The records are gone from the store; now the key every other
+            // copy of them needs. A replay destroys nothing twice.
+            for account in erased {
+                self.keys.destroy(account)?;
+                let _ = self
+                    .failures
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&account);
             }
             if let Some(policy) = policy {
                 *self.policy.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(policy);
@@ -1506,6 +1681,7 @@ impl Engine for AuthEngine {
                 }
                 Op::CreateAccount { .. }
                 | Op::CreateSealedAccount { .. }
+                | Op::EraseAccount { .. }
                 | Op::UpdateAccount { .. }
                 | Op::SetIdentifier { .. }
                 | Op::SetPolicy { .. }
@@ -1537,6 +1713,12 @@ impl Engine for AuthEngine {
         self.accounts.flush()?;
         fs::sync_names(&self.dir)?;
         let _ = self.accounts_durable.fetch_max(mark, Ordering::AcqRel);
+        // Keys made for accounts whose creating commit never landed.
+        for account in self.keys.settle(now_ms().saturating_sub(ORPHAN_KEY_MS)) {
+            if !self.account_exists(account)? {
+                self.keys.destroy(account)?;
+            }
+        }
         self.save_sessions(upto)?;
         Ok(self.durable_through())
     }
@@ -1555,8 +1737,14 @@ enum StagedOp {
     CreateAccount {
         account: AccountId,
         digest: [u8; 32],
+        created_ms: u64,
         /// The account record, sealed while staging (see [`seal_value`]).
         value: Vec<u8>,
+    },
+    EraseAccount {
+        account: AccountId,
+        identifiers: Vec<[u8; 32]>,
+        at_ms: u64,
     },
     IssueSession {
         digest: [u8; 32],
@@ -1707,6 +1895,7 @@ impl Staged for AuthStaged<'_> {
                 op,
                 StagedOp::RevokeSession { .. }
                     | StagedOp::RaiseEpoch { .. }
+                    | StagedOp::EraseAccount { .. }
                     | StagedOp::UpdateAccount { .. }
                     | StagedOp::PutKey { revoked: true, .. }
             )
@@ -1769,12 +1958,27 @@ fn write_ops(ops: &[StagedOp], out: &mut Vec<u8>) -> Result<()> {
             StagedOp::CreateAccount {
                 account,
                 digest,
+                created_ms,
                 value,
             } => {
-                w.u8(OP_CREATE_SEALED_ACCOUNT);
+                w.u8(OP_CREATE_KEYED_ACCOUNT);
                 w.bytes(account.as_bytes());
                 w.bytes(digest);
+                w.u64(*created_ms);
                 w.bytes32(value)?;
+            }
+            StagedOp::EraseAccount {
+                account,
+                identifiers,
+                at_ms,
+            } => {
+                w.u8(OP_ERASE_ACCOUNT);
+                w.bytes(account.as_bytes());
+                w.u8(identifiers.len() as u8);
+                for digest in identifiers {
+                    w.bytes(digest);
+                }
+                w.u64(*at_ms);
             }
             StagedOp::IssueSession { digest, session } => {
                 w.u8(OP_ISSUE_SESSION_AT_EPOCH);
@@ -1906,22 +2110,49 @@ fn write_ops(ops: &[StagedOp], out: &mut Vec<u8>) -> Result<()> {
 /// bytes travel inside the (sealed) log section and `apply` stores them as
 /// they are.
 fn seal_value(key: &[u8; 32], store_key: &[u8], plain: &[u8]) -> Result<Vec<u8>> {
+    seal_with(key, FILE_KEY_ID, store_key, plain)
+}
+
+/// Seal under `key`, whose id is `id`.
+fn seal_with(key: &[u8; 32], id: u32, store_key: &[u8], plain: &[u8]) -> Result<Vec<u8>> {
     let sealed = Crypt::xchacha20_poly1305()
         .encrypt_with_aad(&key[..], plain, store_key)
         .map_err(|e| Error::storage("sealing an account record", e))?;
     let mut out = Vec::with_capacity(5 + sealed.len());
     out.push(VALUE_SEALED);
-    out.extend_from_slice(&FILE_KEY_ID.to_le_bytes());
+    out.extend_from_slice(&id.to_le_bytes());
     out.extend_from_slice(&sealed);
     Ok(out)
 }
 
+/// The id of the key a sealed value names.
+fn key_id(value: &[u8]) -> Result<u32> {
+    let corrupt = || Error::corrupt("a sealed account record", 0);
+    let rest = value.strip_prefix(&[VALUE_SEALED]).ok_or_else(corrupt)?;
+    let id = rest.get(..4).ok_or_else(corrupt)?;
+    let id = u32::from_le_bytes(id.try_into().map_err(|_| corrupt())?);
+    if id != FILE_KEY_ID && id != DATA_KEY_ID {
+        return Err(corrupt());
+    }
+    Ok(id)
+}
+
 /// Open a value sealed by [`seal_value`].
 fn open_value(key: &[u8; 32], store_key: &[u8], value: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    open_with(key, FILE_KEY_ID, store_key, value)
+}
+
+/// Open a value sealed by [`seal_with`] under `key`, whose id is `want`.
+fn open_with(
+    key: &[u8; 32],
+    want: u32,
+    store_key: &[u8],
+    value: &[u8],
+) -> Result<Zeroizing<Vec<u8>>> {
     let corrupt = || Error::corrupt("a sealed account record", 0);
     let rest = value.strip_prefix(&[VALUE_SEALED]).ok_or_else(corrupt)?;
     let (id, sealed) = rest.split_at_checked(4).ok_or_else(corrupt)?;
-    if id != FILE_KEY_ID.to_le_bytes() {
+    if id != want.to_le_bytes() {
         return Err(corrupt());
     }
     Crypt::xchacha20_poly1305()
@@ -2016,10 +2247,10 @@ impl AccountRecord {
         std::iter::once(&self.digest).chain(&self.identifiers)
     }
 
-    /// The record sealed for `account` under the engine's file key.
+    /// The record sealed for `account` under its data key.
     fn seal(&self, engine: &AuthEngine, account: AccountId) -> Result<Vec<u8>> {
-        seal_value(
-            &engine.file_key,
+        engine.seal_private(
+            account,
             &account_key(engine.collection, account),
             &self.encode()?,
         )
@@ -2122,6 +2353,7 @@ fn read_checkpoint(path: &Path, file_key: &[u8; 32]) -> Result<Option<Checkpoint
                     REASON_REVOKED => RevokeReason::Revoked,
                     REASON_ROTATED => RevokeReason::Rotated,
                     REASON_SIGNED_OUT_EVERYWHERE => RevokeReason::SignedOutEverywhere,
+                    REASON_ERASED => RevokeReason::Erased,
                     _ => return Err(corrupt()),
                 })
             }
@@ -2275,8 +2507,9 @@ impl AuthTx<'_, '_> {
         self.staged
             .writes
             .push(account_key(engine.collection, account));
+        let created_ms = now_ms();
         let value = AccountRecord {
-            created_ms: now_ms(),
+            created_ms,
             digest,
             standing: if engine.realm().pending_verification {
                 Standing::PendingVerification
@@ -2291,6 +2524,7 @@ impl AuthTx<'_, '_> {
         self.staged.ops.push(StagedOp::CreateAccount {
             account,
             digest,
+            created_ms,
             value,
         });
         Ok(account)
@@ -2598,6 +2832,66 @@ impl AuthTx<'_, '_> {
         if standing.blocked_until(now_ms()).is_some() {
             let _ = self.revoke_all(account)?;
         }
+        Ok(())
+    }
+
+    /// Erase `account`: its record and password hash, identifiers, second
+    /// factors, recovery codes, passkeys, and API keys are removed, and the
+    /// key that sealed its private records is destroyed, so no copy of them
+    /// (in the commit log, a store file, or a restored backup) can be read
+    /// again. Its sessions end at
+    /// once as `Revoked { reason: Erased }`. Its identifiers are free for a
+    /// new account. Content that refers to the account is the
+    /// application's to remove.
+    ///
+    /// Commits ahead of ordinary commits.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the account does not exist, or was created in
+    /// this same transaction.
+    pub fn erase_account(&mut self, account: AccountId) -> Result<()> {
+        let engine = self.staged.engine;
+        if self.staged.accounts.contains(&account) {
+            return Err(Error::invalid("account", "created in this transaction"));
+        }
+        let Some(record) = self.record(account)? else {
+            return Err(Error::invalid("account", "no such account"));
+        };
+        let identifiers: Vec<[u8; 32]> = record.all_identifiers().copied().collect();
+        // Nothing else this work staged for the account lands.
+        self.staged.ops.retain(|op| match op {
+            StagedOp::IssueSession { session, .. } => session.account != account,
+            StagedOp::UpdateAccount { account: a, .. }
+            | StagedOp::PutTotp { account: a, .. }
+            | StagedOp::PutRecovery { account: a, .. }
+            | StagedOp::PutPasskey { account: a, .. }
+            | StagedOp::PutKey { account: a, .. }
+            | StagedOp::RaiseEpoch { account: a, .. } => *a != account,
+            _ => true,
+        });
+        let _ = self.staged.updated.remove(&account);
+        let _ = self.staged.raised.insert(account, ERASED_EPOCH);
+        let collection = engine.collection;
+        self.staged.writes.push(account_key(collection, account));
+        self.staged.writes.push(epoch_key(&account));
+        self.staged.writes.push(recovery_conflict(&account));
+        self.staged.writes.push(totp_conflict(&account));
+        for digest in &identifiers {
+            self.staged.writes.push(identifier_key(collection, digest));
+            let _ = self.staged.removed.insert(*digest);
+        }
+        let at_ms = now_ms();
+        self.staged.ops.push(StagedOp::RaiseEpoch {
+            account,
+            epoch: ERASED_EPOCH,
+            at_ms,
+        });
+        self.staged.ops.push(StagedOp::EraseAccount {
+            account,
+            identifiers,
+            at_ms,
+        });
         Ok(())
     }
 
@@ -2942,8 +3236,8 @@ impl AuthTx<'_, '_> {
     ) -> Result<()> {
         let engine = self.staged.engine;
         let value = match record {
-            Some(record) => seal_value(
-                &engine.file_key,
+            Some(record) => engine.seal_private(
+                account,
                 &totp_key(engine.collection, account),
                 &record.encode(),
             )?,
@@ -3299,11 +3593,14 @@ impl AuthTx<'_, '_> {
             } if *a == account => Some(value.clone()),
             _ => None,
         }) {
-            Some(sealed) => recovery::decode(&open_value(
-                &engine.file_key,
+            Some(sealed) => match engine.open_private(
+                account,
                 &recovery_key(engine.collection, account),
                 &sealed,
-            )?)?,
+            )? {
+                Some(plain) => recovery::decode(&plain)?,
+                None => Vec::new(),
+            },
             None => engine.recovery_digests(account)?,
         };
         let before = digests.len();
@@ -3324,8 +3621,8 @@ impl AuthTx<'_, '_> {
         used: bool,
     ) -> Result<()> {
         let engine = self.staged.engine;
-        let value = seal_value(
-            &engine.file_key,
+        let value = engine.seal_private(
+            account,
             &recovery_key(engine.collection, account),
             &recovery::encode(digests),
         )?;
@@ -3741,6 +4038,26 @@ impl Auth<'_> {
     pub fn revoke_all(&self, account: AccountId) -> Result<u32> {
         self.db
             .commit(|tx| tx.auth_of(self.engine.collection).revoke_all(account))
+    }
+
+    /// Erase an account in its own commit. See [`AuthTx::erase_account`].
+    ///
+    /// ```no_run
+    /// # fn main() -> nex_db::Result<()> {
+    /// # let db = nex_db::open("data/site")?;
+    /// # let account = nex_db::AccountId::from_bytes([1; 16]);
+    /// db.auth().erase_account(account)?;
+    /// assert!(db.auth().account(account)?.is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`AuthTx::erase_account`], plus the errors of [`Database::commit`].
+    pub fn erase_account(&self, account: AccountId) -> Result<()> {
+        self.db
+            .commit(|tx| tx.auth_of(self.engine.collection).erase_account(account))
     }
 
     /// Replace a session's token in its own commit. See
@@ -4501,6 +4818,7 @@ mod tests {
         let create = sealed_len(StagedOp::CreateAccount {
             account,
             digest: [2; 32],
+            created_ms: u64::MAX,
             value,
         });
         // A session with the largest payload is the largest single operation.
@@ -4643,6 +4961,34 @@ mod tests {
         let last = bad.len() - 1;
         bad[last] ^= 1;
         assert!(open_value(&key, b"store key a", &bad).is_err());
+    }
+
+    #[test]
+    fn test_an_erased_accounts_sealed_record_no_longer_opens() {
+        let dir = std::env::temp_dir().join(format!(
+            "nex-db-erase-unit-{}-{}",
+            std::process::id(),
+            id_forge::ulid::Ulid::new()
+        ));
+        {
+            let db = crate::open(&dir).unwrap();
+            let pw = db.auth().hash_password("pw").unwrap();
+            let ann = db.auth().create_account("ann@example.com", &pw).unwrap();
+            let engine = db.auth_engine();
+            let key = account_key(engine.collection, ann);
+            // The bytes the log and the store hold: under the data key.
+            let sealed = engine.accounts.get(&key).unwrap().unwrap();
+            assert_eq!(key_id(&sealed).unwrap(), DATA_KEY_ID);
+            assert!(open_value(&engine.file_key, &key, &sealed).is_err());
+            assert!(engine.open_private(ann, &key, &sealed).unwrap().is_some());
+            // Bound to its account: another account's key does not open it.
+            let bo = db.auth().create_account("bo@example.com", &pw).unwrap();
+            assert!(engine.open_private(bo, &key, &sealed).is_err());
+            db.auth().erase_account(ann).unwrap();
+            assert!(engine.open_private(ann, &key, &sealed).unwrap().is_none());
+            assert!(engine.keys.get(ann).unwrap().is_none());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

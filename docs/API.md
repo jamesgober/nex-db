@@ -429,7 +429,7 @@ it.
 | `set_standing(account, Standing, by: Option<AccountId>) -> Result<()>` | 0.3 | P0 | a ban or lock-out ends every session at once; `by` is `None` for an automatic lock-out |
 | `set_password(account, &HashedPassword) -> Result<()>` | 0.4 | P1 | ends the account's other sessions |
 | `add_identifier(account, identifier)`, `remove_identifier(account, identifier) -> Result<bool>` | 0.4 | P1 | a second email, a username; at most five per account, and never fewer than one |
-| `erase_account(account) -> Result<()>` | 0.5 | P2 | destroys the account's key: its data in every copy and backup becomes unreadable |
+| `erase_account(account) -> Result<()>` (also in a transaction) | 0.5 | P2 | removes the account's records (record and password hash, identifiers, TOTP, recovery codes, passkeys, API keys) and destroys its data key, so no copy of its private records in the log, a store file, or a backup restored by nex-db can be read; its sessions end as `Revoked { Erased }`; its identifiers are free again; commits ahead of ordinary commits. Content referring to the account is the application's |
 
 `SignIn` (non-exhaustive): `Success { account, token }` and `Failed` (0.1);
 `LockedOut { until: Option<SystemTime> }` (0.3) and
@@ -835,7 +835,8 @@ order, each with the `Position` of its commit. `Change` (non-exhaustive):
 for none), `RouteChanged { site, path }`, `AccountCreated { account }`,
 `SessionRevoked { account: Option<AccountId> }` (one session, or every
 session of the account), `StandingChanged { account }`, and
-`AccountChanged { account }` (roles, identifiers, or password). Auth changes
+`AccountChanged { account }` (roles, identifiers, or password), and (0.5)
+`AccountErased { account }`. Auth changes
 carry ids and kinds only.
 
 A `Feed` is an iterator that blocks for the next change; `next_timeout(d)` and

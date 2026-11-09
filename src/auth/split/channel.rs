@@ -9,7 +9,7 @@
 
 use std::{
     collections::HashMap,
-    io::Write,
+    io::{BufReader, Write},
     path::Path,
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
@@ -37,6 +37,13 @@ const EXIT_WAIT: Duration = Duration::from_secs(30);
 /// not answer in time is ended, so the channel fails closed (every auth call
 /// errors and writes stop) instead of leaving callers waiting.
 const REQUEST_WAIT: Duration = Duration::from_secs(120);
+/// How long a request watches for its reply before it sleeps on it. Most
+/// replies come within this, and a thread that is still running sees one
+/// sooner than one that has to be woken.
+const SPIN_WAIT: Duration = Duration::from_micros(50);
+/// Buffer for reading replies: a frame and its length usually arrive in one
+/// read.
+const READ_BUFFER: usize = 64 * 1024;
 
 fn gone() -> Error {
     Error::storage(
@@ -73,12 +80,31 @@ impl Reply {
 struct Slot {
     reply: Mutex<Option<std::result::Result<Reply, ()>>>,
     ready: Condvar,
+    /// Set after the reply is in place, for a request still spinning.
+    filled: AtomicBool,
 }
 
 impl Slot {
     fn fill(&self, reply: std::result::Result<Reply, ()>) {
         *self.reply.lock().unwrap_or_else(PoisonError::into_inner) = Some(reply);
+        self.filled.store(true, Ordering::Release);
         self.ready.notify_one();
+    }
+
+    /// Watch for the reply for up to [`SPIN_WAIT`]; true when it came.
+    fn spin(&self) -> bool {
+        let started = Instant::now();
+        loop {
+            for _ in 0..64 {
+                if self.filled.load(Ordering::Acquire) {
+                    return true;
+                }
+                std::hint::spin_loop();
+            }
+            if started.elapsed() >= SPIN_WAIT {
+                return false;
+            }
+        }
     }
 }
 
@@ -141,7 +167,7 @@ impl Channel {
             .spawn()
             .map_err(|e| Error::storage("starting the auth process", e))?;
         let pid = child.id();
-        let (Some(input), Some(mut output)) = (child.stdin.take(), child.stdout.take()) else {
+        let (Some(input), Some(output)) = (child.stdin.take(), child.stdout.take()) else {
             let _ = child.kill();
             let _ = child.wait();
             return Err(Error::storage(
@@ -155,6 +181,7 @@ impl Channel {
             .name("nex-db-auth-channel".to_owned())
             .spawn(move || {
                 let shared = reader_shared;
+                let mut output = BufReader::with_capacity(READ_BUFFER, output);
                 // The stream ending, failing, or holding a frame that does
                 // not parse ends the channel.
                 while let Ok(Some(frame)) = wire::read_frame(&mut output, RESPONSE_HEAD) {
@@ -262,6 +289,7 @@ impl Channel {
             let _ = pending.insert(id, Arc::clone(&slot));
         }
         self.write(&frame);
+        let _ = slot.spin();
         let mut reply = slot.reply.lock().unwrap_or_else(PoisonError::into_inner);
         let started = Instant::now();
         loop {

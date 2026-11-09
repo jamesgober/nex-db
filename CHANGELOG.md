@@ -6,6 +6,10 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-09
+
+Feature complete: split auth, erasure, search, and backups.
+
 ### Added
 
 - Sticky entities: `Entity::sticky`, `set_sticky`, `Entry::sticky`, and `Listing::sticky_first`.
@@ -144,7 +148,8 @@ The walking skeleton.
 - Repository scaffold: `Cargo.toml` (edition 2024, MSRV 1.85), `src/lib.rs` with `VERSION`, CI on Linux, macOS, and Windows (stable and 1.85), `cargo deny` configuration.
 - `dev/PLAN.md`, `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/nex-db/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/jamesgober/nex-db/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/jamesgober/nex-db/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/jamesgober/nex-db/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/jamesgober/nex-db/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/nex-db/compare/v0.2.0...v0.3.0

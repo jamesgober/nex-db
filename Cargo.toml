@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "nex-db"
-version = "0.4.1"
+version = "0.5.0"
 
 # Minimum Supported Rust Version (MSRV)
 # 1.85: the baseline of the db-collection crates nex-db builds on.

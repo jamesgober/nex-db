@@ -18,6 +18,15 @@
 //! commit, so without running snapshots the overlay stays empty, and a read
 //! then takes no lock: it sees a count of zero and goes to the store.
 //!
+//! A read that is not a registered snapshot (a plain `get`) can hold a
+//! sequence number older than the watermark, so older than every version a
+//! key keeps. It gets the oldest kept version, the
+//! newest one at or below the watermark, which was visible when the
+//! watermark was taken. Reading the store instead would be wrong: the
+//! store may already hold a commit that is applied but not yet visible,
+//! and the reader's next read, at the visible sequence number, would then
+//! find the key tracked and go back to an older version.
+//!
 //! A reader reads the store first and asks the overlay second. An apply
 //! records a key here before it writes the store, so a reader that saw the
 //! store's new value finds the key tracked and takes its version instead;
@@ -115,9 +124,12 @@ impl Versions {
         let Some(chain) = keys.get(key) else {
             return Lookup::Untracked;
         };
-        match chain.iter().rposition(|(seq, _)| *seq <= at) {
-            Some(i) => Lookup::Tracked {
-                value: chain[i].1.clone(),
+        // A snapshot older than every kept version sees the oldest (see
+        // the module notes).
+        let i = chain.iter().rposition(|(seq, _)| *seq <= at).unwrap_or(0);
+        match chain.get(i) {
+            Some((_, value)) => Lookup::Tracked {
+                value: value.clone(),
                 newest: i + 1 == chain.len(),
             },
             None => Lookup::Untracked,
@@ -133,10 +145,13 @@ impl Versions {
         }
         let keys = self.keys.read().unwrap_or_else(PoisonError::into_inner);
         let chain = keys.get(key)?;
+        // A snapshot older than every kept version sees the oldest (see
+        // the module notes).
         chain
             .iter()
             .rev()
             .find(|(seq, _)| *seq <= at)
+            .or_else(|| chain.first())
             .map(|(_, value)| value.clone())
     }
 
@@ -212,6 +227,27 @@ mod tests {
     }
 
     #[test]
+    fn test_older_than_kept_sees_the_oldest_kept_version_not_the_store() {
+        let versions = Versions::new();
+        versions
+            .record(b"k", 2, Some(b"v2"), || Ok(Some(b"v1".to_vec())))
+            .unwrap();
+        versions.record(b"k", 3, Some(b"v3"), || Ok(None)).unwrap();
+        // The watermark passes 2 while 3 is applied and not yet visible.
+        versions.prune(2);
+        // A plain read that took its sequence number (1) before.
+        assert_eq!(bytes(&versions.at(b"k", 1)), Some(Some(&b"v2"[..])));
+        assert!(matches!(
+            versions.lookup(b"k", 1),
+            Lookup::Tracked { value: Some(v), newest: false } if &*v == b"v2"
+        ));
+        assert!(matches!(
+            versions.lookup(b"k", 3),
+            Lookup::Tracked { value: Some(v), newest: true } if &*v == b"v3"
+        ));
+    }
+
+    #[test]
     fn test_a_second_write_in_one_commit_replaces_the_first() {
         let versions = Versions::new();
         versions.record(b"k", 5, Some(b"x"), || Ok(None)).unwrap();
@@ -227,8 +263,12 @@ mod tests {
     #[test]
     fn test_a_replayed_earlier_record_is_ignored() {
         let versions = Versions::new();
-        versions.record(b"k", 7, Some(b"seven"), || Ok(None)).unwrap();
-        versions.record(b"k", 5, Some(b"five"), || Ok(None)).unwrap();
+        versions
+            .record(b"k", 7, Some(b"seven"), || Ok(None))
+            .unwrap();
+        versions
+            .record(b"k", 5, Some(b"five"), || Ok(None))
+            .unwrap();
         assert_eq!(bytes(&versions.at(b"k", 7)), Some(Some(&b"seven"[..])));
         assert_eq!(bytes(&versions.at(b"k", 6)), Some(None));
     }

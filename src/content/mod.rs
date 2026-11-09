@@ -2970,6 +2970,92 @@ impl ContentRead<'_> {
 mod tests {
     use super::*;
 
+    /// A section that publishes `rid` with title `n` as revision `n`.
+    fn publish_section(rid: Rid, n: u32) -> Vec<u8> {
+        let mut head = Entity::new("page")
+            .field("title", n.to_string().as_str())
+            .into_head(rid, 1, Locale::EN)
+            .unwrap();
+        head.last_revision = n;
+        head.variants[0].published = Some(Published {
+            revision: n,
+            at_ms: u64::from(n),
+            path: None,
+            refs: Vec::new(),
+        });
+        let revision =
+            Revision::new(Locale::EN, u64::from(n), "", head.base().draft.clone()).unwrap();
+        let mut body = Vec::new();
+        let mut w = Writer::new(&mut body);
+        w.u8(OP_PUT_REVISION);
+        w.bytes(rid.as_bytes());
+        w.u32(n);
+        w.bytes32(&revision.encode().unwrap()).unwrap();
+        w.u8(OP_PUT_HEAD);
+        w.bytes(rid.as_bytes());
+        w.bytes32(&head.encode().unwrap()).unwrap();
+        body
+    }
+
+    fn apply_section(engine: &ContentEngine, seq: Seq, body: &[u8]) {
+        engine
+            .apply(
+                seq,
+                &Section {
+                    engine: EngineId::CONTENT,
+                    flags: 0,
+                    format: FORMAT,
+                    collection: 2,
+                    body,
+                },
+                &mut Vec::new(),
+            )
+            .unwrap();
+    }
+
+    fn title_at(engine: &ContentEngine, rid: Rid, at: Seq) -> Option<String> {
+        engine.published_in(rid, None, at).unwrap().and_then(|e| {
+            e.field("title")
+                .and_then(|v| v.as_text())
+                .map(str::to_owned)
+        })
+    }
+
+    /// The interleaving the reader-threads test found: a plain read takes
+    /// its sequence number (1); commit 2 becomes visible and the watermark
+    /// passes it; commit 3 is applied, not yet visible; the reader reads.
+    /// It must see commit 2, not the store's commit 3, or its next read (at
+    /// 2) goes back. Forced here by applying and reclaiming by hand.
+    #[test]
+    fn test_a_read_older_than_the_watermark_never_sees_an_invisible_commit() {
+        let dir = std::env::temp_dir().join(format!(
+            "nex-db-content-watermark-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        {
+            let engine = ContentEngine::open(&dir, 2, Arc::default()).unwrap();
+            let rid = Rid::from_bytes([5; 16]);
+            apply_section(&engine, 1, &publish_section(rid, 1));
+            engine.reclaim(1);
+            apply_section(&engine, 2, &publish_section(rid, 2));
+            // Cached as the latest while commit 2 is the newest.
+            assert_eq!(title_at(&engine, rid, 2).as_deref(), Some("2"));
+            apply_section(&engine, 3, &publish_section(rid, 3));
+            engine.reclaim(2);
+            // The reader that took 1 before any of this, then reads twice.
+            assert_eq!(title_at(&engine, rid, 1).as_deref(), Some("2"));
+            assert_eq!(title_at(&engine, rid, 2).as_deref(), Some("2"));
+            // Visible now: commit 3, from the store and then the cache.
+            assert_eq!(title_at(&engine, rid, 3).as_deref(), Some("3"));
+            assert_eq!(title_at(&engine, rid, 3).as_deref(), Some("3"));
+            assert_eq!(title_at(&engine, rid, 2).as_deref(), Some("2"));
+            engine.reclaim(3);
+            assert_eq!(title_at(&engine, rid, 1).as_deref(), Some("3"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_entity_key_array_matches_entity_key() {
         let rid = Rid::from_bytes([7; 16]);

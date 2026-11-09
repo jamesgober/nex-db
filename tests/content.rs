@@ -1451,7 +1451,7 @@ fn test_search_ranks_published_bodies_per_locale() {
     let (a, b, c) = {
         let db = Database::open(&dir.0).unwrap();
         db.content().define(post.clone()).unwrap();
-        let mut make = |kind: &str, title: &str, body: &str| {
+        let make = |kind: &str, title: &str, body: &str| {
             let rid = db
                 .content()
                 .create(Entity::new(kind).field("title", title).field("body", body))

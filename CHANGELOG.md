@@ -12,6 +12,7 @@ All notable changes to `nex-db` are documented in this file. The format is based
 - Session tokens parse through a lookup table.
 - Content reads of entries served before come from a cache of decoded entries (up to 4,096 entities per space), and cloning an `Entry` no longer copies its fields.
 - Split auth: replies are read through a buffer and written in one write each.
+- The session table allocates its cells in chunks of at most 1,024, so mid-size tables waste less memory.
 
 ### Fixed
 

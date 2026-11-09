@@ -150,12 +150,23 @@ fn validate_many(c: &mut Criterion) {
 fn content(c: &mut Criterion) {
     let t = TempDb::new("content");
     let db = t.db();
+    db.content()
+        .define(
+            nex_db::Type::new("page")
+                .field("title", nex_db::FieldType::Text)
+                .searchable(3),
+        )
+        .unwrap();
+    const WORDS: [&str; 8] = [
+        "garden", "river", "stone", "light", "winter", "harbor", "forest", "market",
+    ];
     for i in 0..1_000 {
+        let title = format!("Hello {} {}", WORDS[i % 8], WORDS[(i / 8) % 8]);
         let _ = db
             .commit(|tx| {
                 let rid = tx.content().create(
                     Entity::new("page")
-                        .field("title", "Hello")
+                        .field("title", title.as_str())
                         .path(format!("/p/{i}")),
                 )?;
                 tx.content().publish(rid)
@@ -177,6 +188,18 @@ fn content(c: &mut Criterion) {
     });
     c.bench_function("content/get_warm", |b| {
         b.iter(|| db.content().get(black_box(route.entity())).unwrap());
+    });
+    let latest = nex_db::Listing::latest("page").limit(10);
+    c.bench_function("content/list_latest", |b| {
+        b.iter(|| db.content().list(black_box(&latest)).unwrap());
+    });
+    let query = nex_db::Search::new("river garden");
+    c.bench_function("content/search", |b| {
+        b.iter(|| {
+            db.content()
+                .search(nex_db::Locale::EN, black_box(&query))
+                .unwrap()
+        });
     });
 }
 

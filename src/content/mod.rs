@@ -15,6 +15,7 @@ pub(crate) mod lists;
 pub(crate) mod locale;
 mod routes;
 pub(crate) mod schedule;
+pub(crate) mod search;
 mod tree;
 pub(crate) mod types;
 
@@ -40,6 +41,7 @@ use self::{
     locale::{Locale, SpaceSpec},
     routes::RouteTable,
     schedule::{Schedules, Wake},
+    search::{Hits, Search, SearchIndex},
     tree::Tree,
     types::{Rule, Type, TypeIndex, Types},
 };
@@ -225,6 +227,8 @@ pub(crate) struct ContentEngine {
     lists: ListIndex,
     /// Children by parent.
     tree: Tree,
+    /// Published bodies by locale, word by word.
+    search: SearchIndex,
     /// Every schedule, earliest first.
     schedules: Schedules,
     /// The space's default locale and fallback chains.
@@ -267,6 +271,7 @@ impl ContentEngine {
         let routes = RouteTable::new();
         let lists = ListIndex::new();
         let tree = Tree::new();
+        let search = SearchIndex::new();
         let schedules = Schedules::new(wake);
         let types = match store.get(types_key(collection))? {
             Some(bytes) => Types::decode(&bytes, applied)?,
@@ -289,6 +294,9 @@ impl ContentEngine {
             published_ms = published_ms.max(head.last_published_ms());
             let legacy = Head::is_legacy(&value);
             type_index.update(&types, &head, |locale, n| {
+                published_body(&store, collection, &head, legacy, locale, n)
+            })?;
+            search.update(&types, &head, false, |locale, n| {
                 published_body(&store, collection, &head, legacy, locale, n)
             })?;
             if !Head::is_current(&value) {
@@ -327,6 +335,7 @@ impl ContentEngine {
             routes,
             lists,
             tree,
+            search,
             schedules,
             space: RwLock::new(space),
             types: RwLock::new(types),
@@ -765,6 +774,7 @@ impl Engine for ContentEngine {
             self.tree.remove(*rid);
             self.schedules.remove(*rid);
             self.type_index().remove(*rid, kind);
+            self.search.remove(*rid);
         }
         if let Some(space) = space {
             *self.space.write().unwrap_or_else(PoisonError::into_inner) = space;
@@ -778,6 +788,20 @@ impl Engine for ContentEngine {
                 })?;
             }
             *self.type_index() = index;
+            // Changed searchable fields index every entity again.
+            if self.types().search_differs(&types) {
+                for (head, legacy) in self.all_heads()? {
+                    self.search.update(&types, &head, true, |locale, n| {
+                        published_body(&self.store, self.collection, &head, legacy, locale, n)
+                    })?;
+                }
+            } else {
+                for (head, legacy) in &heads {
+                    self.search.update(&types, head, false, |locale, n| {
+                        published_body(&self.store, self.collection, head, *legacy, locale, n)
+                    })?;
+                }
+            }
             *self.types.write().unwrap_or_else(PoisonError::into_inner) = types;
         } else if !heads.is_empty() {
             // After the write: a revision this commit published is stored.
@@ -785,6 +809,9 @@ impl Engine for ContentEngine {
             let mut index = self.type_index();
             for (head, legacy) in &heads {
                 index.update(&types, head, |locale, n| {
+                    published_body(&self.store, self.collection, head, *legacy, locale, n)
+                })?;
+                self.search.update(&types, head, false, |locale, n| {
                     published_body(&self.store, self.collection, head, *legacy, locale, n)
                 })?;
             }
@@ -2429,6 +2456,31 @@ impl Content<'_> {
                 after,
             }),
         })
+    }
+
+    /// The published entities of `locale` holding every word of `query` in
+    /// a searchable field ([`Type::searchable`]), best first. English
+    /// locales match word forms ("running" finds "runs") and skip common
+    /// words; other locales match words as they are, without case. Reads
+    /// memory only.
+    ///
+    /// ```no_run
+    /// # fn main() -> nex_db::Result<()> {
+    /// use nex_db::{Locale, Search};
+    /// let db = nex_db::open("data/site")?;
+    /// let hits = db.content().search(Locale::EN, &Search::new("rust tips").kind("post"))?;
+    /// let ids: Vec<_> = hits.items().iter().map(|h| h.rid()).collect();
+    /// let entries = db.content().get_many(&ids, Locale::EN)?;
+    /// # let _ = entries;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the query is over 1,024 bytes or 16 words.
+    pub fn search(&self, locale: Locale, query: &Search) -> Result<Hits> {
+        self.engine().search.search(locale, query)
     }
 
     /// Every entry of `listing`, page by page, for sitemaps and feeds. Each

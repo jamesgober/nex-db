@@ -12,10 +12,11 @@ All notable changes to `nex-db` are documented in this file. The format is based
 - `Listing::outdated(locale)`: translations made from an older revision than their source publishes.
 - `get_many`, one snapshot for many entities, and `stream`, every entry of a listing.
 - `add_redirect` and `remove_route`.
+- Search: `Type::searchable`, `Content::search`, `Search`, `Hit`, and `Hits`: every word of a query in a published body of one locale, ranked by BM25 over weighted fields; English locales stem and skip common words.
 
 ### Changed
 
-- Entity heads are written in format 6 (a flags byte); format 5 still reads.
+- Entity heads are written in format 6 (a flags byte); format 5 still reads. Types are written in format 3 (searchable fields); formats 1 and 2 still read.
 - `translate` records the source revision on every call, not only the first.
 
 ## [0.4.1] - 2026-11-08

@@ -1428,3 +1428,105 @@ fn test_manual_redirects_resolve_and_can_be_removed() {
         }
     );
 }
+
+#[test]
+fn test_search_ranks_published_bodies_per_locale() {
+    use nex_db::{FieldType, Locale, Search};
+    let fr = Locale::new("fr").unwrap();
+    let dir = TempDir::new("search");
+    let post = Type::new("post")
+        .field("title", FieldType::Text)
+        .searchable(3)
+        .field("body", FieldType::Text)
+        .searchable(1);
+    let found = |db: &Database, locale: Locale, query: Search| -> Vec<nex_db::Rid> {
+        db.content()
+            .search(locale, &query)
+            .unwrap()
+            .items()
+            .iter()
+            .map(nex_db::Hit::rid)
+            .collect()
+    };
+    let (a, b, c) = {
+        let db = Database::open(&dir.0).unwrap();
+        db.content().define(post.clone()).unwrap();
+        let make = |kind: &str, title: &str, body: &str| {
+            let rid = db
+                .content()
+                .create(Entity::new(kind).field("title", title).field("body", body))
+                .unwrap();
+            let _ = db.content().publish(rid).unwrap();
+            rid
+        };
+        let a = make("post", "Running a database", "Notes on running things.");
+        let b = make(
+            "post",
+            "Garden notes",
+            "The database runs in the garden shed.",
+        );
+        let c = make("post", "Cooking", "Nothing about runs here, or databases.");
+        // An undeclared type is not indexed; neither is a draft.
+        let _ = make("page", "Running database page", "running database");
+        let _ = db
+            .content()
+            .create(Entity::new("post").field("title", "Running database draft"))
+            .unwrap();
+        // Every word must match; word forms match; the title weighs more, and
+        // of two bodies the shorter (c) ranks higher.
+        assert_eq!(
+            found(&db, Locale::EN, Search::new("RUNS databases")),
+            [a, c, b]
+        );
+        assert_eq!(found(&db, Locale::EN, Search::new("garden database")), [b]);
+        assert!(found(&db, Locale::EN, Search::new("garden zebra")).is_empty());
+        // Stopwords alone match nothing.
+        assert!(found(&db, Locale::EN, Search::new("the of")).is_empty());
+        let page = db
+            .content()
+            .search(Locale::EN, &Search::new("database").limit(1).offset(1))
+            .unwrap();
+        assert_eq!((page.total(), page.items().len()), (3, 1));
+        assert_eq!(page.items()[0].rid(), c);
+        assert!(found(&db, Locale::EN, Search::new("database").kind("page")).is_empty());
+        // A translation is searched in its own locale, without stemming.
+        db.commit(|tx| {
+            tx.content()
+                .translate(c, fr, Patch::new().set("title", "Cuisine du jardin"))?;
+            tx.content().publish_in(c, &[fr])
+        })
+        .unwrap();
+        assert_eq!(found(&db, fr, Search::new("JARDIN")), [c]);
+        assert!(found(&db, fr, Search::new("jardins")).is_empty());
+        // Unpublishing takes it out.
+        let _ = db.content().unpublish(a).unwrap();
+        assert_eq!(found(&db, Locale::EN, Search::new("running")), [c, b]);
+        (a, b, c)
+    };
+    // Rebuilt at open; a new weight indexes again.
+    let db = Database::open(&dir.0).unwrap();
+    assert_eq!(found(&db, Locale::EN, Search::new("database")), [c, b]);
+    assert_eq!(found(&db, fr, Search::new("cuisine")), [c]);
+    let _ = db.content().publish(a).unwrap();
+    db.content()
+        .define(
+            Type::new("post")
+                .field("title", FieldType::Text)
+                .searchable(1)
+                .field("body", FieldType::Text)
+                .searchable(10),
+        )
+        .unwrap();
+    assert_eq!(found(&db, Locale::EN, Search::new("notes")), [a, b]);
+    // Only text fields are searchable.
+    assert!(
+        db.content()
+            .define(Type::new("count").field("n", FieldType::Int).searchable(2))
+            .is_err()
+    );
+    assert!(
+        db.content()
+            .search(Locale::EN, &Search::new("x ".repeat(600)))
+            .is_err()
+    );
+}

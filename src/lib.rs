@@ -145,6 +145,7 @@ pub use crate::content::{
     },
     lists::{Cursor, Listing, Page},
     locale::{Locale, SpaceSpec},
+    search::{Hit, Hits, Search},
     types::{FieldType, Rule, Type},
 };
 pub use crate::{

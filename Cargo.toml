@@ -157,6 +157,11 @@ required-features = ["auth", "content"]
 name = "table"
 harness = false
 
+[[bench]]
+name = "memory"
+harness = false
+required-features = ["auth", "content"]
+
 
 # DEV PROFILE
 # #################################

@@ -193,6 +193,29 @@ fn content(c: &mut Criterion) {
     c.bench_function("content/list_latest", |b| {
         b.iter(|| db.content().list(black_box(&latest)).unwrap());
     });
+    // Ten thousand entities read in turn: more than the cache keeps, so
+    // most reads decode from the store.
+    let many: Vec<nex_db::Rid> = (0..10_000)
+        .map(|i| {
+            db.commit(|tx| {
+                let rid = tx.content().create(
+                    Entity::new("page")
+                        .field("title", "many")
+                        .path(format!("/m/{i}")),
+                )?;
+                let _ = tx.content().publish(rid)?;
+                Ok(rid)
+            })
+            .unwrap()
+        })
+        .collect();
+    let mut i = 0usize;
+    c.bench_function("content/get_rotating_10k", |b| {
+        b.iter(|| {
+            i = (i + 7_919) % many.len();
+            db.content().get(black_box(many[i])).unwrap()
+        });
+    });
     let query = nex_db::Search::new("river garden");
     c.bench_function("content/search", |b| {
         b.iter(|| {
@@ -284,7 +307,67 @@ fn split(c: &mut Criterion) {
 #[cfg(not(feature = "split-auth"))]
 fn split(_: &mut Criterion) {}
 
-criterion_group!(benches, auth, split, content, core);
+/// `core/recovery`: closing and opening a database that holds 100,000
+/// sessions (a million with `NEX_BENCH_LARGE`) and 1,000 published
+/// entities, checkpointed as the default log size triggers it: replay of
+/// the last checkpoint and the log after it.
+fn recovery(c: &mut Criterion) {
+    let n: usize = if std::env::var_os("NEX_BENCH_LARGE").is_some() {
+        1_000_000
+    } else {
+        100_000
+    };
+    let mut t = TempDb::with("recovery", |b| b.max_sessions(n + 1));
+    {
+        let db = t.db();
+        let password = db.auth().hash_password("bench password").unwrap();
+        let account = db
+            .auth()
+            .create_account("recover@example.com", &password)
+            .unwrap();
+        for i in 0..1_000 {
+            let _ = db
+                .commit(|tx| {
+                    let rid = tx
+                        .content()
+                        .create(Entity::new("page").path(format!("/r/{i}")))?;
+                    tx.content().publish(rid)
+                })
+                .unwrap();
+        }
+        let issue = |count: usize| {
+            let mut left: usize = count;
+            while left > 0 {
+                let batch = left.min(4_000);
+                let _ = db
+                    .commit(|tx| {
+                        (0..batch)
+                            .map(|_| tx.auth().issue_session(account, SessionSpec::web()))
+                            .collect::<nex_db::Result<Vec<_>>>()
+                    })
+                    .unwrap();
+                left -= batch;
+            }
+        };
+        issue(n);
+    }
+    let mut group = c.benchmark_group("core/recovery");
+    let _ = group.sample_size(10);
+    let _ = group.bench_function(format!("{n}"), |b| {
+        b.iter(|| {
+            drop(t.db.take());
+            t.db = Some(
+                Database::builder(&t.dir)
+                    .max_sessions(n + 1)
+                    .open()
+                    .unwrap(),
+            );
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(benches, auth, split, content, core, recovery);
 
 // The bench program is also the auth process of `auth/validate_split`.
 fn main() {

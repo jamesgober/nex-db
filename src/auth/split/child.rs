@@ -10,7 +10,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    io::{Stdout, Write},
+    io::Write,
     path::PathBuf,
     sync::{Arc, Condvar, Mutex, OnceLock, PoisonError},
     time::{Duration, Instant},
@@ -150,7 +150,7 @@ struct State<'h> {
     host: &'h Host,
     txs: Mutex<HashMap<u64, Arc<Mutex<AuthStaged<'h>>>>>,
     hashes: Mutex<HashMap<[u8; 16], Held>>,
-    out: Mutex<Stdout>,
+    out: Mutex<Box<dyn Write + Send>>,
 }
 
 impl<'h> State<'h> {
@@ -693,7 +693,7 @@ fn inline(op: u16) -> bool {
 pub(crate) fn serve() -> Result<()> {
     let io = |e: std::io::Error| Error::storage("reading the auth channel", e);
     let mut input = std::io::stdin().lock();
-    let out = Mutex::new(std::io::stdout());
+    let out = Mutex::new(raw_stdout());
     let Some(frame) = wire::read_frame(&mut input, REQUEST_HEAD).map_err(io)? else {
         return Ok(());
     };
@@ -744,6 +744,35 @@ pub(crate) fn serve() -> Result<()> {
     Ok(())
 }
 
+/// Standard output without the line buffer `Stdout` adds, so each reply
+/// is one write to the pipe: a reply with a newline byte in it would
+/// otherwise go out in two writes, and the application might wake twice.
+/// Falls back to `Stdout` when the handle cannot be copied.
+fn raw_stdout() -> Box<dyn Write + Send> {
+    #[cfg(windows)]
+    let copied = {
+        use std::os::windows::io::AsHandle;
+        std::io::stdout()
+            .as_handle()
+            .try_clone_to_owned()
+            .map(std::fs::File::from)
+    };
+    #[cfg(unix)]
+    let copied = {
+        use std::os::fd::AsFd;
+        std::io::stdout()
+            .as_fd()
+            .try_clone_to_owned()
+            .map(std::fs::File::from)
+    };
+    #[cfg(not(any(windows, unix)))]
+    let copied: std::io::Result<std::fs::File> = Err(std::io::ErrorKind::Unsupported.into());
+    match copied {
+        Ok(file) => Box::new(file),
+        Err(_) => Box::new(std::io::stdout()),
+    }
+}
+
 /// A request frame's id, op, and payload.
 fn parse(frame: &[u8]) -> Result<(u64, u16, &[u8])> {
     let mut r = Reader::new(frame, "a request to the auth process", 0);
@@ -754,7 +783,7 @@ fn parse(frame: &[u8]) -> Result<(u64, u16, &[u8])> {
 
 /// Write one response. A failed write means the application is gone; its
 /// input ends next, and the process with it.
-fn write_reply(out: &Mutex<Stdout>, id: u64, status: u8, body: &[u8]) {
+fn write_reply(out: &Mutex<Box<dyn Write + Send>>, id: u64, status: u8, body: &[u8]) {
     if id == 0 {
         return;
     }

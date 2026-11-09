@@ -6,6 +6,18 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 ## [Unreleased]
 
+### Added
+
+- Sticky entities: `Entity::sticky`, `set_sticky`, `Entry::sticky`, and `Listing::sticky_first`.
+- `Listing::outdated(locale)`: translations made from an older revision than their source publishes.
+- `get_many`, one snapshot for many entities, and `stream`, every entry of a listing.
+- `add_redirect` and `remove_route`.
+
+### Changed
+
+- Entity heads are written in format 6 (a flags byte); format 5 still reads.
+- `translate` records the source revision on every call, not only the first.
+
 ## [0.4.1] - 2026-11-08
 
 Second factors, and a read fix.

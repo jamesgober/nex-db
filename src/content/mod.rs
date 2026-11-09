@@ -823,6 +823,11 @@ impl Engine for ContentEngine {
         self.durable.load(Ordering::Acquire)
     }
 
+    fn backup(&self, out: &mut dyn crate::engine::BackupSink) -> Result<()> {
+        let mut pairs = self.store.scan(Vec::new()..)?;
+        out.store(&self.dir, &mut pairs)
+    }
+
     fn checkpoint(&self, upto: Seq) -> Result<Seq> {
         // The store holds every content section through `upto`; say so in
         // its mark, so a store untouched by recent commits does not hold the

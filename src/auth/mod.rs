@@ -1727,6 +1727,15 @@ impl Engine for AuthEngine {
         self.conflicts.prune(watermark);
         self.versions.prune(watermark);
     }
+
+    fn backup(&self, out: &mut dyn crate::engine::BackupSink) -> Result<()> {
+        let auth_dir = self.dir.parent().unwrap_or(&self.dir);
+        out.file(&self.sessions_file)?;
+        out.file(&auth_dir.join(audit::AUDIT_FILE))?;
+        out.keys(&auth_dir.join(KEYS_FILE))?;
+        let mut pairs = self.accounts.scan(Vec::new()..)?;
+        out.store(&self.dir, &mut pairs)
+    }
 }
 
 /// An auth operation staged in a transaction.
@@ -2893,6 +2902,93 @@ impl AuthTx<'_, '_> {
             at_ms,
         });
         Ok(())
+    }
+
+    /// Stage again what the auth section of commit `seq`, made after a
+    /// restore point, took away: ended sessions, sign-outs everywhere,
+    /// erasures, revoked API keys, and from a replaced account record its
+    /// password and a standing that blocks. Everything else in it is left
+    /// out.
+    pub(crate) fn reapply(&mut self, seq: Seq, section: &Section<'_>) -> Result<()> {
+        let engine = self.staged.engine;
+        let plain;
+        let body = match (section.format, section.flags) {
+            (FORMAT_PLAIN, 0) => section.body,
+            (FORMAT, SEALED) => {
+                plain = open(&engine.seal_key, seq, section)?;
+                unpad(&plain, seq)?
+            }
+            _ => return Err(Error::corrupt("an auth section header", seq)),
+        };
+        for op in decode_ops(seq, body)? {
+            match op {
+                Op::RevokeSession {
+                    digest,
+                    reason,
+                    at_ms,
+                } => {
+                    self.staged.writes.push(session_key(&digest));
+                    self.staged.ops.push(StagedOp::RevokeSession {
+                        digest,
+                        reason,
+                        at_ms,
+                    });
+                }
+                Op::RaiseEpoch {
+                    account,
+                    epoch,
+                    at_ms,
+                } if epoch != ERASED_EPOCH && epoch > self.epoch(account) => {
+                    let _ = self.staged.raised.insert(account, epoch);
+                    self.staged.writes.push(epoch_key(&account));
+                    self.staged.ops.push(StagedOp::RaiseEpoch {
+                        account,
+                        epoch,
+                        at_ms,
+                    });
+                }
+                Op::EraseAccount { account, .. } => self.erase_if_present(account)?,
+                Op::UpdateAccount { account, value, .. } => {
+                    let key = account_key(engine.collection, account);
+                    let (Some(later), Some(now)) = (
+                        engine.decode_account(account, &key, value)?,
+                        self.record(account)?,
+                    ) else {
+                        continue;
+                    };
+                    let blocks = later.standing.blocked_until(now_ms()).is_some()
+                        && later.standing != now.standing;
+                    let password = later.phc != now.phc;
+                    if blocks || password {
+                        self.update_record(account, UPDATE_SEVERAL, |record| {
+                            if blocks {
+                                record.standing = later.standing;
+                            }
+                            if password {
+                                record.phc = later.phc.clone();
+                            }
+                            Ok(())
+                        })?;
+                        let _ = self.revoke_all(account)?;
+                    }
+                }
+                Op::PutKey {
+                    id, revoked: true, ..
+                } => {
+                    let _ = self.revoke_api_key(keys::ApiKeyId(id))?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Erase `account` when it exists.
+    fn erase_if_present(&mut self, account: AccountId) -> Result<()> {
+        match self.record(account)? {
+            Some(_) => self.erase_account(account),
+            None => Ok(()),
+        }
     }
 
     /// The account's record as this transaction sees it.

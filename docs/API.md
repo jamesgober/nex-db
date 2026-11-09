@@ -894,10 +894,26 @@ slow work to another thread. `Recovering` is not seen through this API in
 | Call | Since | Grade |
 |---|---|---|
 | `db.backup(to_dir) -> Result<BackupInfo>` | 0.5 | P1 |
-| `nex_db::restore(backup_dir, into_dir, RestorePoint::Latest \| At(SystemTime) \| Position(p))` | 0.5 | P1 |
+| `nex_db::restore(backup_dir, into_dir, RestorePoint::Latest \| At(SystemTime) \| Position(p)) -> Result<Position>` | 0.5 | P1 |
 
-A backup is taken while the database runs and stays encrypted. Revocations
-survive a restore: a session revoked after the restore point stays revoked.
+A backup is taken while the database runs. The first one into an empty
+directory copies every engine's files as of the last commit: writes wait
+while it is taken, reads go on. Each later backup into the same directory
+adds the commits made since (quick; writes wait only while the new log
+records are copied), so a restore can reach any commit from the first backup
+to the last. If a checkpoint has dropped log records the backup lacks, the
+call fails and a new directory is needed: back up more often than the log
+fills `checkpoint_every`. Auth data stays sealed as the database stores it;
+content is copied as stored. The root key is in the backup only for a
+database whose key lives in its own directory (`BackupInfo::holds_key()`).
+`BackupInfo` also gives `position()`, `base()`, and `incremental()`.
+
+`restore` builds a new database in an empty directory, opened with the same
+key source. `At(time)` restores the commits up to the last one before the
+first commit made after `time`. Revocations survive a restore: sessions
+ended, sign-outs everywhere, blocking standings, password changes, revoked
+API keys, and erasures committed after the restore point are applied again,
+in one commit, when the restored database first opens.
 
 ## Read replica
 

@@ -79,6 +79,9 @@ const MAX_IN_FLIGHT: usize = 4096;
 struct CommitState {
     /// The last sequence number appended to the log.
     last: Seq,
+    /// The time of the last record numbered: times never go back, even
+    /// when the system clock does.
+    last_ms: u64,
     /// Commits appended and not yet visible (or failed).
     in_flight: usize,
 }
@@ -167,16 +170,17 @@ impl Core {
         new_database: bool,
         defaults: &[Collection],
     ) -> Result<()> {
-        let last = self.replay(engines)?;
+        let (last, last_ms) = self.replay(engines)?;
         // The engines hold everything replay read: drop what the last
         // checkpoint covers.
         let mut floor = Seq::MAX;
         engines.each(&mut |engine| floor = floor.min(engine.durable_through()));
         self.truncate_held(floor)?;
-        self.commit
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .last = last;
+        {
+            let mut state = self.commit.lock().unwrap_or_else(PoisonError::into_inner);
+            state.last = last;
+            state.last_ms = last_ms;
+        }
         self.order.start_at(last);
         self.feed.reset(last);
         if new_database && !defaults.is_empty() {
@@ -335,6 +339,34 @@ impl Core {
         self.write_or_fail(engines, Kind::Catalog, self.visible(), &[&staged])
     }
 
+    /// Stop writes for a backup: no checkpoint runs, no commit is
+    /// sequenced, and every commit sequenced before is visible, until the
+    /// guard is dropped. Reads go on.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Storage`] when writes stopped after a failed write.
+    #[cfg_attr(not(any(feature = "auth", feature = "content")), allow(dead_code))]
+    pub(crate) fn freeze(&self) -> Result<Frozen<'_>> {
+        let checkpointing = self
+            .checkpointing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let commit = self.commit.lock().unwrap_or_else(PoisonError::into_inner);
+        let last = commit.last;
+        // A commit in flight applies without the sequencer lock.
+        self.order.wait_visible(last);
+        if self.halted() {
+            return Err(halted_error());
+        }
+        Ok(Frozen {
+            core: self,
+            last,
+            _checkpointing: checkpointing,
+            _commit: commit,
+        })
+    }
+
     /// Start a checkpoint after `bytes` more log bytes (at least 1).
     pub(crate) fn set_checkpoint_every(&self, bytes: u64) {
         self.checkpoint_every.store(bytes.max(1), Ordering::Release);
@@ -482,7 +514,8 @@ impl Core {
         };
         let ids: Vec<EngineId> = staged.iter().map(|w| w.engine()).collect();
         // One buffer per commit: it must outlive the lock until its apply.
-        let mut record = RecordWriter::new(seq, kind, class, &ids, Vec::new())?;
+        let time_ms = super::now_ms().max(state.last_ms);
+        let mut record = RecordWriter::new(seq, kind, class, &ids, time_ms, Vec::new())?;
         for work in staged {
             let format = self
                 .engine(engines, work.engine(), work.collection())?
@@ -508,6 +541,7 @@ impl Core {
             work.reserve(seq);
         }
         state.last = seq;
+        state.last_ms = time_ms;
         state.in_flight += 1;
         // Queued while the sequencer lock is held, so the queue stays in
         // sequence order.
@@ -539,8 +573,9 @@ impl Core {
             .map_err(stopped)
     }
 
-    /// Replay the log into the engines. Returns the last sequence number.
-    fn replay(&self, engines: &dyn Registry) -> Result<Seq> {
+    /// Replay the log into the engines. Returns the last sequence number
+    /// and the latest record time.
+    fn replay(&self, engines: &dyn Registry) -> Result<(Seq, u64)> {
         // Engines skip what they hold; the catalog file holds every catalog
         // change it applied, so replay never skips past it.
         let mut engines_floor = Seq::MAX;
@@ -551,8 +586,10 @@ impl Core {
         });
         let floor = engines_floor.min(self.catalog.durable_through());
         let mut last: Option<Seq> = None;
+        let mut last_ms = 0;
         self.log.replay(|lsn, bytes| {
             let view = record::decode(bytes, lsn)?;
+            last_ms = last_ms.max(view.time_ms);
             let expected = match last {
                 Some(last) => last + 1,
                 // A log truncated by a checkpoint starts later: every
@@ -580,7 +617,7 @@ impl Core {
         if top > last {
             return Err(Error::corrupt("the commit log (ends early)", last));
         }
-        Ok(last)
+        Ok((last, last_ms))
     }
 
     /// Hand each section of a decoded record to its engine.
@@ -653,6 +690,38 @@ fn stopped(stop: Stop<Error>) -> Error {
     match stop {
         Stop::Halted => halted_error(),
         Stop::Failed(err) => err,
+    }
+}
+
+/// Writes stopped by [`Core::freeze`].
+pub(crate) struct Frozen<'c> {
+    core: &'c Core,
+    last: Seq,
+    _checkpointing: MutexGuard<'c, ()>,
+    _commit: MutexGuard<'c, CommitState>,
+}
+
+#[cfg_attr(not(any(feature = "auth", feature = "content")), allow(dead_code))]
+impl Frozen<'_> {
+    /// The last commit: everything the database holds.
+    pub(crate) fn last(&self) -> Seq {
+        self.last
+    }
+
+    /// Make every engine's files hold everything through the last commit.
+    pub(crate) fn checkpoint(&self, engines: &dyn Registry) -> Result<()> {
+        let mut failed = None;
+        engines.each(&mut |engine| {
+            if let Err(err) = engine.checkpoint(self.last) {
+                failed = failed.take().or(Some(err));
+            }
+        });
+        failed.map_or(Ok(()), Err)
+    }
+
+    /// Each record of the log, in order.
+    pub(crate) fn records(&self, f: impl FnMut(u64, &[u8]) -> Result<()>) -> Result<()> {
+        self.core.log.replay(f)
     }
 }
 

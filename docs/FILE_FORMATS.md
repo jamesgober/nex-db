@@ -58,9 +58,9 @@ session ms u64`, `max idle ms u64` (0 for none), `pending verification u8`. A
 space's definition is the settings it starts with, encoded as the `'m'`
 record below, or empty.
 
-Later versions add `auth/hot/` (session checkpoints), `auth/audit/` (the
-audit chain), `auth/revocations/` (revocations kept across restores),
-`content/routes/` and `content/search/` (rebuildable indexes). A file that
+Later versions add `auth/hot/` (session checkpoints), `content/routes/` and
+`content/search/` (rebuildable indexes). A restored database (0.5) may hold
+`core/reapply/` until it first opens: see [Backups](#backups). A file that
 can be rebuilt from the log is rebuilt when it is missing or fails its check;
 every other file that fails its check keeps the database closed.
 
@@ -394,6 +394,35 @@ field count times:
         6 list            count u16 (at most 1,000), then each value
                           as tag and value, none a list (0.4)
 ```
+
+## Backups
+
+A backup directory (0.5) holds:
+
+```text
+<backup>/
+├─ BACKUP           the manifest
+├─ base/            the database's files at the base commit
+│   └─ <store>.dump   each store's keys and values, one log record each
+└─ log/             the commit log from the base commit on (wal-db
+                    segments, records as in LOG_FORMAT.md)
+```
+
+The manifest, written last and atomically: `"NXDBBKUP" [8]`, `format u16
+(1)`, `base seq u64`, `holds key u8`, `item count u16`, then per item `kind
+u8` (1 a file, 2 a store, 3 a data key file, copied again by each later
+backup) and its path in the database directory, `/`-separated (`str16`). A
+path that is empty, absolute, or holds `.` or `..` parts fails the check.
+
+A store dump is a wal-db log whose records are `key bytes32`, `value
+bytes32`. The base holds `core/catalog.ckpt`, `auth/key.check`, `auth/keys`
+(only for a database whose key lives in its directory), and per realm
+`sessions.ckpt`, `audit.chain`, and `account-keys`.
+
+A restore writes the archived records up to its point as the new log, and
+the records after it of the priority class into `core/reapply/` (a wal-db
+log of whole records). The first open applies their revocations again in
+one commit and then removes the directory.
 
 ## Ids
 

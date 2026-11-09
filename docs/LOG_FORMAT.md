@@ -48,14 +48,17 @@ refuses a log holding a longer record.
 
 ```text
 offset  size  field
-0       2     format     record format, 1
+0       2     format     record format, 2 (1 before 0.5)
 2       8     seq        commit sequence number
 10      1     kind       what the record is
 11      1     class      how it was written
 12      16    engines    bit mask of the engine ids that have a section
 28      2     sections   number of sections
-30      ...   sections, one after another
+30      8     time       when the commit was sequenced, Unix ms (format 2)
+38      ...   sections, one after another
 ```
+
+Format 1 has no time field: its sections start at offset 30. Both read.
 
 - **seq** starts at 1 and rises by exactly 1 per record. Recovery refuses a
   log whose sequence numbers skip or repeat.
@@ -67,6 +70,9 @@ offset  size  field
   section for each of its collections the commit touched (0.4: realms and
   spaces besides the defaults). Records written before 0.4 hold one section
   per engine.
+- **time** is the system clock when the commit was numbered, or the time of
+  the record before when the clock reads earlier, so times never go back. It
+  orders nothing; a restore to a time uses it (see `docs/API.md`).
 - No bytes follow the last section.
 
 ### Kinds

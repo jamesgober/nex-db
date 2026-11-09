@@ -6,6 +6,7 @@
 //!
 //! ```text
 //! header   format u16 | seq u64 | kind u8 | class u8 | engines u128 | sections u16
+//!          | time ms u64 (format 2)
 //! section  engine u16 | flags u8 | format u16 | collection u32 | length u32 | body
 //! ```
 //!
@@ -24,12 +25,14 @@ use crate::{
 /// commit is 1, and 0 means "nothing".
 pub(crate) type Seq = u64;
 
-/// The record format this version writes and reads.
-pub(crate) const RECORD_FORMAT: u16 = 1;
+/// The record format this version writes: 2 adds the commit time.
+pub(crate) const RECORD_FORMAT: u16 = 2;
+/// The format before, without the time; read only.
+const RECORD_FORMAT_1: u16 = 1;
 
 /// Size of the record header in bytes.
 #[cfg(test)]
-pub(crate) const HEADER_LEN: usize = 2 + 8 + 1 + 1 + 16 + 2;
+pub(crate) const HEADER_LEN: usize = 2 + 8 + 1 + 1 + 16 + 2 + 8;
 
 /// Size of a section header in bytes.
 #[cfg(test)]
@@ -97,6 +100,9 @@ pub(crate) struct RecordView<'a> {
     pub(crate) seq: Seq,
     pub(crate) kind: Kind,
     pub(crate) class: Class,
+    /// When the commit was sequenced, in Unix milliseconds; 0 for a format 1
+    /// record.
+    pub(crate) time_ms: u64,
     pub(crate) sections: Vec<Section<'a>>,
 }
 
@@ -122,12 +128,13 @@ pub(crate) struct RecordWriter {
 
 impl RecordWriter {
     /// Start a record of `sections` sections touching the engines in
-    /// `engines`.
+    /// `engines`, committed at `time_ms`.
     pub(crate) fn new(
         seq: Seq,
         kind: Kind,
         class: Class,
         engines: &[EngineId],
+        time_ms: u64,
         mut buf: Vec<u8>,
     ) -> Result<Self> {
         buf.clear();
@@ -144,6 +151,7 @@ impl RecordWriter {
         w.u8(class as u8);
         w.u128(mask);
         w.u16(sections);
+        w.u64(time_ms);
         Ok(RecordWriter {
             buf,
             seq,
@@ -212,7 +220,7 @@ impl RecordWriter {
 pub(crate) fn decode(bytes: &[u8], at: u64) -> Result<RecordView<'_>> {
     let mut r = Reader::new(bytes, "a log record", at);
     let format = r.u16()?;
-    if format != RECORD_FORMAT {
+    if format != RECORD_FORMAT && format != RECORD_FORMAT_1 {
         return Err(Error::corrupt("a log record format", at));
     }
     let seq = r.u64()?;
@@ -220,6 +228,7 @@ pub(crate) fn decode(bytes: &[u8], at: u64) -> Result<RecordView<'_>> {
     let class = Class::from_u8(r.u8()?, seq)?;
     let mask = r.u128()?;
     let count = r.u16()?;
+    let time_ms = if format == RECORD_FORMAT { r.u64()? } else { 0 };
     let mut seen = 0u128;
     let mut sections: Vec<Section<'_>> = Vec::with_capacity(usize::from(count));
     for _ in 0..count {
@@ -251,6 +260,7 @@ pub(crate) fn decode(bytes: &[u8], at: u64) -> Result<RecordView<'_>> {
         seq,
         kind,
         class,
+        time_ms,
         sections,
     })
 }
@@ -265,6 +275,7 @@ mod tests {
             Kind::Commit,
             Class::Durable,
             &[EngineId(1), EngineId(2)],
+            7,
             Vec::new(),
         )
         .unwrap();
@@ -290,6 +301,7 @@ mod tests {
         assert_eq!(view.seq, 42);
         assert_eq!(view.kind, Kind::Commit);
         assert_eq!(view.class, Class::Durable);
+        assert_eq!(view.time_ms, 7);
         assert_eq!(view.sections.len(), 2);
         assert_eq!(view.sections[0].engine, EngineId(1));
         assert_eq!(view.sections[0].collection, 10);
@@ -331,15 +343,29 @@ mod tests {
 
     #[test]
     fn test_writer_undeclared_engine_is_refused() {
-        let mut w =
-            RecordWriter::new(1, Kind::Commit, Class::Durable, &[EngineId(1)], Vec::new()).unwrap();
+        let mut w = RecordWriter::new(
+            1,
+            Kind::Commit,
+            Class::Durable,
+            &[EngineId(1)],
+            0,
+            Vec::new(),
+        )
+        .unwrap();
         assert!(w.begin_section(EngineId(2), 0, 1, 0).is_err());
     }
 
     #[test]
     fn test_writer_missing_section_is_refused() {
-        let w =
-            RecordWriter::new(1, Kind::Commit, Class::Durable, &[EngineId(1)], Vec::new()).unwrap();
+        let w = RecordWriter::new(
+            1,
+            Kind::Commit,
+            Class::Durable,
+            &[EngineId(1)],
+            0,
+            Vec::new(),
+        )
+        .unwrap();
         assert!(w.finish().is_err());
     }
 
@@ -351,9 +377,43 @@ mod tests {
                 Kind::Commit,
                 Class::Durable,
                 &[EngineId(128)],
+                0,
                 Vec::new()
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod format_one {
+    use super::*;
+
+    #[test]
+    fn test_a_format_1_record_reads_without_a_time() {
+        let mut w = RecordWriter::new(
+            3,
+            Kind::Commit,
+            Class::Priority,
+            &[EngineId(1)],
+            9,
+            Vec::new(),
+        )
+        .unwrap();
+        w.begin_section(EngineId(1), 0, 1, 0)
+            .unwrap()
+            .extend_from_slice(b"x");
+        w.end_section().unwrap();
+        let mut bytes = w.finish().unwrap();
+        // Format 1: the same header without the time.
+        let header = 2 + 8 + 1 + 1 + 16 + 2;
+        let _ = bytes.drain(header..header + 8);
+        bytes[..2].copy_from_slice(&RECORD_FORMAT_1.to_le_bytes());
+        let view = decode(&bytes, 0).unwrap();
+        assert_eq!(
+            (view.seq, view.time_ms, view.class),
+            (3, 0, Class::Priority)
+        );
+        assert_eq!(view.sections[0].body, b"x");
     }
 }

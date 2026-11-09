@@ -177,3 +177,7 @@ required-features = ["auth", "content"]
 [[test]]
 name = "erasure"
 required-features = ["auth"]
+
+[[test]]
+name = "backup"
+required-features = ["auth", "content"]

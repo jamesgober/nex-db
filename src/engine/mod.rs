@@ -51,6 +51,8 @@
 //! The contract is crate-internal: engines are modules of this crate, so the
 //! contract can change between versions without breaking callers.
 
+use std::path::Path;
+
 use crate::{
     core::record::{Section, Seq},
     error::{Error, Result},
@@ -160,6 +162,34 @@ pub(crate) trait Engine: Send + Sync {
     /// No running transaction has a snapshot below `watermark`: state kept
     /// only for older snapshots (conflict entries, old versions) may go.
     fn reclaim(&self, watermark: Seq);
+
+    /// Hand a backup the engine's files, called after a checkpoint while
+    /// writes are stopped: each store's contents, and each other file.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Storage`] when a store cannot be read or the backup cannot
+    /// be written.
+    fn backup(&self, out: &mut dyn BackupSink) -> Result<()> {
+        let _ = out;
+        Ok(())
+    }
+}
+
+/// Where an engine's files go in a backup.
+#[cfg_attr(not(any(feature = "auth", feature = "content")), allow(dead_code))]
+pub(crate) trait BackupSink {
+    /// A file, copied as it is.
+    fn file(&mut self, path: &Path) -> Result<()>;
+    /// A file copied again by every later backup into the same directory:
+    /// one that changes outside the log (data keys).
+    fn keys(&mut self, path: &Path) -> Result<()>;
+    /// The contents of the store in `dir`: every key and value.
+    fn store(
+        &mut self,
+        dir: &Path,
+        pairs: &mut dyn Iterator<Item = (Vec<u8>, Vec<u8>)>,
+    ) -> Result<()>;
 }
 
 /// One transaction's work in one engine.

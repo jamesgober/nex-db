@@ -12,12 +12,13 @@ All notable changes to `nex-db` are documented in this file. The format is based
 - `Listing::outdated(locale)`: translations made from an older revision than their source publishes.
 - `get_many`, one snapshot for many entities, and `stream`, every entry of a listing.
 - `add_redirect` and `remove_route`.
+- Backups and point-in-time restore: `Database::backup`, `restore`, `BackupInfo`, and `RestorePoint`. Later backups into the same directory add the commits since; revocations after the restore point are applied again.
 - Per-account data keys and `erase_account`: an account's private records are sealed under its own key, kept in `auth/account-keys` and never in the log; erasing the account removes its records and destroys the key. `RevokeReason::Erased` and `Change::AccountErased`.
 - Search: `Type::searchable`, `Content::search`, `Search`, `Hit`, and `Hits`: every word of a query in a published body of one locale, ranked by BM25 over weighted fields; English locales stem and skip common words.
 
 ### Changed
 
-- Entity heads are written in format 6 (a flags byte); format 5 still reads. Types are written in format 3 (searchable fields); formats 1 and 2 still read.
+- Entity heads are written in format 6 (a flags byte); format 5 still reads. Types are written in format 3 (searchable fields); formats 1 and 2 still read. Log records are written in format 2 (with the commit time); format 1 still reads.
 - `translate` records the source revision on every call, not only the first.
 
 ## [0.4.1] - 2026-11-08

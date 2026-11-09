@@ -757,10 +757,15 @@ static INTERNED: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 /// `text` as a `&'static str`: one kept before, or a new one while there is
 /// room, or [`FALLBACK`].
 fn intern(text: &str) -> &'static str {
+    intern_in(&INTERNED, text)
+}
+
+/// [`intern`] with the table `table`.
+fn intern_in(table: &Mutex<Vec<&'static str>>, text: &str) -> &'static str {
     if text.len() > MAX_TEXT {
         return FALLBACK;
     }
-    let mut kept = INTERNED.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut kept = table.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(found) = kept.iter().find(|k| **k == text) {
         return found;
     }
@@ -912,13 +917,20 @@ mod tests {
 
     #[test]
     fn test_interned_texts_are_bounded() {
+        // A table of its own: filling the shared one would change what
+        // tests running alongside receive.
+        let table = Mutex::new(Vec::new());
         let long = "x".repeat(MAX_TEXT + 1);
-        assert_eq!(intern(&long), FALLBACK);
+        assert_eq!(intern_in(&table, &long), FALLBACK);
         for i in 0..MAX_INTERNED + 10 {
-            let _ = intern(&format!("text {i}"));
+            let _ = intern_in(&table, &format!("text {i}"));
         }
-        assert!(INTERNED.lock().unwrap().len() <= MAX_INTERNED);
-        assert_eq!(intern("a text never seen before, past the bound"), FALLBACK);
+        assert!(table.lock().unwrap().len() <= MAX_INTERNED);
+        assert_eq!(
+            intern_in(&table, "a text never seen before, past the bound"),
+            FALLBACK
+        );
+        assert_eq!(intern_in(&table, "text 3"), "text 3");
     }
 
     #[test]

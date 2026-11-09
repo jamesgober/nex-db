@@ -6,6 +6,11 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 ## [Unreleased]
 
+### Changed
+
+- The session table keeps entries in place and finds them with one index probe: about half the memory per session, and faster checks of unknown tokens.
+- Session tokens parse through a lookup table.
+
 ## [0.5.0] - 2026-11-09
 
 Feature complete: split auth, erasure, search, and backups.

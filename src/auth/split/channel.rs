@@ -33,6 +33,10 @@ const HELLO_WAIT: Duration = Duration::from_secs(30);
 /// How long a closing database waits for the auth process to end before it
 /// is killed.
 const EXIT_WAIT: Duration = Duration::from_secs(30);
+/// The longest any request waits for its reply. An auth process that does
+/// not answer in time is ended, so the channel fails closed (every auth call
+/// errors and writes stop) instead of leaving callers waiting.
+const REQUEST_WAIT: Duration = Duration::from_secs(120);
 
 fn gone() -> Error {
     Error::storage(
@@ -191,7 +195,12 @@ impl Channel {
             reader: Mutex::new(Some(reader)),
             pid,
         });
-        let reply = channel.exchange(super::op::HELLO, hello, Some(HELLO_WAIT))?;
+        let reply = channel.exchange(
+            super::op::HELLO,
+            hello,
+            HELLO_WAIT,
+            "it did not answer the hello: does the program's main call nex_db::serve_auth_process first?",
+        )?;
         reply.decode(|r| {
             if r.fixed::<8>()? != *HELLO_REPLY {
                 return Err(Error::corrupt(REPLY, 0));
@@ -217,14 +226,15 @@ impl Channel {
         op: u16,
         f: impl FnOnce(&mut Writer<'_>) -> Result<()>,
     ) -> Result<Reply> {
-        self.exchange(op, f, None)
+        self.exchange(op, f, REQUEST_WAIT, "it did not answer in two minutes, and was ended")
     }
 
     fn exchange(
         &self,
         op: u16,
         f: impl FnOnce(&mut Writer<'_>) -> Result<()>,
-        wait: Option<Duration>,
+        limit: Duration,
+        late: &'static str,
     ) -> Result<Reply> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let frame = wire::frame(
@@ -253,31 +263,17 @@ impl Channel {
             if let Some(reply) = reply.take() {
                 return reply.map_err(|()| gone());
             }
-            match wait {
-                None => {
-                    reply = slot
-                        .ready
-                        .wait(reply)
-                        .unwrap_or_else(PoisonError::into_inner);
-                }
-                Some(limit) => {
-                    let left = limit.saturating_sub(started.elapsed());
-                    if left.is_zero() {
-                        drop(reply);
-                        self.kill();
-                        return Err(Error::storage(
-                            "starting the auth process",
-                            "it did not answer: does the program's main call \
-                             nex_db::serve_auth_process first?",
-                        ));
-                    }
-                    reply = slot
-                        .ready
-                        .wait_timeout(reply, left)
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .0;
-                }
+            let left = limit.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                drop(reply);
+                self.kill();
+                return Err(Error::storage("the auth process", late));
             }
+            reply = slot
+                .ready
+                .wait_timeout(reply, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
         }
     }
 

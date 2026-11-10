@@ -97,9 +97,6 @@
 #[cfg(feature = "auth")]
 mod auth;
 mod backup;
-#[cfg(any(fuzzing, test))]
-#[doc(hidden)]
-pub mod fuzz;
 #[cfg(feature = "content")]
 mod content;
 mod core;
@@ -107,6 +104,9 @@ mod db;
 mod engine;
 mod error;
 mod feed;
+#[cfg(any(fuzzing, test))]
+#[doc(hidden)]
+pub mod fuzz;
 mod ids;
 #[cfg(feature = "auth")]
 #[cfg(feature = "metrics")]

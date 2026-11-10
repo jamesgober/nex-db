@@ -6,10 +6,13 @@
 //! A target gets arbitrary bytes. It may return an error; it must not
 //! panic, hang, or allocate more than the input justifies.
 
+/// A decoder and its name.
+pub type Target = (&'static str, fn(&[u8]));
+
 /// The decoders, by name.
-pub fn targets() -> Vec<(&'static str, fn(&[u8]))> {
+pub fn targets() -> Vec<Target> {
     #[allow(unused_mut)]
-    let mut targets: Vec<(&'static str, fn(&[u8]))> = vec![
+    let mut targets: Vec<Target> = vec![
         ("record", crate::core::record::fuzz),
         ("catalog", crate::core::catalog::fuzz),
         ("root_key", crate::core::keys::fuzz),

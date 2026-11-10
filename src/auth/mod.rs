@@ -5360,6 +5360,7 @@ pub(crate) fn fuzz(data: &[u8]) {
     let _ = recovery::decode(data);
     let _ = roles::Policy::decode(data, 0);
     let _ = totp::TotpRecord::decode(data);
+    #[cfg(feature = "mfa")]
     passkey::fuzz(data);
     if let Ok(text) = std::str::from_utf8(data) {
         let _ = token::parse(text);

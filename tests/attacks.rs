@@ -109,7 +109,7 @@ fn test_files_without_the_key_hold_no_identifier_password_or_token() {
         assert!(!contains(&bytes, password.as_bytes()), "{file:?}");
         assert!(!contains(&bytes, token_text.as_bytes()), "{file:?}");
         // The random part of a token is its last 44 characters.
-        assert!(!contains(&bytes, token_text[4..].as_bytes()), "{file:?}");
+        assert!(!contains(&bytes, &token_text.as_bytes()[4..]), "{file:?}");
     }
     // And without the key the database does not open.
     std::fs::remove_file(key_dir.0.join("root.key")).unwrap();
@@ -130,7 +130,10 @@ fn test_no_call_shows_a_password_hash() {
     let shown = format!("{hashed:?}");
     assert!(!shown.contains("argon2"), "{shown}");
     assert!(!shown.contains('$'), "{shown}");
-    let account = db.auth().create_account("hash@example.com", &hashed).unwrap();
+    let account = db
+        .auth()
+        .create_account("hash@example.com", &hashed)
+        .unwrap();
     let view = format!("{:?}", db.auth().account(account).unwrap());
     assert!(!view.contains("argon2"), "{view}");
     assert!(!view.contains("hash@example.com"), "{view}");
@@ -143,7 +146,10 @@ fn test_known_and_unknown_identifiers_take_the_same_time() {
     let dir = TempDir::new("timing");
     let db = Database::open(&dir.0).unwrap();
     let hashed = db.auth().hash_password("the right password").unwrap();
-    let _ = db.auth().create_account("known@example.com", &hashed).unwrap();
+    let _ = db
+        .auth()
+        .create_account("known@example.com", &hashed)
+        .unwrap();
     let time = |identifier: &str| {
         let started = Instant::now();
         let outcome = db
@@ -180,7 +186,10 @@ fn test_a_lock_out_survives_a_restart() {
     {
         let db = Database::open(&dir.0).unwrap();
         let hashed = db.auth().hash_password("the right password").unwrap();
-        let _ = db.auth().create_account("stuffed@example.com", &hashed).unwrap();
+        let _ = db
+            .auth()
+            .create_account("stuffed@example.com", &hashed)
+            .unwrap();
         for _ in 0..20 {
             let _ = db
                 .auth()
@@ -191,7 +200,11 @@ fn test_a_lock_out_survives_a_restart() {
     let db = Database::open(&dir.0).unwrap();
     assert!(matches!(
         db.auth()
-            .sign_in("stuffed@example.com", "the right password", SessionSpec::web())
+            .sign_in(
+                "stuffed@example.com",
+                "the right password",
+                SessionSpec::web()
+            )
             .unwrap(),
         SignIn::LockedOut { .. }
     ));
@@ -204,7 +217,10 @@ fn test_guessed_tokens_are_never_accepted() {
     let dir = TempDir::new("guess");
     let db = Database::open(&dir.0).unwrap();
     let hashed = db.auth().hash_password("pw for guessing").unwrap();
-    let account = db.auth().create_account("guess@example.com", &hashed).unwrap();
+    let account = db
+        .auth()
+        .create_account("guess@example.com", &hashed)
+        .unwrap();
     let real = db
         .auth()
         .issue_session(account, SessionSpec::web())

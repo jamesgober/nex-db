@@ -77,7 +77,7 @@ mfa = [
 # runtime dependency of nex-db's own; the ones these crates bring are recorded
 # as temporary exceptions in dev/PLAN.md (OD-5).
 [dependencies]
-wal-db = "1.1.1"
+wal-db = "1.2"
 id-forge = { version = "1.0", default-features = false, features = ["ulid"] }
 crypt-io = { version = "1.5", default-features = false, features = [
     "std",
@@ -87,7 +87,7 @@ crypt-io = { version = "1.5", default-features = false, features = [
     "aead-chacha20",
 ] }
 # `durability` stays off: the core commit log is the write-ahead log.
-lsm-db = { version = "1.1", default-features = false, features = ["std"], optional = true }
+lsm-db = { version = "1.2", default-features = false, features = ["std"], optional = true }
 # The auth audit chain. No third-party dependency with default features off;
 # hashed with keyed BLAKE3 through crypt-io.
 audit-trail = { version = "1.1", default-features = false, features = ["std"], optional = true }

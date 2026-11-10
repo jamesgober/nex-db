@@ -111,7 +111,8 @@
 
 - Fuzz targets for every decoder; attack tests for every threat; soak tests; kill tests on all three platforms.
   - [x] Fuzz entries for every decoder, a cargo-fuzz target, and attack tests (`PLAN.md` D-121).
-- Upstream dependency removals adopted (OD-5).
+  - [x] Soak test (`tests/soak.rs`: an hour on Linux, 42,602 rounds); kill tests on Linux, macOS, and Windows in CI (25 rounds each), 1,000 rounds on Linux and 500 on Windows before release.
+- [x] Upstream dependency removals adopted (OD-5): error-forge 1.1, wal-db 1.2, lsm-db 1.2 (`PLAN.md` D-123).
 - [x] Defence idea: decoy tokens (`PLAN.md` D-122).
 - **Exit:** no third-party runtime dependency outside crypt-io's audited cryptography.
 

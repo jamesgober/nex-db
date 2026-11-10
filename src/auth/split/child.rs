@@ -274,7 +274,10 @@ impl<'h> State<'h> {
                     wire::put_str(w, path)?;
                 }
             }
-            op::VALIDATE => wire::put_validation(w, &engine.validate(get_str(r)?))?,
+            op::VALIDATE => {
+                let (validation, decoy) = engine.validate_checked(get_str(r)?);
+                wire::put_checked_validation(w, &validation, decoy)?;
+            }
             op::CHECK => {
                 let identifier = get_str(r)?;
                 let password = get_str(r)?;
@@ -472,6 +475,7 @@ impl<'h> State<'h> {
                 let spec = wire::get_spec(r)?;
                 wire::put_token(w, &tx.issue_session(account, spec)?)?;
             }
+            op::PLANT_DECOY => wire::put_token(w, &tx.plant_decoy()?)?,
             op::SINGLE_USE_TOKEN | op::STAGE_SINGLE_USE => {
                 let purpose = wire::get_purpose(r)?;
                 let account = wire::get_account(r)?;

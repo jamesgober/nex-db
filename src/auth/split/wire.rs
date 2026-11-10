@@ -380,8 +380,30 @@ pub(crate) fn put_validation(w: &mut Writer<'_>, v: &Validation) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn get_validation(r: &mut Reader<'_>) -> Result<Validation> {
-    Ok(match r.u8()? {
+/// A validation reply: as [`put_validation`], with a decoy as its own code
+/// so the application raises the event.
+pub(crate) fn put_checked_validation(
+    w: &mut Writer<'_>,
+    v: &Validation,
+    decoy: bool,
+) -> Result<()> {
+    if decoy {
+        w.u8(6);
+        return Ok(());
+    }
+    put_validation(w, v)
+}
+
+/// A validation reply and whether the token was a decoy.
+pub(crate) fn get_checked_validation(r: &mut Reader<'_>) -> Result<(Validation, bool)> {
+    match r.u8()? {
+        6 => Ok((Validation::Unknown, true)),
+        code => Ok((validation_of(code, r)?, false)),
+    }
+}
+
+fn validation_of(code: u8, r: &mut Reader<'_>) -> Result<Validation> {
+    Ok(match code {
         1 => Validation::Valid(get_session(r)?),
         2 => Validation::Expired,
         3 => Validation::Revoked {
@@ -908,7 +930,7 @@ pub(crate) fn fuzz(data: &[u8]) {
     let _ = get_roles(&mut reader());
     let _ = get_role(&mut reader());
     let _ = get_session(&mut reader());
-    let _ = get_validation(&mut reader());
+    let _ = get_checked_validation(&mut reader());
     let _ = get_checked(&mut reader());
     let _ = get_view(&mut reader());
     let _ = get_session_infos(&mut reader());
@@ -1003,9 +1025,14 @@ mod tests {
                 reason: RevokeReason::Erased,
             },
         ] {
-            let mut out = Vec::new();
-            put_validation(&mut Writer::new(&mut out), &v).unwrap();
-            assert_eq!(get_validation(&mut Reader::new(&out, REPLY, 0)).unwrap(), v);
+            for decoy in [false, true] {
+                let mut out = Vec::new();
+                put_checked_validation(&mut Writer::new(&mut out), &v, decoy).unwrap();
+                let back = get_checked_validation(&mut Reader::new(&out, REPLY, 0)).unwrap();
+                // A decoy always reads back as Unknown, flagged.
+                let expect = if decoy { Validation::Unknown } else { v };
+                assert_eq!(back, (expect, decoy));
+            }
         }
     }
 }

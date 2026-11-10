@@ -198,6 +198,10 @@ name = "backup"
 required-features = ["auth", "content"]
 
 [[test]]
+name = "soak"
+required-features = ["auth", "content"]
+
+[[test]]
 name = "attacks"
 required-features = ["auth", "content"]
 

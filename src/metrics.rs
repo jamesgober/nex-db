@@ -30,12 +30,13 @@ const CODES: [&str; 12] = [
 ];
 
 /// Security event kinds, as labels.
-const KINDS: [&str; 5] = [
+const KINDS: [&str; 6] = [
     "sign_in_failed",
     "locked_out",
     "sign_in_blocked",
     "revoked_session_presented",
     "canary_requested",
+    "decoy_presented",
 ];
 
 /// Reports a database's commits, errors, and security events into a
@@ -117,6 +118,7 @@ impl Observer for Recorder {
             SecurityEvent::SignInBlocked => 2,
             SecurityEvent::RevokedSessionPresented => 3,
             SecurityEvent::CanaryRequested => 4,
+            SecurityEvent::DecoyPresented => 5,
         };
         if let Some(counter) = self.security.get(kind) {
             counter.inc();

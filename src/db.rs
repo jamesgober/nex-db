@@ -1078,6 +1078,7 @@ impl Read<'_> {
         AuthRead {
             engine: self.db.inner.engines.auth.get(),
             snapshot: &self.snapshot,
+            observers: self.db.observers(),
         }
     }
 

@@ -76,6 +76,9 @@ pub enum SecurityEvent {
     /// most likely a scanner. The path is the one the application just
     /// resolved on this thread.
     CanaryRequested,
+    /// A decoy token was presented ([`AuthTx::plant_decoy`](crate::AuthTx::plant_decoy)):
+    /// someone is using a token that was only ever planted for attackers.
+    DecoyPresented,
 }
 
 /// Receives commits, errors, and security events. Every method has an

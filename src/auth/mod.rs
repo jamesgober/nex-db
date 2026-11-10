@@ -138,6 +138,8 @@ const CHALLENGE_MS: u64 = 5 * 60 * 1000;
 const OP_CREATE_KEYED_ACCOUNT: u8 = 15;
 /// Erase an account: its records go, and its data key is destroyed.
 const OP_ERASE_ACCOUNT: u8 = 16;
+/// A decoy token's digest (0.7): digest [32], at_ms u64.
+const OP_PLANT_DECOY: u8 = 17;
 /// The epoch of an erased account: its sessions end as `Erased`.
 pub(crate) const ERASED_EPOCH: u32 = u32::MAX;
 /// The data key file, next to the account store.
@@ -196,6 +198,8 @@ const SESSIONS_FORMAT: u16 = 1;
 /// Slot kinds in the session checkpoint.
 const SLOT_LIVE: u8 = 1;
 const SLOT_REVOKED: u8 = 2;
+/// A decoy (0.7): the digest alone.
+const SLOT_DECOY: u8 = 3;
 
 /// A revocation by `revoke_all`, kept only in checkpoints (the log raises
 /// the epoch instead).
@@ -555,7 +559,7 @@ impl AuthEngine {
             for (digest, slot, time) in checkpoint.slots {
                 let epoch = match slot {
                     Slot::Live(session) => engine.epochs.get(session.account),
-                    Slot::Revoked(_) => 0,
+                    Slot::Revoked(_) | Slot::Decoy => 0,
                 };
                 engine
                     .sessions
@@ -602,6 +606,7 @@ impl AuthEngine {
                     w.bytes16(session.payload.as_bytes())?;
                     w.u64(*seen);
                 }
+                Slot::Decoy => w.u8(SLOT_DECOY),
                 Slot::Revoked(reason) => {
                     w.u8(SLOT_REVOKED);
                     w.u64(*seen);
@@ -959,6 +964,7 @@ impl AuthEngine {
                 "session.issued",
                 account(session.account),
             ),
+            Op::PlantDecoy { at_ms, .. } => (*at_ms, "session.decoy_planted", "session".to_owned()),
             Op::RevokeSession {
                 digest,
                 reason,
@@ -1085,6 +1091,7 @@ impl AuthEngine {
             Op::UpdateAccount { account, .. } => Change::AccountChanged { account: *account },
             Op::EraseAccount { account, .. } => Change::AccountErased { account: *account },
             Op::IssueSession { .. }
+            | Op::PlantDecoy { .. }
             | Op::SetIdentifier { .. }
             | Op::SetPolicy { .. }
             | Op::PutKey { .. }
@@ -1154,16 +1161,19 @@ impl AuthEngine {
         Ok(slot)
     }
 
-    fn validate(&self, token: &str) -> Validation {
+    /// Check a session token: the validation, and whether the token is a
+    /// decoy (answered `Unknown`, as any token never issued).
+    fn validate_checked(&self, token: &str) -> (Validation, bool) {
         let Some(random) = token::parse(token) else {
-            return Validation::Malformed;
+            return (Validation::Malformed, false);
         };
         let digest = self.token_digest(&random);
         let now = now_ms();
         // No epoch lookup: signing an account out everywhere turns its
         // sessions into tombstones when the commit applies.
-        match self.sessions.get_seen(&digest) {
+        let validation = match self.sessions.get_seen(&digest) {
             None => Validation::Unknown,
+            Some((Slot::Decoy, ..)) => return (Validation::Unknown, true),
             Some((Slot::Revoked(reason), ..)) => Validation::Revoked { reason },
             Some((Slot::Live(session), ..)) if now >= session.expires_ms => Validation::Expired,
             Some((Slot::Live(session), seen, _))
@@ -1175,7 +1185,8 @@ impl AuthEngine {
                 self.sessions.touch(place, now);
                 Validation::Valid(session)
             }
-        }
+        };
+        (validation, false)
     }
 
     fn hash_password(&self, password: &str) -> Result<HashedPassword> {
@@ -1376,9 +1387,10 @@ impl AuthRef<'_> {
         }
     }
 
-    fn validate(self, token: &str) -> Result<Validation> {
+    /// The validation, and whether the token was a decoy.
+    fn validate(self, token: &str) -> Result<(Validation, bool)> {
         match self {
-            AuthRef::Local(engine) => Ok(engine.validate(token)),
+            AuthRef::Local(engine) => Ok(engine.validate_checked(token)),
             #[cfg(feature = "split-auth")]
             AuthRef::Remote(remote) => remote.validate(token),
         }
@@ -1513,6 +1525,10 @@ enum Op<'a> {
     IssueSession {
         digest: [u8; 32],
         session: Session,
+    },
+    PlantDecoy {
+        digest: [u8; 32],
+        at_ms: u64,
     },
     RevokeSession {
         digest: [u8; 32],
@@ -1654,6 +1670,10 @@ fn decode_ops(seq: Seq, body: &[u8]) -> Result<Vec<Op<'_>>> {
                     },
                 }
             }
+            OP_PLANT_DECOY => Op::PlantDecoy {
+                digest: r.fixed()?,
+                at_ms: r.u64()?,
+            },
             OP_RAISE_EPOCH => Op::RaiseEpoch {
                 account: AccountId::from_bytes(r.fixed()?),
                 epoch: r.u32()?,
@@ -1943,6 +1963,11 @@ impl Engine for AuthEngine {
                         .insert(digest, session, epoch)
                         .map_err(|_| table_full())?;
                 }
+                Op::PlantDecoy { digest, .. } => {
+                    self.sessions
+                        .plant_decoy(digest)
+                        .map_err(|_| table_full())?;
+                }
                 Op::RevokeSession {
                     digest,
                     reason,
@@ -2034,6 +2059,10 @@ enum StagedOp {
     IssueSession {
         digest: [u8; 32],
         session: Session,
+    },
+    PlantDecoy {
+        digest: [u8; 32],
+        at_ms: u64,
     },
     RevokeSession {
         digest: [u8; 32],
@@ -2263,6 +2292,11 @@ fn write_ops(ops: &[StagedOp], out: &mut Vec<u8>) -> Result<()> {
                 for digest in identifiers {
                     w.bytes(digest);
                 }
+                w.u64(*at_ms);
+            }
+            StagedOp::PlantDecoy { digest, at_ms } => {
+                w.u8(OP_PLANT_DECOY);
+                w.bytes(digest);
                 w.u64(*at_ms);
             }
             StagedOp::IssueSession { digest, session } => {
@@ -2632,6 +2666,10 @@ fn read_checkpoint(path: &Path, file_key: &[u8; 32]) -> Result<Option<Checkpoint
                 seen = r.u64()?;
                 Slot::Live(session)
             }
+            SLOT_DECOY => {
+                seen = 0;
+                Slot::Decoy
+            }
             SLOT_REVOKED => {
                 seen = r.u64()?;
                 Slot::Revoked(match r.u8()? {
@@ -2847,6 +2885,26 @@ impl AuthTx<'_, '_> {
             AuthPart::Local(staged) => LocalTx { staged }.issue_session(account, spec),
             #[cfg(feature = "split-auth")]
             AuthPart::Remote(remote) => remote.issue_session(account, spec),
+        }
+    }
+
+    /// Plant a decoy: a token that looks like a session token and names no
+    /// session. Put it where only an attacker would find and use it (a
+    /// honeypot page, a fake backup, a planted cookie). Presenting it is
+    /// answered [`Validation::Unknown`], as for any token never issued, and
+    /// raises [`SecurityEvent::DecoyPresented`](crate::SecurityEvent::DecoyPresented)
+    /// on the observer, on the thread that validated it. A decoy is never
+    /// reclaimed; [`revoke`](Self::revoke) retires it, after which it reads
+    /// as any token never issued.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Busy`] when the session table is full.
+    pub fn plant_decoy(&mut self) -> Result<Token> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.plant_decoy(),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.plant_decoy(),
         }
     }
 
@@ -3558,6 +3616,24 @@ impl LocalTx<'_, '_> {
             at_ms: now_ms(),
         });
         Ok(Some(account))
+    }
+
+    fn plant_decoy(&mut self) -> Result<Token> {
+        let engine = self.staged.engine;
+        if engine.sessions.len() + self.staged.issued.len() >= engine.max_sessions {
+            return Err(Error::Busy {
+                what: "the session table",
+            });
+        }
+        let (token, random) = Token::generate()?;
+        let digest = engine.token_digest(&random);
+        let _ = self.staged.issued.insert(digest);
+        self.staged.writes.push(session_key(&digest));
+        self.staged.ops.push(StagedOp::PlantDecoy {
+            digest,
+            at_ms: now_ms(),
+        });
+        Ok(token)
     }
 
     fn stage_session(&mut self, session: Session) -> Result<Token> {
@@ -4499,7 +4575,7 @@ impl LocalTx<'_, '_> {
                 self.staged.note(session_key(&digest));
                 engine.sessions.get(&digest)
             },
-            Some(Slot::Live(_))
+            Some(Slot::Live(_) | Slot::Decoy)
         ) || self.staged.issued.contains(&digest);
         if !live {
             return Ok(false);
@@ -4555,13 +4631,25 @@ impl Auth<'_> {
     /// None embedded. With split auth, where the check is one round trip to
     /// the auth process, [`Error::Storage`] once that process is gone.
     pub fn validate(&self, token: impl AsRef<str>) -> Result<Validation> {
-        let validation = self.engine().validate(token.as_ref())?;
-        if matches!(validation, Validation::Revoked { .. }) {
+        let (validation, decoy) = self.engine().validate(token.as_ref())?;
+        if decoy {
+            self.db.observers().security(SecurityEvent::DecoyPresented);
+        } else if matches!(validation, Validation::Revoked { .. }) {
             self.db
                 .observers()
                 .security(SecurityEvent::RevokedSessionPresented);
         }
         Ok(validation)
+    }
+
+    /// Plant a decoy token in its own commit. See [`AuthTx::plant_decoy`].
+    ///
+    /// # Errors
+    ///
+    /// As [`AuthTx::plant_decoy`], plus the errors of [`Database::commit`].
+    pub fn plant_decoy(&self) -> Result<Token> {
+        self.db
+            .commit(|tx| tx.auth_of(self.engine.collection()).plant_decoy())
     }
 
     /// Hash a password with Argon2id (19 MiB, 2 passes, 1 lane, random
@@ -5315,6 +5403,7 @@ impl Auth<'_> {
 pub struct AuthRead<'r> {
     pub(crate) engine: AuthRef<'r>,
     pub(crate) snapshot: &'r SnapshotGuard<'r>,
+    pub(crate) observers: &'r crate::observe::Observers,
 }
 
 impl AuthRead<'_> {
@@ -5327,7 +5416,11 @@ impl AuthRead<'_> {
         if self.snapshot.expired() {
             return Err(Error::SnapshotTooOld);
         }
-        self.engine.validate(token.as_ref())
+        let (validation, decoy) = self.engine.validate(token.as_ref())?;
+        if decoy {
+            self.observers.security(SecurityEvent::DecoyPresented);
+        }
+        Ok(validation)
     }
 
     /// The account's standing as of the snapshot, or `None` when the account

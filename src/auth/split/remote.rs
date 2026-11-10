@@ -113,8 +113,12 @@ impl RemoteAuth {
             .decode(read)
     }
 
-    pub(crate) fn validate(&self, token: &str) -> Result<Validation> {
-        self.call(op::VALIDATE, |w| put_str(w, token), wire::get_validation)
+    pub(crate) fn validate(&self, token: &str) -> Result<(Validation, bool)> {
+        self.call(
+            op::VALIDATE,
+            |w| put_str(w, token),
+            wire::get_checked_validation,
+        )
     }
 
     pub(crate) fn hash_password(&self, password: &str) -> Result<HashedPassword> {
@@ -438,6 +442,10 @@ impl<'db> RemoteStaged<'db> {
             },
             wire::get_account,
         )
+    }
+
+    pub(crate) fn plant_decoy(&mut self) -> Result<Token> {
+        self.tx(op::PLANT_DECOY, |_| Ok(()), wire::get_token)
     }
 
     pub(crate) fn issue_session(&mut self, account: AccountId, spec: SessionSpec) -> Result<Token> {

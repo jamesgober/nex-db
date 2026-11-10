@@ -802,3 +802,9 @@ fn write_reply(out: &Mutex<Box<dyn Write + Send>>, id: u64, status: u8, body: &[
     let mut out = out.lock().unwrap_or_else(PoisonError::into_inner);
     let _ = out.write_all(&frame).and_then(|()| out.flush());
 }
+
+/// The request frame parser, for fuzzing and tests.
+#[cfg(any(fuzzing, test))]
+pub(crate) fn parse_frame(frame: &[u8]) -> Result<(u64, u16, &[u8])> {
+    parse(frame)
+}

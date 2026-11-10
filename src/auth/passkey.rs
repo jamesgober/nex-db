@@ -575,6 +575,15 @@ impl Json<'_> {
     }
 }
 
+/// Runs this module's decoders on `data`, for fuzzing and tests. Errors are
+/// expected; a panic, a hang, or an allocation the input asked for is a bug.
+#[cfg(any(fuzzing, test))]
+pub(crate) fn fuzz(data: &[u8]) {
+    let _ = PasskeyRecord::decode(data);
+    let _ = parse_auth_data(data);
+    let _ = parse_client_data(data);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

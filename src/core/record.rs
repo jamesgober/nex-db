@@ -265,6 +265,13 @@ pub(crate) fn decode(bytes: &[u8], at: u64) -> Result<RecordView<'_>> {
     })
 }
 
+/// Runs this module's decoders on `data`, for fuzzing and tests. Errors are
+/// expected; a panic, a hang, or an allocation the input asked for is a bug.
+#[cfg(any(fuzzing, test))]
+pub(crate) fn fuzz(data: &[u8]) {
+    let _ = decode(data, 0);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

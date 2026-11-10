@@ -366,6 +366,13 @@ fn decode_checkpoint(bytes: &[u8]) -> Result<State> {
     })
 }
 
+/// Runs this module's decoders on `data`, for fuzzing and tests. Errors are
+/// expected; a panic, a hang, or an allocation the input asked for is a bug.
+#[cfg(any(fuzzing, test))]
+pub(crate) fn fuzz(data: &[u8]) {
+    let _ = decode_checkpoint(data);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

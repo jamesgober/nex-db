@@ -887,6 +887,38 @@ fn read_error(r: &mut Reader<'_>) -> Result<Error> {
     Ok(err)
 }
 
+/// Runs this module's decoders on `data`, for fuzzing and tests. Errors are
+/// expected; a panic, a hang, or an allocation the input asked for is a bug.
+#[cfg(any(fuzzing, test))]
+pub(crate) fn fuzz(data: &[u8]) {
+    let _ = read_frame(&mut &data[..], REQUEST_HEAD);
+    let _ = read_frame(&mut &data[..], RESPONSE_HEAD);
+    // Every reader the application uses on a reply, from the start.
+    let reader = || Reader::new(data, "fuzz", 0);
+    let _ = get_bool(&mut reader());
+    let _ = get_account(&mut reader());
+    let _ = get_opt_account(&mut reader());
+    let _ = get_token(&mut reader());
+    let _ = get_duration(&mut reader());
+    let _ = get_time(&mut reader());
+    let _ = get_opt_time(&mut reader());
+    let _ = get_spec(&mut reader());
+    let _ = get_purpose(&mut reader());
+    let _ = get_standing(&mut reader());
+    let _ = get_roles(&mut reader());
+    let _ = get_role(&mut reader());
+    let _ = get_session(&mut reader());
+    let _ = get_validation(&mut reader());
+    let _ = get_checked(&mut reader());
+    let _ = get_view(&mut reader());
+    let _ = get_session_infos(&mut reader());
+    let _ = get_key_check(&mut reader());
+    let _ = get_api_key(&mut reader());
+    let _ = get_codes(&mut reader());
+    let _ = get_change(&mut reader());
+    let _ = get_error(&mut reader());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

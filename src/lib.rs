@@ -104,6 +104,9 @@ mod db;
 mod engine;
 mod error;
 mod feed;
+#[cfg(any(fuzzing, test))]
+#[doc(hidden)]
+pub mod fuzz;
 mod ids;
 #[cfg(feature = "auth")]
 #[cfg(feature = "metrics")]

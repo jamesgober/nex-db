@@ -1,0 +1,29 @@
+# Coverage-guided fuzzing of every decoder (`src/fuzz.rs`), with cargo-fuzz:
+#
+#   cargo +nightly fuzz run decoders
+#
+# Not part of the published crate.
+
+[package]
+name = "nex-db-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nex-db = { path = "..", features = ["split-auth", "mfa"] }
+
+[[bin]]
+name = "decoders"
+path = "fuzz_targets/decoders.rs"
+test = false
+doc = false
+bench = false
+
+# A workspace of its own, so the crate's own build ignores this one.
+[workspace]
+members = ["."]

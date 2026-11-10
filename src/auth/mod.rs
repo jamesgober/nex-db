@@ -5348,6 +5348,27 @@ impl AuthRead<'_> {
     }
 }
 
+/// Runs this module's decoders on `data`, for fuzzing and tests. Errors are
+/// expected; a panic, a hang, or an allocation the input asked for is a bug.
+#[cfg(any(fuzzing, test))]
+pub(crate) fn fuzz(data: &[u8]) {
+    let _ = decode_ops(1, data);
+    let _ = AccountRecord::decode(data);
+    let _ = audit::Tail::decode(&mut Reader::new(data, "fuzz", 0));
+    let _ = keys::KeyRecord::decode(data);
+    let _ = realm::RealmPolicy::decode(data);
+    let _ = recovery::decode(data);
+    let _ = roles::Policy::decode(data, 0);
+    let _ = totp::TotpRecord::decode(data);
+    #[cfg(feature = "mfa")]
+    passkey::fuzz(data);
+    if let Ok(text) = std::str::from_utf8(data) {
+        let _ = token::parse(text);
+    }
+    #[cfg(feature = "split-auth")]
+    split::fuzz(data);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

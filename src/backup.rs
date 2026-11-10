@@ -686,3 +686,10 @@ fn restore_store(_dump: &Path, _dir: &Path) -> Result<()> {
         "holds a store, and this build has no engine to read it",
     ))
 }
+
+/// Runs this module's decoders on `data`, for fuzzing and tests. Errors are
+/// expected; a panic, a hang, or an allocation the input asked for is a bug.
+#[cfg(any(fuzzing, test))]
+pub(crate) fn fuzz(data: &[u8]) {
+    let _ = Manifest::decode(data);
+}

@@ -53,6 +53,7 @@ type Chain = Vec<(Seq, Option<Arc<[u8]>>)>;
 
 /// What [`Versions::lookup`] found.
 #[derive(Debug)]
+#[cfg_attr(not(feature = "content"), allow(dead_code))]
 pub(crate) enum Lookup {
     /// Not tracked: read the store.
     Untracked,
@@ -109,6 +110,7 @@ impl Versions {
 
     /// True when any key is tracked; false lets a caller skip building a
     /// key to ask with.
+    #[cfg_attr(not(feature = "content"), allow(dead_code))]
     pub(crate) fn tracks_any(&self) -> bool {
         self.tracked.load(Ordering::Acquire) != 0
     }
@@ -116,6 +118,7 @@ impl Versions {
     /// What a snapshot at `at` sees of `key`: whether the key is tracked,
     /// and if so its value then and whether that is its newest version (so
     /// the store's latest state as well).
+    #[cfg_attr(not(feature = "content"), allow(dead_code))]
     pub(crate) fn lookup(&self, key: &[u8], at: Seq) -> Lookup {
         if self.tracked.load(Ordering::Acquire) == 0 {
             return Lookup::Untracked;
@@ -139,6 +142,7 @@ impl Versions {
     /// The value `key` had at snapshot `at`, when the key is tracked:
     /// `Some(None)` means it did not exist then. `None` means not tracked:
     /// read the store.
+    #[cfg_attr(not(feature = "auth"), allow(dead_code))]
     pub(crate) fn at(&self, key: &[u8], at: Seq) -> Option<Option<Arc<[u8]>>> {
         if self.tracked.load(Ordering::Acquire) == 0 {
             return None;

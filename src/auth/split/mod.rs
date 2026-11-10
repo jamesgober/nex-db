@@ -196,3 +196,11 @@ pub fn serve_auth_process() -> Result<bool> {
     child::serve()?;
     Ok(true)
 }
+
+/// Runs this module's decoders on `data`, for fuzzing and tests. Errors are
+/// expected; a panic, a hang, or an allocation the input asked for is a bug.
+#[cfg(any(fuzzing, test))]
+pub(crate) fn fuzz(data: &[u8]) {
+    wire::fuzz(data);
+    let _ = child::parse_frame(data);
+}

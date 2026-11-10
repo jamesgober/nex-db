@@ -259,6 +259,15 @@ pub(crate) fn load_file(path: &Path) -> Result<RootKey> {
     Ok(RootKey(key))
 }
 
+/// Runs this module's decoders on `data`, for fuzzing and tests. Errors are
+/// expected; a panic, a hang, or an allocation the input asked for is a bug.
+#[cfg(any(fuzzing, test))]
+pub(crate) fn fuzz(data: &[u8]) {
+    if let Ok(text) = std::str::from_utf8(data) {
+        let _ = parse_hex(text);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

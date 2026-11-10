@@ -3035,6 +3035,19 @@ impl ContentRead<'_> {
     }
 }
 
+/// Runs this module's decoders on `data`, for fuzzing and tests. Errors are
+/// expected; a panic, a hang, or an allocation the input asked for is a bug.
+#[cfg(any(fuzzing, test))]
+pub(crate) fn fuzz(data: &[u8]) {
+    let _ = decode_ops(1, FORMAT, data);
+    let _ = decode_ops(1, FORMAT_CREATE_ONLY, data);
+    let _ = Head::decode(data, 0);
+    let _ = Revision::decode(data, 0);
+    let _ = decode_route(data, 0);
+    let _ = SpaceSpec::decode(data, 0);
+    let _ = Types::decode(data, 0);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

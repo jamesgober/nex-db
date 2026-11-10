@@ -33,6 +33,8 @@ authors = ["James Gober <me@jamesgober.com>"]
 
 # Not published until James decides (dev/PLAN.md, open decision OD-1).
 publish = false
+# The fuzzing crate builds on its own (`fuzz/Cargo.toml`).
+exclude = ["/fuzz"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -193,6 +195,10 @@ required-features = ["auth"]
 
 [[test]]
 name = "backup"
+required-features = ["auth", "content"]
+
+[[test]]
+name = "attacks"
 required-features = ["auth", "content"]
 
 [[test]]

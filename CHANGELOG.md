@@ -6,6 +6,10 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 ## [Unreleased]
 
+### Added
+
+- Decoy tokens: `plant_decoy()` gives a token that names no session. Validating it answers `Validation::Unknown`, as for any token never issued, and raises `SecurityEvent::DecoyPresented`; `revoke` retires it. Log op 17 and session checkpoint slot kind 3.
+
 ## [0.6.0] - 2026-11-09
 
 Optimisation: the session table, a cache of published entries, allocation-free read hits, and canary routes.

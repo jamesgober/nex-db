@@ -112,6 +112,7 @@
 - Fuzz targets for every decoder; attack tests for every threat; soak tests; kill tests on all three platforms.
   - [x] Fuzz entries for every decoder, a cargo-fuzz target, and attack tests (`PLAN.md` D-121).
 - Upstream dependency removals adopted (OD-5).
+- [x] Defence idea: decoy tokens (`PLAN.md` D-122).
 - **Exit:** no third-party runtime dependency outside crypt-io's audited cryptography.
 
 ## 0.8.0 Alpha

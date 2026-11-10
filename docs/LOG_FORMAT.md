@@ -197,6 +197,7 @@ The operations:
 | 14 | store a passkey (0.5) | `credential digest [32]`, `account [16]`, `what u8` (1 added, 2 used, 3 removed), `record bytes32` (sealed, as stored; empty when removed), `at ms u64` |
 | 15 | create account (0.5) | `account [16]`, `identifier digest [32]`, `created ms u64`, `record bytes32` (sealed under the account's data key, so the time is in the clear: a replay never needs the key) |
 | 16 | erase an account (0.5) | `account [16]`, `identifier count u8` (at most 5), `identifier digest [32]` each, `at ms u64`; applying it removes the account's records and destroys its data key. The same commit raises the account's epoch to `u32::MAX`, which ends its sessions as erased |
+| 17 | plant a decoy (0.7) | `token digest [32]`, `at ms u64`; the session table holds the digest as a decoy, never reclaimed; a revoke of it (op 3) removes it |
 | 13 | store an account's TOTP record (0.5) | `account [16]`, `what u8` (1 added, 2 confirmed, 3 a code used, 4 removed), `record bytes32` (sealed, as stored; empty when removed), `at ms u64` |
 
 A session is valid only while its epoch equals the account's current epoch

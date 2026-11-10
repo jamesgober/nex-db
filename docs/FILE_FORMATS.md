@@ -269,6 +269,7 @@ slot count times:         token digest [32], kind u8, then by kind:
                           last used ms u64
     2 revoked             kept until ms u64, reason u8 (1 revoked, 2 rotated,
                           3 signed out everywhere)
+    3 decoy (0.7)         nothing more
 ```
 
 Each checkpoint first drops sessions that have expired and tombstones whose

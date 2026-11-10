@@ -372,11 +372,12 @@ opaque to nex-db.
 |---|---|---|---|
 | `validate(token) -> Result<Validation>` | 0.1 | P0 | read only |
 | `issue_session(account, spec) -> Result<Token>` | 0.1 | P0 | durable |
-| `revoke(token) -> Result<bool>` | 0.1 | P0 | takes effect ahead of ordinary commits; `false` when the token names no session or one already revoked |
+| `revoke(token) -> Result<bool>` | 0.1 | P0 | takes effect ahead of ordinary commits; `false` when the token names no session or one already revoked; on a decoy, retires it |
 | `rotate(token) -> Result<Token>` | 0.3 | P0 | the old token becomes `Revoked { Rotated }` |
 | `revoke_all(account) -> Result<u32>` | 0.3 | P0 | signs the account out everywhere; returns how many sessions ended |
 | `sessions(account) -> Result<Vec<SessionInfo>>` | 0.4 | P2 | newest first; `SessionInfo`: `id()`, `created_at()`, `expires_at()`, `last_used_at()`, `idle_limit()`; never tokens or digests; single-use tokens are not listed |
 | `revoke_session(account, SessionId) -> Result<bool>` | 0.4 | P2 | for "sign out that device"; a `SessionId` (32 hex digits as text) is a keyed digest of the session's digest: random to anyone without the keys and no way to the token; also in a transaction |
+| `plant_decoy() -> Result<Token>` | 0.7 | defence | a token that names no session, for places only an attacker would use it; `validate` answers `Unknown`, as for any token never issued, and raises `SecurityEvent::DecoyPresented`; never reclaimed; `revoke` retires it; also in a transaction |
 
 ### Accounts and passwords
 
@@ -497,6 +498,7 @@ Inside `db.commit`, `tx.auth()` stages:
 | `create_account(identifier, &HashedPassword) -> Result<AccountId>` | 0.1 |
 | `issue_session(account, spec) -> Result<Token>` | 0.1 |
 | `revoke(token) -> Result<bool>` | 0.1 |
+| `plant_decoy() -> Result<Token>` | 0.7 |
 | `revoke_all`, `set_standing`, `rotate` | 0.3 |
 | `add_identifier`, `remove_identifier`, `define_role` | 0.4 |
 | `set_password`, `assign_roles`, `new_recovery_codes`, `use_recovery_code`, `create_api_key`, `revoke_api_key`, `revoke_session` | 0.4 |
@@ -932,8 +934,9 @@ again) always reach the observer, with ids and kinds only, never an
 identifier; nex-db never keeps one to itself. `SecurityEvent`
 (non-exhaustive): `SignInFailed { account: Option<AccountId> }` (`None` for an
 identifier no account has), `LockedOut { account }`, `SignInBlocked`,
-`RevokedSessionPresented`, and `CanaryRequested` (a canary path was resolved;
-the path is the one the application resolved on that thread). Observers run on the calling thread, so they hand
+`RevokedSessionPresented`, `CanaryRequested` (a canary path was resolved; the
+path is the one the application resolved on that thread), and
+`DecoyPresented` (a decoy token was validated). Observers run on the calling thread, so they hand
 slow work to another thread. `Recovering` is not seen through this API in
 0.4, since `open` returns once recovery is done; it is for split auth.
 

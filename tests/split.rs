@@ -775,6 +775,47 @@ fn test_totp_and_passkey_challenges() {
     ));
 }
 
+fn test_a_decoy_raises_its_event_in_the_application() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    };
+    struct Count(Arc<AtomicU32>);
+    impl nex_db::Observer for Count {
+        fn on_security_event(&self, event: &nex_db::SecurityEvent) {
+            if *event == nex_db::SecurityEvent::DecoyPresented {
+                let _ = self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    let dir = TempDir::new("decoy");
+    let hits = Arc::new(AtomicU32::new(0));
+    let decoy;
+    {
+        let db = Database::builder(&dir.0)
+            .auth(AuthMode::separate_process())
+            .observer(Count(Arc::clone(&hits)))
+            .open()
+            .unwrap();
+        decoy = db.auth().plant_decoy().unwrap();
+        assert!(matches!(
+            db.auth().validate(decoy.as_str()).unwrap(),
+            nex_db::Validation::Unknown
+        ));
+        assert_eq!(hits.load(Ordering::Relaxed), 1);
+    }
+    // The same decoy, the database opened embedded.
+    let db = Database::builder(&dir.0)
+        .observer(Count(Arc::clone(&hits)))
+        .open()
+        .unwrap();
+    assert!(matches!(
+        db.auth().validate(decoy.as_str()).unwrap(),
+        nex_db::Validation::Unknown
+    ));
+    assert_eq!(hits.load(Ordering::Relaxed), 2);
+}
+
 type Test = (&'static str, fn());
 
 const TESTS: &[Test] = &[
@@ -815,6 +856,10 @@ const TESTS: &[Test] = &[
         test_a_killed_auth_process_fails_calls_and_stops_writes,
     ),
     ("threads_share_the_channel", test_threads_share_the_channel),
+    (
+        "a_decoy_raises_its_event_in_the_application",
+        test_a_decoy_raises_its_event_in_the_application,
+    ),
     #[cfg(feature = "mfa")]
     (
         "totp_and_passkey_challenges",

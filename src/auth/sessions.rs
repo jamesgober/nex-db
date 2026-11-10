@@ -341,6 +341,11 @@ impl SessionTable {
     ) -> Result<(), Full> {
         let mut w = self.writer();
         match self.table.get(&digest) {
+            // A decoy retired: gone, as a token never issued.
+            Some(found) if kind(&found.words) == KIND_DECOY => {
+                let _ = self.table.remove(found.at);
+                Ok(())
+            }
             Some(found) => {
                 let account = account_of(&found.words);
                 if kind(&found.words) == KIND_LIVE {

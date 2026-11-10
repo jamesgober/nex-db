@@ -1161,12 +1161,8 @@ impl AuthEngine {
         Ok(slot)
     }
 
-    fn validate(&self, token: &str) -> Validation {
-        self.validate_checked(token).0
-    }
-
-    /// As [`validate`](Self::validate), and whether the token is a decoy
-    /// (answered `Unknown`, as any token never issued).
+    /// Check a session token: the validation, and whether the token is a
+    /// decoy (answered `Unknown`, as any token never issued).
     fn validate_checked(&self, token: &str) -> (Validation, bool) {
         let Some(random) = token::parse(token) else {
             return (Validation::Malformed, false);
@@ -2898,7 +2894,8 @@ impl AuthTx<'_, '_> {
     /// answered [`Validation::Unknown`], as for any token never issued, and
     /// raises [`SecurityEvent::DecoyPresented`](crate::SecurityEvent::DecoyPresented)
     /// on the observer, on the thread that validated it. A decoy is never
-    /// reclaimed; revoking it turns it into a revoked session's marker.
+    /// reclaimed; [`revoke`](Self::revoke) retires it, after which it reads
+    /// as any token never issued.
     ///
     /// # Errors
     ///
@@ -4578,7 +4575,7 @@ impl LocalTx<'_, '_> {
                 self.staged.note(session_key(&digest));
                 engine.sessions.get(&digest)
             },
-            Some(Slot::Live(_))
+            Some(Slot::Live(_) | Slot::Decoy)
         ) || self.staged.issued.contains(&digest);
         if !live {
             return Ok(false);

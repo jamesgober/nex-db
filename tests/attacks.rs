@@ -282,3 +282,86 @@ fn test_engines_never_reach_each_other() {
     check("content", &["crate::auth", "super::auth", "AuthEngine"]);
     check("auth", &["crate::content", "ContentEngine"]);
 }
+
+/// Counts decoy events.
+struct Decoys(std::sync::Arc<std::sync::atomic::AtomicU32>);
+
+impl nex_db::Observer for Decoys {
+    fn on_security_event(&self, event: &nex_db::SecurityEvent) {
+        if *event == nex_db::SecurityEvent::DecoyPresented {
+            let _ = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Probing with a stolen or planted token: a decoy is answered `Unknown`,
+/// as any token never issued, and raises an event. It survives a restart
+/// (from the log, and from the checkpoint written at close), is never
+/// listed as a session, and `revoke` retires it (then it raises nothing).
+#[test]
+fn test_a_decoy_answers_unknown_and_raises_an_event() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    };
+    let dir = TempDir::new("decoy");
+    let hits = Arc::new(AtomicU32::new(0));
+    let open = || {
+        Database::builder(&dir.0)
+            .observer(Decoys(Arc::clone(&hits)))
+            .open()
+            .unwrap()
+    };
+    let decoy;
+    {
+        let db = open();
+        let hashed = db.auth().hash_password("pw for decoys").unwrap();
+        let account = db
+            .auth()
+            .create_account("decoy@example.com", &hashed)
+            .unwrap();
+        let _ = db
+            .auth()
+            .issue_session(account, SessionSpec::web())
+            .unwrap();
+        decoy = db.auth().plant_decoy().unwrap();
+        assert_eq!(decoy.as_str().len(), 48);
+        assert!(matches!(
+            db.auth().validate(decoy.as_str()).unwrap(),
+            Validation::Unknown
+        ));
+        assert_eq!(hits.load(Ordering::Relaxed), 1);
+        // A token never issued raises nothing.
+        let other = format!("AQAA{}", "B".repeat(44));
+        assert!(matches!(
+            db.auth().validate(&other).unwrap(),
+            Validation::Unknown
+        ));
+        assert_eq!(hits.load(Ordering::Relaxed), 1);
+        // At a snapshot too.
+        let seen = db.read(|r| r.auth().validate(decoy.as_str())).unwrap();
+        assert!(matches!(seen, Validation::Unknown));
+        assert_eq!(hits.load(Ordering::Relaxed), 2);
+        // Not a session of anyone.
+        assert_eq!(db.auth().sessions(account).unwrap().len(), 1);
+    }
+    let db = open();
+    assert!(matches!(
+        db.auth().validate(decoy.as_str()).unwrap(),
+        Validation::Unknown
+    ));
+    assert_eq!(hits.load(Ordering::Relaxed), 3);
+    assert!(db.auth().revoke(&decoy).unwrap());
+    assert!(matches!(
+        db.auth().validate(decoy.as_str()).unwrap(),
+        Validation::Unknown
+    ));
+    assert_eq!(hits.load(Ordering::Relaxed), 3);
+    drop(db);
+    let db = open();
+    assert!(matches!(
+        db.auth().validate(decoy.as_str()).unwrap(),
+        Validation::Unknown
+    ));
+    assert_eq!(hits.load(Ordering::Relaxed), 3);
+}

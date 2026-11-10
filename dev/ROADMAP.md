@@ -2,7 +2,7 @@
 
 > One milestone at a time, each ending with something that runs. Work only on the current milestone. Requirements (FR, NFR) are in [`PLAN.md`](./PLAN.md).
 
-**Current milestone: 0.7.0 (hardening). 0.1.0 to 0.6.0 are released (GitHub pre-releases).**
+**Current milestone: 0.8.0 (alpha). 0.1.0 to 0.7.0 are released (GitHub pre-releases).**
 
 ---
 
@@ -114,7 +114,8 @@
   - [x] Soak test (`tests/soak.rs`: an hour on Linux, 42,602 rounds); kill tests on Linux, macOS, and Windows in CI (25 rounds each), 1,000 rounds on Linux and 500 on Windows before release.
 - [x] Upstream dependency removals adopted (OD-5): error-forge 1.1, wal-db 1.2, lsm-db 1.2 (`PLAN.md` D-123).
 - [x] Defence idea: decoy tokens (`PLAN.md` D-122).
-- **Exit:** no third-party runtime dependency outside crypt-io's audited cryptography.
+- **Exit:** no third-party runtime dependency outside crypt-io's audited cryptography. Met; released 2026-11-10.
+- Moved to 0.8: sealed mode, per-operation budgets for admin listings, online re-keying, secure deletion at compaction (the remaining hardening items of the private design), and the items moved to 0.7 from 0.6 (measurements, the preview index, device-bound sessions, the P2 items).
 
 ## 0.8.0 Alpha
 

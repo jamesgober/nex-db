@@ -6,6 +6,10 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-10
+
+Hardening: fuzzing, attack and soak tests, decoy tokens, and no third-party dependency outside crypt-io's cryptography.
+
 ### Added
 
 - Decoy tokens: `plant_decoy()` gives a token that names no session. Validating it answers `Validation::Unknown`, as for any token never issued, and raises `SecurityEvent::DecoyPresented`; `revoke` retires it. Log op 17 and session checkpoint slot kind 3.
@@ -175,7 +179,8 @@ The walking skeleton.
 - Repository scaffold: `Cargo.toml` (edition 2024, MSRV 1.85), `src/lib.rs` with `VERSION`, CI on Linux, macOS, and Windows (stable and 1.85), `cargo deny` configuration.
 - `dev/PLAN.md`, `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/nex-db/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/jamesgober/nex-db/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/jamesgober/nex-db/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/nex-db/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/nex-db/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/jamesgober/nex-db/compare/v0.4.0...v0.4.1

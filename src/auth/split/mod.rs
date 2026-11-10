@@ -91,6 +91,7 @@ pub(crate) mod op {
     pub(crate) const REVOKE_API_KEY: u16 = 70;
     pub(crate) const REVOKE_SESSION: u16 = 71;
     pub(crate) const REVOKE: u16 = 72;
+    pub(crate) const PLANT_DECOY: u16 = 73;
     #[cfg(feature = "mfa")]
     pub(crate) const ADD_TOTP: u16 = 80;
     #[cfg(feature = "mfa")]

@@ -37,6 +37,7 @@ const _: () = assert!(INLINE + EXT * 8 == MAX_PAYLOAD);
 
 const KIND_LIVE: u64 = 1;
 const KIND_REVOKED: u64 = 2;
+const KIND_DECOY: u64 = 3;
 
 /// How long a tombstone of a session whose expiry is unknown is kept.
 const TOMBSTONE_MS: u64 = 24 * 60 * 60 * 1000;
@@ -58,6 +59,8 @@ type ExtWords = [u64; EXT];
 pub(crate) enum Slot {
     Live(Session),
     Revoked(RevokeReason),
+    /// A token planted for attackers to find: never a session.
+    Decoy,
 }
 
 /// Where an entry was found, for [`SessionTable::touch`].
@@ -177,6 +180,7 @@ fn decode(words: &Words, ext: Option<&ExtWords>) -> Option<Slot> {
             }))
         }
         KIND_REVOKED => reason_of((words[6] >> 8) & 0xFF).map(Slot::Revoked),
+        KIND_DECOY => Some(Slot::Decoy),
         _ => None,
     }
 }
@@ -309,6 +313,19 @@ impl SessionTable {
                 Ok(())
             }
             Err(Refused::Exists(_)) => Ok(()),
+            Err(Refused::Full) => Err(Full),
+        }
+    }
+
+    /// Hold `digest` as a decoy: never a session, never reclaimed. A digest
+    /// already in the table keeps its entry.
+    pub(crate) fn plant_decoy(&self, digest: [u8; 32]) -> Result<(), Full> {
+        let _w = self.writer();
+        let mut words = [0; WORDS];
+        words[3] = u64::MAX;
+        words[6] = KIND_DECOY;
+        match self.table.insert(&digest, &words, None, 0) {
+            Ok(_) | Err(Refused::Exists(_)) => Ok(()),
             Err(Refused::Full) => Err(Full),
         }
     }
@@ -451,6 +468,7 @@ impl SessionTable {
                 let time = match slot {
                     Slot::Live(_) => found.aux,
                     Slot::Revoked(_) => found.words[3],
+                    Slot::Decoy => 0,
                 };
                 out.push((digest, slot, time));
             }
@@ -473,6 +491,7 @@ impl SessionTable {
                 let mut w = self.writer();
                 self.put_tombstone(&mut w, digest, reason, time)
             }
+            Slot::Decoy => self.plant_decoy(digest),
         }
     }
 }

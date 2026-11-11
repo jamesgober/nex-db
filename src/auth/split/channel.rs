@@ -1,19 +1,28 @@
 //! The application's end of the channel to the auth process.
 //!
 //! Many threads share one channel. A request takes the writer lock only to
-//! write its frame; one reader thread hands each response to the request
-//! with its id. When the auth process ends, or sends a frame that does not
-//! parse, the channel is dead: every waiting request and every later one
-//! fails with [`Error::Storage`], and [`Channel::failure`] reports it to the
-//! core, which stops writes.
+//! write its frame. Then it reads its own reply: the request that holds the
+//! read side reads frames off the pipe, hands each other request its reply,
+//! and returns with its own; a request that finds the read side taken waits
+//! for its reply or for its turn to read. A lone request so takes one
+//! wake-up for its reply, the pipe's, not two (the pipe's and then a reader
+//! thread's).
+//!
+//! A watchdog thread checks every [`WATCH`] that the auth process is still
+//! running and that no request has waited past its limit: the request that
+//! reads is blocked on the pipe and cannot time itself out, so the watchdog
+//! ends the process, which ends the pipe. When the auth process ends, or
+//! sends a frame that does not parse, the channel is dead: every waiting
+//! request and every later one fails with [`Error::Storage`], and
+//! [`Channel::failure`] reports it to the core, which stops writes.
 
 use std::{
     collections::HashMap,
     io::{BufReader, Write},
     path::Path,
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{
-        Arc, Condvar, Mutex, PoisonError,
+        Arc, Condvar, Mutex, MutexGuard, PoisonError, TryLockError,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::JoinHandle,
@@ -40,6 +49,10 @@ const REQUEST_WAIT: Duration = Duration::from_secs(120);
 /// Buffer for reading replies: a frame and its length usually arrive in one
 /// read.
 const READ_BUFFER: usize = 64 * 1024;
+/// How often the watchdog checks the auth process and the waiting requests.
+/// An auth process that ends while no request is waiting stops writes
+/// within this time; one that ends during a request fails it at once.
+const WATCH: Duration = Duration::from_millis(100);
 
 fn gone() -> Error {
     Error::storage(
@@ -72,35 +85,145 @@ impl Reply {
     }
 }
 
+/// What a waiting request is woken for: its reply, once read, or its turn
+/// to take the read side.
 #[derive(Default)]
+struct Wait {
+    reply: Option<std::result::Result<Reply, ()>>,
+    lead: bool,
+}
+
+/// One request in flight.
 struct Slot {
-    reply: Mutex<Option<std::result::Result<Reply, ()>>>,
+    wait: Mutex<Wait>,
     ready: Condvar,
+    /// When the request stops waiting. Past it the auth process is ended:
+    /// by the request itself when it waits, by the watchdog when it reads.
+    deadline: Instant,
 }
 
 impl Slot {
+    fn new(limit: Duration) -> Slot {
+        Slot {
+            wait: Mutex::new(Wait::default()),
+            ready: Condvar::new(),
+            deadline: Instant::now() + limit,
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Wait> {
+        self.wait.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn fill(&self, reply: std::result::Result<Reply, ()>) {
-        *self.reply.lock().unwrap_or_else(PoisonError::into_inner) = Some(reply);
+        self.lock().reply = Some(reply);
+        self.ready.notify_one();
+    }
+
+    fn lead(&self) {
+        self.lock().lead = true;
         self.ready.notify_one();
     }
 }
 
-/// What the reader thread shares with the requests.
-#[derive(Default)]
+/// What the requests and the watchdog share.
 struct Shared {
     pending: Mutex<HashMap<u64, Arc<Slot>>>,
     dead: AtomicBool,
+    /// The read side of the pipe: the request that holds it reads.
+    output: Mutex<BufReader<ChildStdout>>,
+    child: Mutex<Option<Child>>,
+    /// Set when the channel closes, to end the watchdog.
+    closing: AtomicBool,
 }
 
 impl Shared {
+    fn pending(&self) -> MutexGuard<'_, HashMap<u64, Arc<Slot>>> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Mark the channel dead and fail every waiting request. A request
     /// checks `dead` under the same lock before it waits, so none is left
     /// waiting.
     fn fail(&self) {
-        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut pending = self.pending();
         self.dead.store(true, Ordering::Release);
         for (_, slot) in pending.drain() {
             slot.fill(Err(()));
+        }
+    }
+
+    /// End the auth process now and fail every request.
+    fn kill(&self) {
+        if let Some(child) = self
+            .child
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            let _ = child.kill();
+        }
+        self.fail();
+    }
+
+    /// Read replies until the one for `id` arrives, handing each other
+    /// reply to its request. The stream ending, failing, or holding a frame
+    /// that does not parse or that no request is waiting for ends the
+    /// channel.
+    fn read_until(&self, output: &mut BufReader<ChildStdout>, id: u64) -> Option<Reply> {
+        while let Ok(Some(frame)) = wire::read_frame(output, RESPONSE_HEAD) {
+            let mut r = Reader::new(&frame, REPLY, 0);
+            let (Ok(got), Ok(status)) = (r.u64(), r.u8()) else {
+                break;
+            };
+            if status != OK && status != ERR {
+                break;
+            }
+            let Some(slot) = self.pending().remove(&got) else {
+                break;
+            };
+            let reply = Reply { status, frame };
+            if got == id {
+                return Some(reply);
+            }
+            slot.fill(Ok(reply));
+        }
+        self.fail();
+        None
+    }
+
+    /// Give the read side's turn to one waiting request, if any. Called by
+    /// a request after it let go of the read side.
+    fn pass_lead(&self) {
+        if let Some(slot) = self.pending().values().next() {
+            slot.lead();
+        }
+    }
+
+    /// The watchdog: until the channel closes, every [`WATCH`], end the
+    /// channel if the auth process has exited, and end the auth process if
+    /// a request has waited past its limit.
+    fn watch(&self) {
+        while !self.closing.load(Ordering::Acquire) {
+            std::thread::park_timeout(WATCH);
+            if self.dead.load(Ordering::Acquire) {
+                continue;
+            }
+            let exited = self
+                .child
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
+                .is_some_and(|child| !matches!(child.try_wait(), Ok(None)));
+            if exited {
+                self.fail();
+                continue;
+            }
+            let now = Instant::now();
+            let late = self.pending().values().any(|slot| slot.deadline <= now);
+            if late {
+                self.kill();
+            }
         }
     }
 }
@@ -110,8 +233,7 @@ pub(crate) struct Channel {
     shared: Arc<Shared>,
     input: Mutex<Option<ChildStdin>>,
     next: AtomicU64,
-    child: Mutex<Option<Child>>,
-    reader: Mutex<Option<JoinHandle<()>>>,
+    watchdog: Mutex<Option<JoinHandle<()>>>,
     pid: u32,
 }
 
@@ -152,42 +274,29 @@ impl Channel {
                 "its pipes are missing",
             ));
         };
-        let shared = Arc::new(Shared::default());
-        let reader_shared = Arc::clone(&shared);
-        let reader = std::thread::Builder::new()
-            .name("nex-db-auth-channel".to_owned())
-            .spawn(move || {
-                let shared = reader_shared;
-                let mut output = BufReader::with_capacity(READ_BUFFER, output);
-                // The stream ending, failing, or holding a frame that does
-                // not parse ends the channel.
-                while let Ok(Some(frame)) = wire::read_frame(&mut output, RESPONSE_HEAD) {
-                    let mut r = Reader::new(&frame, REPLY, 0);
-                    let (Ok(id), Ok(status)) = (r.u64(), r.u8()) else {
-                        break;
-                    };
-                    if status != OK && status != ERR {
-                        break;
-                    }
-                    let slot = shared
-                        .pending
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .remove(&id);
-                    match slot {
-                        Some(slot) => slot.fill(Ok(Reply { status, frame })),
-                        // A response nobody asked for: the stream is not
-                        // what this side wrote for.
-                        None => break,
-                    }
-                }
-                shared.fail();
-            });
-        let reader = match reader {
-            Ok(reader) => reader,
+        let shared = Arc::new(Shared {
+            pending: Mutex::new(HashMap::new()),
+            dead: AtomicBool::new(false),
+            output: Mutex::new(BufReader::with_capacity(READ_BUFFER, output)),
+            child: Mutex::new(Some(child)),
+            closing: AtomicBool::new(false),
+        });
+        let watched = Arc::clone(&shared);
+        let watchdog = std::thread::Builder::new()
+            .name("nex-db-auth-watchdog".to_owned())
+            .spawn(move || watched.watch());
+        let watchdog = match watchdog {
+            Ok(watchdog) => watchdog,
             Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                shared.kill();
+                let child = shared
+                    .child
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                if let Some(mut child) = child {
+                    let _ = child.wait();
+                }
                 return Err(Error::storage("starting the auth channel", e));
             }
         };
@@ -195,8 +304,7 @@ impl Channel {
             shared,
             input: Mutex::new(Some(input)),
             next: AtomicU64::new(1),
-            child: Mutex::new(Some(child)),
-            reader: Mutex::new(Some(reader)),
+            watchdog: Mutex::new(Some(watchdog)),
             pid,
         });
         let reply = channel.exchange(
@@ -253,36 +361,56 @@ impl Channel {
             },
             f,
         )?;
-        let slot = Arc::new(Slot::default());
+        let slot = Arc::new(Slot::new(limit));
         {
-            let mut pending = self
-                .shared
-                .pending
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let mut pending = self.shared.pending();
             if self.shared.dead.load(Ordering::Acquire) {
                 return Err(gone());
             }
             let _ = pending.insert(id, Arc::clone(&slot));
         }
         self.write(&frame);
-        let mut reply = slot.reply.lock().unwrap_or_else(PoisonError::into_inner);
-        let started = Instant::now();
         loop {
-            if let Some(reply) = reply.take() {
-                return reply.map_err(|()| gone());
+            let output = match self.shared.output.try_lock() {
+                Ok(output) => Some(output),
+                Err(TryLockError::Poisoned(output)) => Some(output.into_inner()),
+                Err(TryLockError::WouldBlock) => None,
+            };
+            if let Some(mut output) = output {
+                // The read side is free. The request that held it may have
+                // read this reply already; if not, read until it comes.
+                let ready = slot.lock().reply.take();
+                let reply = match ready {
+                    Some(reply) => reply.ok(),
+                    None => self.shared.read_until(&mut output, id),
+                };
+                drop(output);
+                self.shared.pass_lead();
+                return reply.ok_or_else(gone);
             }
-            let left = limit.saturating_sub(started.elapsed());
-            if left.is_zero() {
-                drop(reply);
-                self.kill();
-                return Err(Error::storage("the auth process", late));
+            // Another request reads: wait for the reply, or for the turn to
+            // read.
+            let mut wait = slot.lock();
+            loop {
+                if let Some(reply) = wait.reply.take() {
+                    return reply.map_err(|()| gone());
+                }
+                if wait.lead {
+                    wait.lead = false;
+                    break;
+                }
+                let left = slot.deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    drop(wait);
+                    self.shared.kill();
+                    return Err(Error::storage("the auth process", late));
+                }
+                wait = slot
+                    .ready
+                    .wait_timeout(wait, left)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
             }
-            reply = slot
-                .ready
-                .wait_timeout(reply, left)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
         }
     }
 
@@ -315,19 +443,6 @@ impl Channel {
             self.shared.fail();
         }
     }
-
-    /// End the auth process now.
-    fn kill(&self) {
-        if let Some(child) = self
-            .child
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_mut()
-        {
-            let _ = child.kill();
-        }
-        self.shared.fail();
-    }
 }
 
 /// What the auth process answers the hello with.
@@ -343,12 +458,13 @@ impl Drop for Channel {
                 .unwrap_or_else(PoisonError::into_inner)
                 .take(),
         );
-        if let Some(mut child) = self
+        let child = self
+            .shared
             .child
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
+            .take();
+        if let Some(mut child) = child {
             let started = Instant::now();
             loop {
                 match child.try_wait() {
@@ -364,13 +480,15 @@ impl Drop for Channel {
                 }
             }
         }
-        if let Some(reader) = self
-            .reader
+        self.shared.closing.store(true, Ordering::Release);
+        if let Some(watchdog) = self
+            .watchdog
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
         {
-            let _ = reader.join();
+            watchdog.thread().unpark();
+            let _ = watchdog.join();
         }
     }
 }

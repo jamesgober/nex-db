@@ -13,6 +13,7 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 ### Changed
 
+- Split auth: a request reads its own reply from the auth process instead of waiting for a reader thread to hand it over, which saves a thread wake-up on every call. A watchdog thread checks every 100 ms that the auth process is still running and that no request has waited past its limit. Measured with the local latency harness, alternating with 0.7.0: a session check takes a median of 5.6 to 6.0 us against 8.1 to 8.3 us on Linux, and 11 to 27 us against 20 to 37 us on Windows (mean 17 to 33 us against 37 to 71 us). Eight threads sharing the channel do more checks a second on both: 54,000 to 83,000 against 18,000 to 67,000.
 - Renamed for plain names (the old names stay, deprecated, until 0.9):
 
   | 0.7 | 0.8 |

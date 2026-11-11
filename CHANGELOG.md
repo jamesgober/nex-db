@@ -29,6 +29,7 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 ### Fixed
 
+- The scheduling thread allocated on every pass, even with nothing due. Its first pass could fall inside `tests/alloc.rs`'s count on a loaded machine, so the test failed now and then. A pass with nothing due now allocates nothing.
 - The README and crate-level examples published a page without `publish`, so the page they resolved was a draft and not served. They now use `put` and compile as doctests.
 
 ## [0.7.0] - 2026-11-10

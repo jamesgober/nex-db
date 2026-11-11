@@ -177,16 +177,16 @@ impl Scheduler {
 
 fn run(db: &Database, wake: &Wake) {
     loop {
+        // A pass with nothing due allocates nothing.
         let now = now_ms();
-        let spaces = db.spaces();
-        let next = spaces
-            .iter()
+        let next = db
+            .spaces()
             .filter_map(|s| s.engine().schedules.next())
             .min();
         let sleep = match next {
             Some(at) if at <= now => {
                 let mut done = true;
-                for space in &spaces {
+                for space in db.spaces() {
                     done &= space.fire_due(now);
                 }
                 if done {

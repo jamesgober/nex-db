@@ -702,7 +702,7 @@ impl Database {
 
     /// Every space, the default first.
     #[cfg(feature = "content")]
-    pub(crate) fn spaces(&self) -> Vec<Content<'_>> {
+    pub(crate) fn spaces(&self) -> impl Iterator<Item = Content<'_>> {
         std::iter::once(&self.inner.engines.content)
             .chain(
                 self.inner
@@ -712,7 +712,6 @@ impl Database {
                     .filter_map(std::sync::OnceLock::get),
             )
             .map(|engine| Content { db: self, engine })
-            .collect()
     }
 
     #[cfg_attr(not(any(feature = "auth", feature = "content")), allow(dead_code))]

@@ -3,8 +3,8 @@
 use std::{path::PathBuf, time::Duration};
 
 use nex_db::{
-    CollectionKind, DEFAULT_SITE, Database, Entity, Error, Locale, Login, RealmPolicy, SessionSpec,
-    SignIn, SpaceSpec, Standing, Validation,
+    CollectionKind, DEFAULT_SITE, Database, Entity, Error, Locale, PasswordCheck, RealmPolicy,
+    SessionSpec, SignIn, SpaceSpec, Standing, Validation,
 };
 
 struct TempDir(PathBuf);
@@ -87,12 +87,12 @@ fn test_realms_hold_their_own_accounts_sessions_and_policy() {
         for _ in 0..2 {
             assert_eq!(
                 staff.verify_password("ann@example.com", "wrong").unwrap(),
-                Login::Failed
+                PasswordCheck::Failed
             );
         }
         assert!(matches!(
             staff.verify_password("ann@example.com", PASSWORD).unwrap(),
-            Login::LockedOut { .. }
+            PasswordCheck::LockedOut { .. }
         ));
         for _ in 0..2 {
             let _ = db.auth().verify_password("ann@example.com", "wrong");
@@ -101,7 +101,7 @@ fn test_realms_hold_their_own_accounts_sessions_and_policy() {
             db.auth()
                 .verify_password("ann@example.com", PASSWORD)
                 .unwrap(),
-            Login::Verified(_)
+            PasswordCheck::Verified(_)
         ));
 
         // The default realm's policy can change too.

@@ -28,7 +28,7 @@ impl Drop for TempDir {
     }
 }
 
-fn title(db: &Database, rid: nex_db::Rid) -> Option<String> {
+fn title(db: &Database, rid: nex_db::EntityId) -> Option<String> {
     db.content()
         .get(rid)
         .unwrap()
@@ -184,7 +184,7 @@ fn test_status_and_visibility_rules() {
     );
     assert!(matches!(
         db.content()
-            .save_draft(nex_db::Rid::from_bytes([1; 16]), Patch::new()),
+            .save_draft(nex_db::EntityId::from_bytes([1; 16]), Patch::new()),
         Err(Error::Invalid { .. })
     ));
 }
@@ -410,7 +410,7 @@ fn test_listings_page_newest_first_and_follow_publishing() {
     let db = Database::open(&dir.0).unwrap();
     let all = db.content().list(&Listing::latest("post")).unwrap();
     assert_eq!(titles(&all), ["p4", "p3", "p2", "p1 again"]);
-    assert_eq!(all.items()[0].rid(), posts[3]);
+    assert_eq!(all.items()[0].id(), posts[3]);
     assert!(
         db.content()
             .list(&Listing::latest("post").site("other.example"))
@@ -707,7 +707,7 @@ fn test_trash_restore_and_delete() {
     assert!(db.content().draft(deleted).unwrap().is_none());
     let list = db.content().list(&Listing::latest("post")).unwrap();
     assert_eq!(list.items().len(), 1);
-    assert_eq!(list.items()[0].rid(), kept);
+    assert_eq!(list.items()[0].id(), kept);
     // Another entity may take a gone path.
     let next = db
         .content()
@@ -741,7 +741,7 @@ fn test_references_are_indexed_and_their_rules_apply_on_delete() {
             .unwrap();
 
         // A reference must name an entity.
-        let nowhere = nex_db::Rid::from_bytes([9; 16]);
+        let nowhere = nex_db::EntityId::from_bytes([9; 16]);
         assert!(matches!(
             db.content()
                 .create(Entity::new("post").field("author", nowhere)),
@@ -922,7 +922,7 @@ fn test_page_tree_and_authors() {
         assert!(db.content().set_parent(docs, Some(docs)).is_err());
         assert!(
             db.content()
-                .set_parent(docs, Some(nex_db::Rid::from_bytes([9; 16])))
+                .set_parent(docs, Some(nex_db::EntityId::from_bytes([9; 16])))
                 .is_err()
         );
         // Reorder and move.
@@ -957,7 +957,7 @@ fn test_page_tree_and_authors() {
                 .unwrap()
                 .items()
                 .iter()
-                .map(|e| e.rid())
+                .map(|e| e.id())
                 .collect::<Vec<_>>()
         };
         assert_eq!(by(ann), vec![post]);
@@ -975,7 +975,7 @@ fn test_page_tree_and_authors() {
             .unwrap();
         let cursor = Cursor::parse(&first.next().unwrap().to_string()).unwrap();
         let second = db.content().next_page(&cursor).unwrap();
-        assert_eq!(second.items()[0].rid(), post);
+        assert_eq!(second.items()[0].id(), post);
         (root, docs, intro)
     };
     // Rebuilt at open.
@@ -1044,7 +1044,7 @@ fn test_terms_tag_entities_and_list_them() {
                 .unwrap()
                 .items()
                 .iter()
-                .map(|e| e.rid())
+                .map(|e| e.id())
                 .collect::<Vec<_>>()
         };
         assert_eq!(tagged(rust), vec![post, old]);
@@ -1085,7 +1085,7 @@ fn test_terms_tag_entities_and_list_them() {
         .list(&Listing::latest("post").term(rust))
         .unwrap();
     assert_eq!(page.items().len(), 1);
-    assert_eq!(page.items()[0].rid(), post);
+    assert_eq!(page.items()[0].id(), post);
     assert!(db.content().get(old).unwrap().is_some());
     assert_eq!(
         db.content().type_named("post").unwrap().taxonomy("tags"),
@@ -1229,7 +1229,7 @@ fn go_off_call(serializable: bool) -> (bool, bool) {
     };
     let (a, b) = (doctor(), doctor());
     let barrier = Arc::new(Barrier::new(2));
-    let run = |me: nex_db::Rid, other: nex_db::Rid| {
+    let run = |me: nex_db::EntityId, other: nex_db::EntityId| {
         let db = Arc::clone(&db);
         let barrier = Arc::clone(&barrier);
         std::thread::spawn(move || {
@@ -1339,10 +1339,10 @@ fn test_sticky_entities_lead_sticky_first_listings_across_pages() {
     }
     db.content().set_sticky(rids[3], true).unwrap();
     assert!(db.content().get(rids[3]).unwrap().unwrap().sticky());
-    let ids = |listing: Listing| -> Vec<nex_db::Rid> {
+    let ids = |listing: Listing| -> Vec<nex_db::EntityId> {
         db.content()
             .stream(listing)
-            .map(|e| e.unwrap().rid())
+            .map(|e| e.unwrap().id())
             .collect()
     };
     // Newest first; sticky ones first only when asked, and once each.
@@ -1357,7 +1357,7 @@ fn test_sticky_entities_lead_sticky_first_listings_across_pages() {
         .unwrap();
     let cursor = Cursor::parse(&first.next().unwrap().to_string()).unwrap();
     let second = db.content().next_page(&cursor).unwrap();
-    assert_eq!(second.items()[0].rid(), rids[1]);
+    assert_eq!(second.items()[0].id(), rids[1]);
     db.content().set_sticky(rids[3], false).unwrap();
     let sticky = ids(Listing::latest("post").sticky_first());
     assert_eq!(sticky, [rids[1], rids[4], rids[3], rids[2], rids[0]]);
@@ -1384,13 +1384,13 @@ fn test_outdated_lists_translations_older_than_their_source() {
             .translate(rid, fr, Patch::new().set("title", "Bonjour"))
     })
     .unwrap();
-    let outdated = |db: &Database| -> Vec<(nex_db::Rid, Locale)> {
+    let outdated = |db: &Database| -> Vec<(nex_db::EntityId, Locale)> {
         db.content()
             .list(&Listing::outdated(fr))
             .unwrap()
             .items()
             .iter()
-            .map(|e| (e.rid(), e.locale()))
+            .map(|e| (e.id(), e.locale()))
             .collect()
     };
     assert!(outdated(&db).is_empty());
@@ -1424,7 +1424,7 @@ fn test_get_many_reads_in_order_with_gaps() {
     let _ = db.content().publish(a).unwrap();
     let got = db.content().get_many(&[b, a, b], Locale::EN).unwrap();
     assert!(got[0].is_none() && got[2].is_none());
-    assert_eq!(got[1].as_ref().map(nex_db::Entry::rid), Some(a));
+    assert_eq!(got[1].as_ref().map(nex_db::Entry::id), Some(a));
     let many = vec![a; 1001];
     assert!(matches!(
         db.content().get_many(&many, Locale::EN),
@@ -1468,7 +1468,12 @@ fn test_manual_redirects_resolve_and_can_be_removed() {
     );
     assert!(
         db.content()
-            .add_redirect(DEFAULT_SITE, "/x", nex_db::Rid::from_bytes([9; 16]), 301)
+            .add_redirect(
+                DEFAULT_SITE,
+                "/x",
+                nex_db::EntityId::from_bytes([9; 16]),
+                301
+            )
             .is_err()
     );
     assert!(db.content().remove_route(DEFAULT_SITE, "/home").is_err());
@@ -1517,13 +1522,13 @@ fn test_search_ranks_published_bodies_per_locale() {
         .searchable(3)
         .field("body", FieldType::Text)
         .searchable(1);
-    let found = |db: &Database, locale: Locale, query: Search| -> Vec<nex_db::Rid> {
+    let found = |db: &Database, locale: Locale, query: Search| -> Vec<nex_db::EntityId> {
         db.content()
             .search(locale, &query)
             .unwrap()
             .items()
             .iter()
-            .map(nex_db::Hit::rid)
+            .map(nex_db::Hit::entity)
             .collect()
     };
     let (a, b, c) = {
@@ -1565,7 +1570,7 @@ fn test_search_ranks_published_bodies_per_locale() {
             .search(Locale::EN, &Search::new("database").limit(1).offset(1))
             .unwrap();
         assert_eq!((page.total(), page.items().len()), (3, 1));
-        assert_eq!(page.items()[0].rid(), c);
+        assert_eq!(page.items()[0].entity(), c);
         assert!(found(&db, Locale::EN, Search::new("database").kind("page")).is_empty());
         // A translation is searched in its own locale, without stemming.
         db.commit(|tx| {

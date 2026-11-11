@@ -702,7 +702,7 @@ impl Database {
 
     /// Every space, the default first.
     #[cfg(feature = "content")]
-    pub(crate) fn spaces(&self) -> Vec<Content<'_>> {
+    pub(crate) fn spaces(&self) -> impl Iterator<Item = Content<'_>> {
         std::iter::once(&self.inner.engines.content)
             .chain(
                 self.inner
@@ -712,7 +712,6 @@ impl Database {
                     .filter_map(std::sync::OnceLock::get),
             )
             .map(|engine| Content { db: self, engine })
-            .collect()
     }
 
     #[cfg_attr(not(any(feature = "auth", feature = "content")), allow(dead_code))]
@@ -936,7 +935,7 @@ impl Database {
     /// # fn main() -> nex_db::Result<()> {
     /// use nex_db::{Entity, Patch};
     /// let db = nex_db::open("data/site")?;
-    /// # let (from, to) = (nex_db::Rid::from_bytes([1; 16]), nex_db::Rid::from_bytes([2; 16]));
+    /// # let (from, to) = (nex_db::EntityId::from_bytes([1; 16]), nex_db::EntityId::from_bytes([2; 16]));
     /// // Move one seat from `from` to `to`, reading both first.
     /// db.commit_serializable(|tx| {
     ///     let seats = |e: Option<nex_db::Entry>| e.and_then(|e| e.field("seats")?.as_int()).unwrap_or(0);
@@ -1026,7 +1025,7 @@ impl Database {
     ///     let route = r.content().resolve(nex_db::DEFAULT_SITE, "/a")?;
     ///     Ok((route, r.content().get(rid)?))
     /// })?;
-    /// assert_eq!(route.map(|r| r.entity()), page.map(|p| p.rid()));
+    /// assert_eq!(route.map(|r| r.entity()), page.map(|p| p.id()));
     /// # drop(db);
     /// # std::fs::remove_dir_all(&dir).unwrap();
     /// # Ok(())

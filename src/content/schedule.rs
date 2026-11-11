@@ -19,7 +19,7 @@ use crate::{
     core::now_ms,
     db::Inner,
     error::{Error, Result},
-    ids::Rid,
+    ids::EntityId,
 };
 
 /// Longest the thread sleeps without a look at the clock: a clock that
@@ -29,12 +29,12 @@ const MAX_SLEEP: Duration = Duration::from_secs(30);
 const BACKOFF: Duration = Duration::from_secs(1);
 
 /// One schedule as the index orders it: time, entity, locale, action.
-type Row = (u64, Rid, Locale, Action);
+type Row = (u64, EntityId, Locale, Action);
 
 #[derive(Debug, Default)]
 struct Index {
     rows: BTreeSet<Row>,
-    placed: HashMap<Rid, Vec<Row>>,
+    placed: HashMap<EntityId, Vec<Row>>,
 }
 
 /// Every schedule of one space, earliest first.
@@ -85,7 +85,7 @@ impl Schedules {
     }
 
     /// Forget `rid`'s schedules: it was deleted.
-    pub(crate) fn remove(&self, rid: Rid) {
+    pub(crate) fn remove(&self, rid: EntityId) {
         let mut inner = self.lock();
         for row in inner.placed.remove(&rid).unwrap_or_default() {
             let _ = inner.rows.remove(&row);
@@ -98,7 +98,7 @@ impl Schedules {
     }
 
     /// Every schedule due at `now`, earliest first.
-    pub(crate) fn due(&self, now: u64) -> Vec<(u64, Rid, Locale, Action)> {
+    pub(crate) fn due(&self, now: u64) -> Vec<(u64, EntityId, Locale, Action)> {
         self.lock()
             .rows
             .iter()
@@ -177,16 +177,16 @@ impl Scheduler {
 
 fn run(db: &Database, wake: &Wake) {
     loop {
+        // A pass with nothing due allocates nothing.
         let now = now_ms();
-        let spaces = db.spaces();
-        let next = spaces
-            .iter()
+        let next = db
+            .spaces()
             .filter_map(|s| s.engine().schedules.next())
             .min();
         let sleep = match next {
             Some(at) if at <= now => {
                 let mut done = true;
-                for space in &spaces {
+                for space in db.spaces() {
                     done &= space.fire_due(now);
                 }
                 if done {

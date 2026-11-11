@@ -10,7 +10,7 @@ use std::{
 };
 
 use super::entity::Head;
-use crate::ids::Rid;
+use crate::ids::EntityId;
 
 /// An order as a key that sorts like the signed number.
 fn order_key(order: i64) -> u64 {
@@ -22,7 +22,7 @@ struct Inner {
     /// (parent, order, child).
     rows: BTreeSet<([u8; 16], u64, [u8; 16])>,
     /// Each child's row, to remove it when the child changes.
-    placed: HashMap<Rid, ([u8; 16], u64)>,
+    placed: HashMap<EntityId, ([u8; 16], u64)>,
 }
 
 /// Children by parent.
@@ -37,7 +37,7 @@ impl Tree {
     }
 
     /// Drop `rid` as a child.
-    pub(crate) fn remove(&self, rid: Rid) {
+    pub(crate) fn remove(&self, rid: EntityId) {
         let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         if let Some((parent, order)) = inner.placed.remove(&rid) {
             let _ = inner.rows.remove(&(parent, order, *rid.as_bytes()));
@@ -57,13 +57,13 @@ impl Tree {
     }
 
     /// The children of `parent`, lowest order first, ties by record id.
-    pub(crate) fn children(&self, parent: Rid) -> Vec<Rid> {
+    pub(crate) fn children(&self, parent: EntityId) -> Vec<EntityId> {
         let inner = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let p = *parent.as_bytes();
         inner
             .rows
             .range((p, 0, [0; 16])..=(p, u64::MAX, [u8::MAX; 16]))
-            .map(|(_, _, child)| Rid::from_bytes(*child))
+            .map(|(_, _, child)| EntityId::from_bytes(*child))
             .collect()
     }
 }
@@ -76,10 +76,10 @@ mod tests {
     fn head(n: u8, parent: Option<u8>, order: i64) -> Head {
         let mut entity = Entity::new("page").order(order);
         if let Some(p) = parent {
-            entity = entity.parent(Rid::from_bytes([p; 16]));
+            entity = entity.parent(EntityId::from_bytes([p; 16]));
         }
         entity
-            .into_head(Rid::from_bytes([n; 16]), 0, Locale::EN)
+            .into_head(EntityId::from_bytes([n; 16]), 0, Locale::EN)
             .unwrap()
     }
 
@@ -91,7 +91,7 @@ mod tests {
         tree.update(&head(3, Some(1), -5));
         tree.update(&head(4, Some(1), 5));
         let ids = |p: u8| {
-            tree.children(Rid::from_bytes([p; 16]))
+            tree.children(EntityId::from_bytes([p; 16]))
                 .iter()
                 .map(|r| r.as_bytes()[0])
                 .collect::<Vec<_>>()
@@ -100,7 +100,7 @@ mod tests {
         tree.update(&head(3, Some(2), 0));
         assert_eq!(ids(1), [2, 4]);
         assert_eq!(ids(2), [3]);
-        tree.remove(Rid::from_bytes([2; 16]));
+        tree.remove(EntityId::from_bytes([2; 16]));
         assert_eq!(ids(1), [4]);
         assert!(order_key(-1) < order_key(0) && order_key(0) < order_key(1));
     }

@@ -24,31 +24,36 @@ use nex_db::{Entity, SessionSpec, SignIn, Validation};
 fn main() -> nex_db::Result<()> {
     let db = nex_db::open("data/site")?;
 
-    // Sign up: an account and a profile page in one commit.
-    let password = db.auth().hash_password("correct horse battery staple")?;
-    let account = db.commit(|tx| {
-        let account = tx.auth().create_account("ann@example.com", &password)?;
-        tx.content().create(
-            Entity::new("profile")
-                .field("account", account)
-                .site("example.com")
-                .path("/u/ann"),
-        )?;
-        Ok(account)
-    })?;
+    // Put a page and get it back.
+    let id = db.content().put(Entity::new("page").field("title", "Hello").path("/hello"))?;
+    let page = db.content().get(id)?;
 
-    // Sign in, and check the session on each request.
-    if let SignIn::Success { token, .. } =
-        db.auth().sign_in("ann@example.com", "correct horse battery staple", SessionSpec::web())?
-    {
+    // Sign a user up and in.
+    let account = db.auth().sign_up("ann@example.com", "correct horse battery staple")?;
+    let signed_in = db.auth().sign_in("ann@example.com", "correct horse battery staple", SessionSpec::web())?;
+
+    // On each request: check the session cookie, then find the page at the path.
+    if let SignIn::Success { token, .. } = signed_in {
         assert!(matches!(db.auth().validate(&token)?, Validation::Valid(s) if s.account() == account));
     }
-
-    // Serve the profile page.
-    if let Some(route) = db.content().resolve("example.com", "/u/ann")? {
-        let _page = db.content().get(route.entity())?;
+    if let Some(route) = db.content().resolve(nex_db::DEFAULT_SITE, "/hello")? {
+        assert_eq!(route.entity(), id);
     }
+    let _ = page;
     Ok(())
+}
+```
+
+A commit can change several engines at once: an account and its profile page are both stored or neither.
+
+```rust,no_run
+fn sign_up(db: &nex_db::Database) -> nex_db::Result<()> {
+    let password = db.auth().hash_password("correct horse battery staple")?;
+    db.commit(|tx| {
+        let account = tx.auth().create_account("ann@example.com", &password)?;
+        tx.content().put(nex_db::Entity::new("profile").field("account", account).path("/u/ann"))?;
+        Ok(())
+    })
 }
 ```
 
@@ -70,7 +75,7 @@ cargo run --example site
 
 ## Status
 
-Version 0.3: the core and the auth engine. The API through 1.0 is in [`docs/API.md`](./docs/API.md); file formats and the API may still change before 1.0, each change recorded in the plan. The plan is in [`dev/PLAN.md`](./dev/PLAN.md) and the schedule in [`dev/ROADMAP.md`](./dev/ROADMAP.md).
+Version 0.8, before 1.0: file formats and the API may still change, each change recorded in [`CHANGELOG.md`](./CHANGELOG.md) with how to migrate. The API through 1.0 is in [`docs/API.md`](./docs/API.md). The plan is in [`dev/PLAN.md`](./dev/PLAN.md) and the schedule in [`dev/ROADMAP.md`](./dev/ROADMAP.md).
 
 ## Documentation
 

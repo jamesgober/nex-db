@@ -119,7 +119,11 @@
 
 ## 0.8.0 Alpha
 
+- [x] API simplified: one-line Tier 1 (`put`, `sign_up`), plain names, one way to do each thing (`PLAN.md` D-124).
 - Read replica following the log (FR-15); multi-machine simulation tests.
+- Verifiable audit export.
+- Split auth: the check over the channel nearer its target.
+- Moved from 0.7: sealed mode, per-operation budgets for admin listings, online re-keying, secure deletion at compaction, the preview index, device-bound sessions, the P2 items.
 - **Exit:** two weeks in production on James's site with no data issue.
 
 ## 0.9.0 Beta

@@ -6,6 +6,32 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 ## [Unreleased]
 
+### Added
+
+- `db.content().put(entity)` (also in a transaction): create and publish in one step, so a page is served once the commit returns.
+- `db.auth().sign_up(identifier, password)`: hash the password and create the account in one call.
+
+### Changed
+
+- Renamed for plain names (the old names stay, deprecated, until 0.9):
+
+  | 0.7 | 0.8 |
+  |---|---|
+  | `Rid` | `EntityId` |
+  | `Login` (from `verify_password`) | `PasswordCheck` |
+  | `Entry::rid()` | `Entry::id()` |
+  | `Hit::rid()` | `Hit::entity()` |
+  | `Change::EntityChanged { rid, .. }` | `Change::EntityChanged { entity, .. }` (no alias: rename the field in patterns) |
+
+  To migrate, replace the names in the left column with those in the right. The compiler points at each use of a deprecated name, and at each pattern on the old field.
+- The text of a malformed entity id error says `entity id` instead of `record id`.
+- `docs/API.md` marks items that are not built yet as planned instead of giving them a version.
+
+### Fixed
+
+- The scheduling thread allocated on every pass, even with nothing due. Its first pass could fall inside `tests/alloc.rs`'s count on a loaded machine, so the test failed now and then. A pass with nothing due now allocates nothing.
+- The README and crate-level examples published a page without `publish`, so the page they resolved was a draft and not served. They now use `put` and compile as doctests.
+
 ## [0.7.0] - 2026-11-10
 
 Hardening: fuzzing, attack and soak tests, decoy tokens, and no third-party dependency outside crypt-io's cryptography.

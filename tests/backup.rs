@@ -3,8 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use nex_db::{
-    Database, Entity, Error, Login, Position, RestorePoint, RevokeReason, SessionSpec, Standing,
-    Validation,
+    Database, Entity, Error, PasswordCheck, Position, RestorePoint, RevokeReason, SessionSpec,
+    Standing, Validation,
 };
 
 struct TempDir(PathBuf);
@@ -39,7 +39,7 @@ fn sign_up(db: &Database, who: &str) -> nex_db::AccountId {
     db.auth().create_account(who, &hash).unwrap()
 }
 
-fn page(db: &Database, path: &str) -> nex_db::Rid {
+fn page(db: &Database, path: &str) -> nex_db::EntityId {
     let rid = db
         .content()
         .create(Entity::new("page").field("title", path).path(path))
@@ -94,13 +94,13 @@ fn test_a_full_backup_restores_every_engine() {
             .unwrap()
             .verify_password("sam@example.com", PASSWORD)
             .unwrap(),
-        Login::Verified(_)
+        PasswordCheck::Verified(_)
     ));
     assert!(matches!(
         db.auth()
             .verify_password("ann@example.com", PASSWORD)
             .unwrap(),
-        Login::Verified(_)
+        PasswordCheck::Verified(_)
     ));
     // The restored database takes new commits.
     let _ = page(&db, "/after");
@@ -231,13 +231,13 @@ fn test_revocations_after_the_restore_point_stay() {
             db.auth()
                 .verify_password("cy@example.com", PASSWORD)
                 .unwrap(),
-            Login::Failed
+            PasswordCheck::Failed
         );
         assert!(matches!(
             db.auth()
                 .verify_password("cy@example.com", "a new password")
                 .unwrap(),
-            Login::Verified(a) if a == cy
+            PasswordCheck::Verified(a) if a == cy
         ));
         assert!(!matches!(
             db.auth().validate(&cy_token).unwrap(),

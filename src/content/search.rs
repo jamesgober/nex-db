@@ -22,7 +22,7 @@ use super::{
 };
 use crate::{
     error::{Error, Result},
-    ids::Rid,
+    ids::EntityId,
 };
 
 /// Longest word indexed, in bytes; longer runs are skipped.
@@ -50,7 +50,7 @@ pub struct Search {
     text: String,
     kind: Option<String>,
     site: Option<String>,
-    term: Option<Rid>,
+    term: Option<EntityId>,
     limit: usize,
     offset: usize,
 }
@@ -82,7 +82,7 @@ impl Search {
     }
 
     /// Only entities whose published body refers to `term`.
-    pub fn term(mut self, term: Rid) -> Search {
+    pub fn term(mut self, term: EntityId) -> Search {
         self.term = Some(term);
         self
     }
@@ -103,14 +103,21 @@ impl Search {
 /// One entity a search found.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Hit {
-    rid: Rid,
+    rid: EntityId,
     score: f32,
 }
 
 impl Hit {
     /// The entity.
     #[must_use]
-    pub const fn rid(&self) -> Rid {
+    pub const fn entity(&self) -> EntityId {
+        self.rid
+    }
+
+    /// The entity: the name of [`entity`](Self::entity) before 0.8.
+    #[deprecated(since = "0.8.0", note = "renamed to `entity`")]
+    #[must_use]
+    pub const fn rid(&self) -> EntityId {
         self.rid
     }
 
@@ -155,7 +162,7 @@ struct Doc {
     revision: u32,
     kind: String,
     site: String,
-    refs: Vec<Rid>,
+    refs: Vec<EntityId>,
     /// Its weighted length.
     len: f64,
     /// Its words, each once.
@@ -166,13 +173,13 @@ struct Doc {
 #[derive(Debug, Default)]
 struct Shelf {
     /// Each word's entities and weighted counts.
-    words: HashMap<Box<str>, HashMap<Rid, f32>>,
-    docs: HashMap<Rid, Doc>,
+    words: HashMap<Box<str>, HashMap<EntityId, f32>>,
+    docs: HashMap<EntityId, Doc>,
     total_len: f64,
 }
 
 impl Shelf {
-    fn remove(&mut self, rid: Rid) {
+    fn remove(&mut self, rid: EntityId) {
         let Some(doc) = self.docs.remove(&rid) else {
             return;
         };
@@ -187,7 +194,7 @@ impl Shelf {
         }
     }
 
-    fn insert(&mut self, rid: Rid, doc: Doc, counts: HashMap<Box<str>, f32>) {
+    fn insert(&mut self, rid: EntityId, doc: Doc, counts: HashMap<Box<str>, f32>) {
         self.total_len += doc.len;
         for (word, count) in counts {
             let _ = self.words.entry(word).or_default().insert(rid, count);
@@ -285,7 +292,7 @@ impl SearchIndex {
     }
 
     /// Forget `rid`: it was deleted.
-    pub(crate) fn remove(&self, rid: Rid) {
+    pub(crate) fn remove(&self, rid: EntityId) {
         let mut shelves = self.shelves.write().unwrap_or_else(PoisonError::into_inner);
         for shelf in shelves.values_mut() {
             shelf.remove(rid);

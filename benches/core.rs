@@ -195,7 +195,7 @@ fn content(c: &mut Criterion) {
     });
     // Ten thousand entities read in turn: more than the cache keeps, so
     // most reads decode from the store.
-    let many: Vec<nex_db::Rid> = (0..10_000)
+    let many: Vec<nex_db::EntityId> = (0..10_000)
         .map(|i| {
             db.commit(|tx| {
                 let rid = tx.content().create(

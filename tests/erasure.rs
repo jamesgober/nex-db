@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use nex_db::{ApiKeyCheck, Database, Login, RevokeReason, SessionSpec, SignIn, Validation};
+use nex_db::{ApiKeyCheck, Database, PasswordCheck, RevokeReason, SessionSpec, SignIn, Validation};
 
 struct TempDir(PathBuf);
 
@@ -74,11 +74,11 @@ fn test_an_erased_account_is_gone_everywhere_and_stays_gone() {
         assert!(auth.account(ann).unwrap().is_none());
         assert_eq!(
             auth.verify_password("ann@example.com", PASSWORD).unwrap(),
-            Login::Failed
+            PasswordCheck::Failed
         );
         assert_eq!(
             auth.verify_password("ann", PASSWORD).unwrap(),
-            Login::Failed
+            PasswordCheck::Failed
         );
         assert!(!matches!(
             auth.validate_api_key(key.as_str()).unwrap(),
@@ -89,7 +89,7 @@ fn test_an_erased_account_is_gone_everywhere_and_stays_gone() {
         // Others are untouched, and the identifiers are free again.
         assert!(matches!(
             auth.verify_password("bob@example.com", PASSWORD).unwrap(),
-            Login::Verified(a) if a == bob
+            PasswordCheck::Verified(a) if a == bob
         ));
         let again = auth.create_account("ann@example.com", &hash).unwrap();
         assert_ne!(again, ann);
@@ -116,7 +116,7 @@ fn test_an_erased_account_is_gone_everywhere_and_stays_gone() {
         // The new account under ann's address signs in with its own key.
         assert!(matches!(
             auth.verify_password("ann@example.com", PASSWORD).unwrap(),
-            Login::Verified(a) if a != ann
+            PasswordCheck::Verified(a) if a != ann
         ));
     }
 }

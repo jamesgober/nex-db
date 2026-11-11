@@ -22,13 +22,15 @@ This is the whole public API planned for 1.0, in the order most applications
 meet it: the everyday calls first (Tier 1), then configuration and the wider
 operations (Tier 2), then the parts few applications need (Tier 3).
 
-Every item carries the version it arrives in. Items marked **0.1** exist now;
-their examples are compiled and run as doctests. Later items are shown as
-signatures. Their names and shapes were approved on 2026-11-05; changing one
-needs a recorded decision.
+Every item carries the version it arrived in, or **planned** when it is not
+built yet ([`dev/ROADMAP.md`](../dev/ROADMAP.md) says when). The examples of
+built items are compiled and run as doctests; planned items are shown as
+signatures. Changing a name or shape needs a recorded decision, and the
+changelog says how to migrate. Until 0.8 these were called `Rid` and `Login`
+and the entry and hit accessors `rid()`: see the 0.8.0 changelog.
 
 Grades say how much an item matters: **P0** required, **P1** expected, **P2**
-high value, **P3** nice to have. Every P0 and P1 item exists by 0.5.
+high value, **P3** nice to have. Every P0 and P1 item exists by 1.0.
 
 - [Setup](#setup)
 - [Tier 1](#tier-1)
@@ -69,14 +71,41 @@ an engine the build leaves out refuses to open with `Error::Invalid`.
 
 The minimum supported Rust version is 1.85. nex-db has no async runtime. A
 commit blocks until the log sync that covers it; `hash_password`,
-`verify_password`, and `sign_in` block for one password hash; a feed read
+`sign_up`, `verify_password`, and `sign_in` block for one password hash; a feed read
 blocks until the next change. From 0.4 the database runs one thread of its
 own (with the `content` feature), which sleeps until a scheduled publish or
 unpublish is due; expiry and checkpoints run on the threads that commit.
 
 ## Tier 1
 
-Open a database, sign a user up across two engines in one commit, sign in,
+Open a database, put a page and get it back, sign a user up and in, and
+serve a request. Each is one line.
+
+```rust
+use nex_db::{Entity, SessionSpec, SignIn, Validation};
+
+# let dir = std::env::temp_dir().join(format!("nex-db-api-tier1a-{}", std::process::id()));
+# let _ = std::fs::remove_dir_all(&dir);
+let db = nex_db::open(&dir)?; // creates the database on first use
+
+let id = db.content().put(Entity::new("page").field("title", "Hello").path("/hello"))?;
+let page = db.content().get(id)?.expect("published");
+
+let account = db.auth().sign_up("ann@example.com", "correct horse battery staple")?;
+let signed_in = db.auth().sign_in("ann@example.com", "correct horse battery staple", SessionSpec::web())?;
+
+// Each request: check the session cookie, then find the page at the path.
+if let SignIn::Success { token, .. } = signed_in {
+    assert!(matches!(db.auth().validate(&token)?, Validation::Valid(s) if s.account() == account));
+}
+let route = db.content().resolve(nex_db::DEFAULT_SITE, "/hello")?.expect("served");
+assert_eq!(route.entity(), page.id());
+# drop(db);
+# std::fs::remove_dir_all(&dir).unwrap();
+# Ok::<(), nex_db::Error>(())
+```
+
+The longer flow: sign a user up across two engines in one commit, sign in,
 validate the session on each request, and resolve a page.
 
 ```rust
@@ -84,19 +113,18 @@ use nex_db::{Entity, SessionSpec, SignIn, Validation};
 
 # let dir = std::env::temp_dir().join(format!("nex-db-api-tier1-{}", std::process::id()));
 # let _ = std::fs::remove_dir_all(&dir);
-let db = nex_db::open(&dir)?; // creates the database on first use
+let db = nex_db::open(&dir)?;
 
 // Sign up: an account (auth) and a profile page (content), both or neither.
 let password = db.auth().hash_password("correct horse battery staple")?;
 let account = db.commit(|tx| {
     let account = tx.auth().create_account("ann@example.com", &password)?;
-    let profile = tx.content().create(
+    tx.content().put(
         Entity::new("profile")
             .field("account", account)
             .site("example.com")
             .path("/u/ann"),
-    )?;
-    tx.content().publish(profile)?; // a new entity is a draft until published
+    )?; // put = create and publish; create alone makes a draft
     Ok(account)
 })?;
 
@@ -128,13 +156,15 @@ db.auth().revoke(token.as_str())?; // sign out
 | Call | Since | Grade |
 |---|---|---|
 | `nex_db::open(path) -> Result<Database>` | 0.1 | P0 |
+| `db.content().put(Entity) -> Result<EntityId>`: create and publish in one commit (also in a transaction) | 0.8 | P0 |
+| `db.content().get(id) -> Result<Option<Entry>>` | 0.1 | P0 |
+| `db.auth().sign_up(identifier, password) -> Result<AccountId>`: hash the password and create the account in one commit | 0.8 | P0 |
 | `db.auth().validate(&token) -> Result<Validation>` | 0.1 | P0 |
 | `db.auth().hash_password(password) -> Result<HashedPassword>` | 0.1 | P0 |
 | `db.auth().sign_in(identifier, password, spec) -> Result<SignIn>` | 0.1 | P1 |
 | `db.auth().revoke(&token) -> Result<bool>` | 0.1 | P0 |
 | `db.auth().revoke_all(account) -> Result<u32>` | 0.3 | P0 |
 | `db.content().resolve(site, path) -> Result<Option<RouteEntry>>` | 0.1 | P0 |
-| `db.content().get(rid) -> Result<Option<Entry>>` | 0.1 | P0 |
 | `db.commit(\|tx\| ..) -> Result<T>` | 0.1 | P0 |
 
 `sign_in` checks the password and issues a session in one call; applications
@@ -169,14 +199,14 @@ From 0.3 the builder configures what `open` takes by default:
 |---|---|---|
 | `Database::builder(dir)` | 0.3 | |
 | `.keys(Keys::file(path))`, `Keys::env(var)`, `Keys::in_directory()` | 0.3 | `Keys::in_directory()` |
-| `.keys(Keys::vault(name))`: the OS keychain | 0.4 | |
+| `.keys(Keys::vault(name))`: the OS keychain | planned | |
 | `.auth(AuthMode::embedded())`, `AuthMode::separate_process()`, `AuthMode::separate_process_program(path)` (feature `split-auth`) | 0.5 | embedded |
-| `.max_snapshot_age(Duration)` | 0.3 | 60 s |
+| `.max_snapshot_age(Duration)` | planned (fixed at the default until then) | 60 s |
 | `.checkpoint_every(bytes)`: log written between checkpoints, which bound the log and the time an open takes | 0.3 | 64 MiB |
 | `.max_sessions(n)`: sessions and revocations held at once; past it `issue_session` fails with `Busy` | 0.3 | 1,000,000 |
-| `.commit_queue(n)`, `.hashing_slots(n)` | 0.3 | 4,096; one per CPU |
-| `.idempotency_window(Duration)` | 0.3 | 24 hours |
-| `.cache(bytes)` | 0.4 | 256 MiB |
+| `.commit_queue(n)`, `.hashing_slots(n)` | planned (fixed at the defaults until then) | 4,096; one per CPU |
+| `.idempotency_window(Duration)` | planned, with `commit_with` | 24 hours |
+| `.cache(bytes)` | planned (until then 4,096 entities per space) | 256 MiB |
 | `.observer(impl Observer)` | 0.4 | none |
 | `.open() -> Result<Database>` | 0.3 | |
 
@@ -220,7 +250,7 @@ A database holds up to 15 realms and 15 spaces besides the defaults; names
 are 1 to 64 ASCII letters, digits, `-`, or `_`.
 
 A collection never changes engine. Dropping one (`db.drop_collection(name)`,
-0.5, P2) marks it and reclaims it in the background.
+planned, P2) will mark it and reclaim it in the background.
 
 ### Reading at one snapshot
 
@@ -231,7 +261,7 @@ read several things as of one moment, use `db.read`:
 |---|---|---|
 | `db.read(\|r\| ..) -> Result<T>` | 0.3 | P0 |
 | `r.auth() -> AuthRead`: `validate(token)` (latest), `standing(account)` | 0.3 | P0 |
-| `r.content() -> ContentRead`: `get(rid)`, `resolve(site, path)` | 0.3 | P0 |
+| `r.content() -> ContentRead`: `get(id)`, `resolve(site, path)` | 0.3 | P0 |
 
 Every read inside the closure sees the same commit. A snapshot held longer
 than the configured maximum fails with `Error::SnapshotTooOld`, so a forgotten
@@ -281,12 +311,12 @@ Rules:
   again, up to four times in all, then `commit` returns `Error::Conflict`. The
   closure must therefore have no side effects outside `tx`.
 - Do slow work (hashing a password) before `commit`, not inside it.
-- Return what the commit made (an `AccountId`, a `Token`, a `Rid`) from the
+- Return what the commit made (an `AccountId`, a `Token`, a `EntityId`) from the
   closure. A value kept from an attempt that was retried never becomes valid.
 - The 16 MiB limit is for the whole commit across engines; a larger one is
   refused with `Error::Invalid { field: "commit", .. }`. Split large bodies
   and large releases into several commits.
-- From 0.3 `max_snapshot_age` also limits how long a closure may run.
+- The snapshot age limit (60 s) also limits how long a closure may run.
 - If the log write or sync fails, the database stops accepting commits
   (`Error::Storage`); reads continue. Restart the process.
 
@@ -294,8 +324,8 @@ Rules:
 |---|---|---|
 | `db.commit(\|tx\| ..) -> Result<T>` | 0.1 | P0 |
 | `tx.auth() -> AuthTx`, `tx.content() -> ContentTx` | 0.1 | P0 |
-| `db.commit_serializable(\|tx\| ..) -> Result<T>` (also checks what the closure read: entities, routes, types and settings, references to an entity, accounts, identifiers, sessions, the roles policy; not listings or other index reads); `tx.content().draft(rid)` reads inside a transaction | 0.4 | P1 |
-| `db.commit_with(CommitOptions, \|tx\| ..) -> Result<Committed<T>>` (retries, idempotency key) | 0.3 | P2 |
+| `db.commit_serializable(\|tx\| ..) -> Result<T>` (also checks what the closure read: entities, routes, types and settings, references to an entity, accounts, identifiers, sessions, the roles policy; not listings or other index reads); `tx.content().draft(id)` reads inside a transaction | 0.4 | P1 |
+| `db.commit_with(CommitOptions, \|tx\| ..) -> Result<Committed<T>>` (retries, idempotency key) | planned | P2 |
 
 An idempotency key makes a retried request commit at most once. A commit with
 a key already used within the idempotency window (24 hours by default) writes
@@ -366,7 +396,7 @@ opaque to nex-db.
 |---|---|
 | `SessionSpec::web()` (30 days), `SessionSpec::new(ttl)` (up to 400 days) | 0.1 |
 | `.idle(Duration)`, `.recheck_after(Duration)`, `.payload(bytes) -> Result<SessionSpec>` (at most 256 bytes) | 0.3 |
-| `.device(DeviceId)` | 0.5 (moved from 0.4 with devices) |
+| `.device(DeviceId)` | planned, with devices |
 
 | Operation | Since | Grade | Notes |
 |---|---|---|---|
@@ -423,8 +453,9 @@ it.
 |---|---|---|---|
 | `hash_password(password) -> Result<HashedPassword>` | 0.1 | P0 | before `commit` |
 | `create_account(identifier, &HashedPassword) -> Result<AccountId>` | 0.1 | P0 | unique by identifier |
+| `sign_up(identifier, password) -> Result<AccountId>` | 0.8 | P0 | `hash_password` and `create_account` in one call and its own commit; in a transaction, hash first and use `create_account` |
 | `sign_in(identifier, password, spec) -> Result<SignIn>` | 0.1 | P0 | check and issue in one call |
-| `verify_password(identifier, password) -> Result<Login>` | 0.3 | P1 | check only; ten failures within fifteen minutes lock the account out for fifteen minutes (set per realm from `RealmPolicy`) |
+| `verify_password(identifier, password) -> Result<PasswordCheck>` | 0.3 | P1 | check only; ten failures within fifteen minutes lock the account out for fifteen minutes (set per realm from `RealmPolicy`) |
 | `account(id) -> Result<Option<Account>>` | 0.4 | P0 | standing, created, roles; never the hash, never identifiers |
 | `standing(account) -> Result<Option<Standing>>` | 0.3 | P0 | the read a request makes when a session's `recheck_at` has passed |
 | `set_standing(account, Standing, by: Option<AccountId>) -> Result<()>` | 0.3 | P0 | a ban or lock-out ends every session at once; `by` is `None` for an automatic lock-out |
@@ -440,7 +471,7 @@ it. It is returned only after the password matched. A wrong password on a
 locked-out account, or an unknown identifier, gives `Failed` after the same
 work, so only someone who knows the password learns the account is locked.
 
-`Login` is `SignIn` without the session: `Verified(AccountId)`, `Failed`,
+`PasswordCheck` is `SignIn` without the session: `Verified(AccountId)`, `Failed`,
 `LockedOut { until }`, `NeedsSecondFactor { account }` (0.4.1: the password
 matched and the account has TOTP on; it is not signed in until
 `check_totp` accepts a code).
@@ -462,7 +493,7 @@ every session of the account in the same commit.
 |---|---|---|
 | `add_totp(account) -> Result<TotpEnrollment>`, `confirm_totp(account, code) -> Result<bool>`, `remove_totp(account) -> Result<bool>` (0.4.1, feature `mfa`; also in a transaction) | P1 | a 160-bit secret, sealed; `TotpEnrollment::secret()` (base32) and `uri(issuer, label)` (`otpauth://`, SHA1, six digits, 30 s) shown once; TOTP is on once a code is confirmed |
 | `verify_totp(challenge, code, spec) -> Result<SignIn>` (0.4.1, feature `mfa`) | P1 | completes `SignIn::NeedsSecondFactor`: the challenge is a single-use token that lasts five minutes; a wrong code counts toward lock-out and leaves the challenge for another try; a code works once (one step of drift either way) |
-| `check_totp(account, code) -> Result<bool>` (0.4.1, feature `mfa`; also in a transaction) | P1 | after `Login::NeedsSecondFactor`, for an application that issues its own sessions |
+| `check_totp(account, code) -> Result<bool>` (0.4.1, feature `mfa`; also in a transaction) | P1 | after `PasswordCheck::NeedsSecondFactor`, for an application that issues its own sessions |
 | `new_recovery_codes(account) -> Result<RecoveryCodes>` (tx) | P1 | ten codes, `xxxxx-xxxxx` (Crockford base32, 50 bits each); replaces any earlier codes; shown once (`codes()`); stored as keyed digests |
 | `use_recovery_code(account, code) -> Result<bool>` (tx) | P1 | `true` once per code; dashes, spaces, and case ignored; two uses at once give `true` to one |
 | `passkey_registration(account) -> Result<PasskeyChallenge>`, `add_passkey(account, &RelyingParty, &PasskeyRegistration) -> Result<PasskeyId>` (0.4.1, feature `mfa`; also in a transaction) | P2 | the challenge's bytes go to `navigator.credentials.create` (`as_bytes()`, `to_base64url()`), the account's id as the user id; checks the client data (type, challenge, origin, not cross-origin), the RP ID hash, user presence (and verification with `RelyingParty::require_user_verification`), and that the key is `ES256`, `EdDSA`, or `RS256`; attestation is not checked; `PasskeyRegistration::new(client_data_json, authenticator_data)` |
@@ -475,8 +506,8 @@ every session of the account in the same commit.
 | `validate_api_key(text) -> Result<ApiKeyCheck>`, `revoke_api_key(id) -> Result<bool>` | P1 | `ApiKeyCheck` (non-exhaustive): `Valid { account, id, scopes }`, `Expired`, `Revoked`, `Unknown`, `Malformed`; one read of the account store; a session token is never a key, nor a key a session |
 | `define_role(Role) -> Result<RoleId>`, `assign_roles(account, &[RoleId])`, `roles(account)`, `role(id)`, `role_named(name)` | P1 | `Role::new(name).permission(p).inherits(id)`; a role inherits only roles already defined; roles are never removed; at most 256 per realm and 16 per account |
 | `allowed(account, permission) -> Result<bool>` | P1 | checks the account's roles against the current policy |
-| `link_external(account, provider, subject)`, `find_external(provider, subject)` | P2 | OAuth and OpenID Connect sign-in |
-| `devices(account)`, `bind_device_key(account, device, public_key)` | P2 | |
+| `link_external(account, provider, subject)`, `find_external(provider, subject)` (planned) | P2 | OAuth and OpenID Connect sign-in |
+| `devices(account)`, `bind_device_key(account, device, public_key)` (planned) | P2 | |
 
 `TotpEnrollment`, `RecoveryCodes`, `ApiKey`, and `Token` show nothing in
 `Debug` and are wiped from memory when dropped.
@@ -560,7 +591,7 @@ assets), their revisions and translations, and the routes that point at them.
 ### Entities
 
 An entity is created from an `Entity` builder and read back as an `Entry`.
-Its id, the `Rid`, never changes and is never reused, whatever happens to its
+Its id, the `EntityId`, never changes and is never reused, whatever happens to its
 path or locale.
 
 ```rust
@@ -569,7 +600,7 @@ use nex_db::{Entity, Value};
 # let dir = std::env::temp_dir().join(format!("nex-db-api-entities-{}", std::process::id()));
 # let _ = std::fs::remove_dir_all(&dir);
 # let db = nex_db::open(&dir)?;
-let rid = db.content().create(
+let id = db.content().create(
     Entity::new("post")
         .field("title", "Hello")
         .field("words", 120)
@@ -577,9 +608,9 @@ let rid = db.content().create(
         .site("example.com")
         .path("/blog/hello"),
 )?;
-assert!(db.content().get(rid)?.is_none()); // a draft until published
-db.content().publish(rid)?;
-let entry = db.content().get(rid)?.expect("published");
+assert!(db.content().get(id)?.is_none()); // a draft until published
+db.content().publish(id)?;
+let entry = db.content().get(id)?.expect("published");
 assert_eq!(entry.kind(), "post");
 assert_eq!(entry.revision(), 1);
 assert_eq!(entry.field("title"), Some(&Value::Text("Hello".into())));
@@ -590,17 +621,18 @@ assert_eq!(entry.route(), Some(("example.com", "/blog/hello")));
 ```
 
 `Value` (non-exhaustive): `Text`, `Int`, `Bool`, `Account(AccountId)`,
-`Entity(Rid)` (0.1); `List(Vec<Value>)` (0.4: at most 1,000 values, none a
-list; `Value::from([rid, ..])` makes a list of references); `Time`, `Float`,
+`Entity(EntityId)` (0.1); `List(Vec<Value>)` (0.4: at most 1,000 values, none a
+list; `Value::from([id, ..])` makes a list of references); `Time`, `Float`,
 `Bytes`, `Blob(BlobRef)` (0.4, to come). A term is an entity, so a term
 value is `Value::Entity` in a list.
 
-`Entry` gives `rid()`, `kind()`, `revision()`, `created_at()`, `route()`,
+`Entry` gives `id()`, `kind()`, `revision()`, `created_at()`, `route()`,
 `field(name)`, `fields()` (0.1), and from 0.4 `locale()`, `fallback()` (the
 locale asked for, when another one was served), `status()`, `visibility()`,
-`updated_at()`, `published_at()`, `first_published_at()`, `display_date()`,
-`created_by()`, `updated_by()`, `published_by()`, `authors()`, `parent()`,
-`terms()`, `body() -> &[u8]`, and `alternates()` (every locale with its path).
+`updated_at()`, `published_at()`, `first_published_at()`, `authors()`,
+`parent()`, and `terms()`. Planned: `display_date()`, `created_by()`,
+`updated_by()`, `published_by()`, `body() -> &[u8]`, and `alternates()`
+(every locale with its path).
 
 ### Types (0.4)
 
@@ -635,8 +667,9 @@ second published entity with the same value is
 reads the rule back; a redefinition may change a rule). The other
 declarations arrive with what gives them meaning: `Float`, `Time`, and
 `Blob` with their values, `.indexed`
-with filtered listings, `.translatable` with shared fields, and `.revisions`
-with revision pruning. `.searchable(weight)` (0.5) puts the field declared
+with filtered listings, `.translatable` with shared fields, `.copied_from`
+with denormalised fields, and `.revisions` with revision pruning (all
+planned). `.searchable(weight)` (0.5) puts the field declared
 last, a text or a list, in the text index with a weight of 1 to 10;
 `Type::weight(name)` reads it back, and a redefinition may change it.
 
@@ -654,17 +687,17 @@ use nex_db::{Entity, Patch};
 # let dir = std::env::temp_dir().join(format!("nex-db-api-drafts-{}", std::process::id()));
 # let _ = std::fs::remove_dir_all(&dir);
 # let db = nex_db::open(&dir)?;
-let rid = db.content().create(Entity::new("post").field("title", "First").path("/p/first"))?;
-assert_eq!(db.content().publish(rid)?, 1);
+let id = db.content().create(Entity::new("post").field("title", "First").path("/p/first"))?;
+assert_eq!(db.content().publish(id)?, 1);
 
 // Edit the draft: readers still see revision 1.
-db.content().save_draft(rid, Patch::new().set("title", "Second"))?;
-assert_eq!(db.content().get(rid)?.unwrap().field("title").unwrap().as_text(), Some("First"));
-assert_eq!(db.content().draft(rid)?.unwrap().field("title").unwrap().as_text(), Some("Second"));
+db.content().save_draft(id, Patch::new().set("title", "Second"))?;
+assert_eq!(db.content().get(id)?.unwrap().field("title").unwrap().as_text(), Some("First"));
+assert_eq!(db.content().draft(id)?.unwrap().field("title").unwrap().as_text(), Some("Second"));
 
-assert_eq!(db.content().publish(rid)?, 2);
-assert_eq!(db.content().get(rid)?.unwrap().field("title").unwrap().as_text(), Some("Second"));
-assert_eq!(db.content().revisions(rid)?.len(), 2);
+assert_eq!(db.content().publish(id)?, 2);
+assert_eq!(db.content().get(id)?.unwrap().field("title").unwrap().as_text(), Some("Second"));
+assert_eq!(db.content().revisions(id)?.len(), 2);
 # drop(db);
 # std::fs::remove_dir_all(&dir).unwrap();
 # Ok::<(), nex_db::Error>(())
@@ -672,16 +705,17 @@ assert_eq!(db.content().revisions(rid)?.len(), 2);
 
 | Operation (in `tx.content()` unless noted) | Grade | Notes |
 |---|---|---|
-| `create(Entity) -> Result<Rid>` | P0 | 0.1; starts as a draft from 0.4 |
-| `save_draft(rid, Patch) -> Result<()>` | P0 | no revision |
-| `save_revision(rid, message) -> Result<u32>` | P0 | |
-| `publish(rid) -> Result<u32>` | P0 | publishes the draft; returns the revision (a new one only when the draft changed) in the entity's own locale; `publish_in(rid, locales)` for others |
-| `unpublish(rid) -> Result<bool>` | P0 | every locale; the paths stop resolving; drafts and revisions stay; `unpublish_in(rid, locales)` for some |
-| `schedule(rid, Action::Publish \| Action::Unpublish, at)` | P1 | fired by the database within moments of `at` (at once when past), in its own commit; `schedule_in(rid, locale, ..)`, `cancel_schedule(rid)`, `cancel_schedule_in`; one schedule per locale, replaced by a new one; `Entry::scheduled()`; a publish takes the draft as it is then; one that cannot run (its path taken) is dropped and reported to the observer; trashing drops them |
-| `set_status(rid, Status)`, `set_visibility(rid, Visibility)` | P1 | |
-| `trash(rid)`, `restore(rid)`, `delete(rid)` | P1 | `trash` takes every locale down and leaves its paths `Gone` (410); `restore` brings it back as a draft and frees them; `delete` removes the entity and its revisions for good, its paths `Gone` until another entity takes them; with references, `delete` applies their rules |
-| `revert(rid, revision)` | P2 | copies an old revision into the draft |
-| `db.content().revisions(rid)`, `revision(rid, n)` | P1 | read |
+| `create(Entity) -> Result<EntityId>` | P0 | 0.1; starts as a draft from 0.4 |
+| `put(Entity) -> Result<EntityId>` | P0 | 0.8; `create` and `publish` in one step: the entity is served once the commit returns |
+| `save_draft(id, Patch) -> Result<()>` | P0 | no revision |
+| `save_revision(id, message) -> Result<u32>` | P0 | |
+| `publish(id) -> Result<u32>` | P0 | publishes the draft; returns the revision (a new one only when the draft changed) in the entity's own locale; `publish_in(id, locales)` for others |
+| `unpublish(id) -> Result<bool>` | P0 | every locale; the paths stop resolving; drafts and revisions stay; `unpublish_in(id, locales)` for some |
+| `schedule(id, Action::Publish \| Action::Unpublish, at)` | P1 | fired by the database within moments of `at` (at once when past), in its own commit; `schedule_in(id, locale, ..)`, `cancel_schedule(id)`, `cancel_schedule_in`; one schedule per locale, replaced by a new one; `Entry::scheduled()`; a publish takes the draft as it is then; one that cannot run (its path taken) is dropped and reported to the observer; trashing drops them |
+| `set_status(id, Status)`, `set_visibility(id, Visibility)` | P1 | |
+| `trash(id)`, `restore(id)`, `delete(id)` | P1 | `trash` takes every locale down and leaves its paths `Gone` (410); `restore` brings it back as a draft and frees them; `delete` removes the entity and its revisions for good, its paths `Gone` until another entity takes them; with references, `delete` applies their rules |
+| `revert(id, revision)` | P2 | planned; copies an old revision into the draft |
+| `db.content().revisions(id)`, `revision(id, n)` | P1 | read |
 
 `Status`: `Draft`, `Review`, `Published`, `Archived`, `Trashed`. Workflow
 stages beyond these are an application field. `Visibility`: `Public`,
@@ -690,8 +724,9 @@ stages beyond these are an application field. `Visibility`: `Public`,
 each locale has its own published revision and its own schedule.
 
 A **release** publishes or unpublishes many entities at one time, in one
-commit: `create_release(name)`, `add_to_release(release, rid, locales,
-action)`, `schedule_release(release, at)`, `publish_release(release)` (P2).
+commit: `create_release(name)`, `add_to_release(release, id, locales,
+action)`, `schedule_release(release, at)`, `publish_release(release)` (P2,
+planned).
 
 ### Locales (0.4)
 
@@ -711,17 +746,17 @@ use nex_db::{Entity, Locale, Patch, SpaceSpec};
 # let _ = std::fs::remove_dir_all(&dir);
 # let db = nex_db::open(&dir)?;
 let (en, fr) = (Locale::new("en")?, Locale::new("fr")?);
-let rid = db.content().create(Entity::new("page").field("title", "Hello").path("/hello"))?;
+let id = db.content().create(Entity::new("page").field("title", "Hello").path("/hello"))?;
 db.commit(|tx| {
-    tx.content().publish(rid)?;
-    tx.content().translate(rid, fr, Patch::new().set("title", "Bonjour").path("/fr/bonjour"))?;
-    tx.content().publish_in(rid, &[fr])
+    tx.content().publish(id)?;
+    tx.content().translate(id, fr, Patch::new().set("title", "Bonjour").path("/fr/bonjour"))?;
+    tx.content().publish_in(id, &[fr])
 })?;
-let page = db.content().get_in(rid, fr)?.expect("published");
+let page = db.content().get_in(id, fr)?.expect("published");
 assert_eq!(page.field("title").and_then(|v| v.as_text()), Some("Bonjour"));
 let route = db.content().resolve(nex_db::DEFAULT_SITE, "/fr/bonjour")?.expect("routed");
 assert_eq!(route.locale(), fr);
-assert_eq!(db.content().get(rid)?.expect("published").locale(), en);
+assert_eq!(db.content().get(id)?.expect("published").locale(), en);
 # let _ = SpaceSpec::new(en);
 # drop(db);
 # std::fs::remove_dir_all(&dir).unwrap();
@@ -730,15 +765,15 @@ assert_eq!(db.content().get(rid)?.expect("published").locale(), en);
 
 | Operation | Grade | Notes |
 |---|---|---|
-| `get(rid) -> Result<Option<Entry>>` | P0 | 0.1; the published revision in the space's default locale (by its chain, then the entity's own), or `None` when nothing is published |
-| `draft(rid)`, `draft_in(rid, locale) -> Result<Option<Entry>>` | P0 | the working draft, for editors |
-| `get_in(rid, locale) -> Result<Option<Entry>>` | P0 | follows the fallback chain; `Entry::fallback()` says when it did |
-| `publish_in(rid, &[Locale])`, `unpublish_in(rid, &[Locale])`, `set_path_in(rid, locale, path)` (tx) | P0 | per locale; `publish`, `unpublish`, and `set_path` act on the entity's own locale (`unpublish`: every locale) |
-| `get_many(&[Rid], locale) -> Result<Vec<Option<Entry>>>` | P1 | 0.5; one snapshot, in order, at most 1,000 |
-| `translate(rid, locale, Patch)` (tx) | P0 | starts a translation from the entity's own fields (without a path); each call records the published revision of the entity's own locale as the one it was translated from |
+| `get(id) -> Result<Option<Entry>>` | P0 | 0.1; the published revision in the space's default locale (by its chain, then the entity's own), or `None` when nothing is published |
+| `draft(id)`, `draft_in(id, locale) -> Result<Option<Entry>>` | P0 | the working draft, for editors |
+| `get_in(id, locale) -> Result<Option<Entry>>` | P0 | follows the fallback chain; `Entry::fallback()` says when it did |
+| `publish_in(id, &[Locale])`, `unpublish_in(id, &[Locale])`, `set_path_in(id, locale, path)` (tx) | P0 | per locale; `publish`, `unpublish`, and `set_path` act on the entity's own locale (`unpublish`: every locale) |
+| `get_many(&[EntityId], locale) -> Result<Vec<Option<Entry>>>` | P1 | 0.5; one snapshot, in order, at most 1,000 |
+| `translate(id, locale, Patch)` (tx) | P0 | starts a translation from the entity's own fields (without a path); each call records the published revision of the entity's own locale as the one it was translated from |
 | `list(Listing::outdated(locale))` | P1 | 0.5; entities of every type whose translation into `locale` was made from an older revision than their own locale publishes, newest source first; the entries are the translations' drafts, in any status |
 
-Each locale has its own path; all of them point at the same `Rid`.
+Each locale has its own path; all of them point at the same `EntityId`.
 
 ### Routes
 
@@ -752,17 +787,17 @@ use nex_db::{Entity, RouteKind};
 # let dir = std::env::temp_dir().join(format!("nex-db-api-routes-{}", std::process::id()));
 # let _ = std::fs::remove_dir_all(&dir);
 # let db = nex_db::open(&dir)?;
-let rid = db.content().create(Entity::new("page").site("example.com").path("/about"))?;
+let id = db.content().create(Entity::new("page").site("example.com").path("/about"))?;
 assert!(db.content().resolve("example.com", "/about")?.is_none()); // drafts are not routed
-db.content().publish(rid)?;
+db.content().publish(id)?;
 let route = db.content().resolve("example.com", "/about")?.expect("routed");
-assert_eq!((route.entity(), route.kind(), route.revision()), (rid, RouteKind::Page, 1));
+assert_eq!((route.entity(), route.kind(), route.revision()), (id, RouteKind::Page, 1));
 
 // Moving a published page leaves a 301 at the old path.
-db.content().set_path(rid, "/about-us")?;
+db.content().set_path(id, "/about-us")?;
 let old = db.content().resolve("example.com", "/about")?.expect("redirect");
-assert_eq!(old.kind(), RouteKind::Redirect { to: rid, status: 301 });
-assert_eq!(db.content().get(rid)?.expect("published").route(), Some(("example.com", "/about-us")));
+assert_eq!(old.kind(), RouteKind::Redirect { to: id, status: 301 });
+assert_eq!(db.content().get(id)?.expect("published").route(), Some(("example.com", "/about-us")));
 assert!(db.content().resolve("example.com", "/missing")?.is_none());
 assert!(db.content().resolve("other.example", "/about")?.is_none());
 # drop(db);
@@ -788,31 +823,32 @@ redirects again is shortened, so a chain is never followed.
 | Operation | Grade | Notes |
 |---|---|---|
 | `resolve(site, path) -> Result<Option<RouteEntry>>` | P0 | 0.1 |
-| `set_path(rid, path)`, `set_path_in(rid, locale, path)` (tx) | P0 | the old path redirects with 301 |
-| `add_redirect(site, from, to: Rid, status) -> Result<()>` (tx), `remove_route(site, path) -> Result<bool>` (tx) | P1 | 0.5; a redirect to an entity, never over a page; it stays when its target is deleted; `remove_route` takes away a redirect, gone marker, or canary, not a page. Redirects to other sites are the application's |
+| `set_path(id, path)`, `set_path_in(id, locale, path)` (tx) | P0 | the old path redirects with 301 |
+| `add_redirect(site, from, to: EntityId, status) -> Result<()>` (tx), `remove_route(site, path) -> Result<bool>` (tx) | P1 | 0.5; a redirect to an entity, never over a page; it stays when its target is deleted; `remove_route` takes away a redirect, gone marker, or canary, not a page. Redirects to other sites are the application's |
 | `add_canary(site, path) -> Result<()>` (tx) | defence | 0.6; a path nothing is served at: `resolve` answers `None` for it, as for any unknown path, and raises `SecurityEvent::CanaryRequested`; never over a page; a page published there later takes it over |
-| `routes(rid) -> Result<Vec<(String, String)>>` | P2 | every path of an entity |
-| `resolve_draft(site, path) -> Result<Option<RouteEntry>>` | P2 | 0.6; drafts at their real paths, for previews |
+| `routes(id) -> Result<Vec<(String, String)>>` | P2 | planned; every path of an entity |
+| `resolve_draft(site, path) -> Result<Option<RouteEntry>>` | P2 | planned; drafts at their real paths, for previews |
 
 Only published entities are routed. `RouteEntry::visibility()` tells the
 application when it must check the session before serving a page. For a
 preview link, the application redeems a single-use token
-(`db.auth().redeem(token, Purpose::Preview)`) and then calls `resolve_draft`;
+(`db.auth().redeem(token, Purpose::Preview)`) and then reads the draft
+(`draft(id)`, or `resolve_draft` once it is built);
 the content engine never checks auth data itself.
 
 ### Page tree and authors (0.4)
 
 An entity has an optional parent and an order among its parent's children,
-set with `Entity::parent(rid)` and `Entity::order(i64)`, or later with
-`set_parent(rid, Option<Rid>)` and `set_order(rid, i64)` (tx). `children(rid)`
+set with `Entity::parent(id)` and `Entity::order(i64)`, or later with
+`set_parent(id, Option<EntityId>)` and `set_order(id, i64)` (tx). `children(id)`
 lists the children in any status, lowest order first, ties by record id;
-`ancestors(rid)` gives the parent first and the root last. A parent is a
+`ancestors(id)` gives the parent first and the root last. A parent is a
 reference that restricts: it cannot be deleted while it has children. A
 parent that would make a cycle, or a tree deeper than 64, is `Invalid`. The
 paths of descendants do not yet follow a move of their parent.
 
 Authors are an ordered list of up to 16 accounts shared by every locale:
-`Entity::author(account)`, `set_authors(rid, &[AccountId])` (tx), and
+`Entity::author(account)`, `set_authors(id, &[AccountId])` (tx), and
 `Entry::authors()`. The tree and the authors take effect at once, published
 or not.
 
@@ -825,7 +861,7 @@ or not.
 - **References:** every `Entity`, `Account`, and `Terms` field is indexed both
   ways in the same commit, so "what links here" is one read. References found
   inside a body, which nex-db never parses, are passed with
-  `Entity::references(&[Rid])` and indexed the same way.
+  `Entity::references(&[EntityId])` (planned) and indexed the same way.
 
   Built so far: `Entity` fields, in drafts and published bodies of every
   locale. Saving a reference to an entity that does not exist is
@@ -850,12 +886,12 @@ or not.
 | `Listing::latest(kind)`, `.updated()`, `.site(s)`, `.limit(n)` | 0.4 | P0 |
 | `.by_author(a)` | 0.4 | P0 |
 | `.term(t)` | 0.4 | P0 |
-| `.sticky_first()`: sticky entities (`Entity::sticky()`, `set_sticky(rid, bool)`, `Entry::sticky()`) first, then the others, each in the listing's order | 0.5 | P0 |
-| `children(rid) -> Vec<Rid>`, `ancestors(rid) -> Result<Vec<Rid>>` | 0.4 | P1 |
-| `referenced_by(rid) -> Result<Vec<Rid>>` | 0.4 | P1 |
+| `.sticky_first()`: sticky entities (`Entity::sticky()`, `set_sticky(id, bool)`, `Entry::sticky()`) first, then the others, each in the listing's order | 0.5 | P0 |
+| `children(id) -> Vec<EntityId>`, `ancestors(id) -> Result<Vec<EntityId>>` | 0.4 | P1 |
+| `referenced_by(id) -> Result<Vec<EntityId>>` | 0.4 | P1 |
 | `stream(Listing) -> Stream`, an iterator of `Result<Entry>` reading page by page, for sitemaps and feeds | 0.5 | P1 |
 | `search(locale, &Search) -> Result<Hits>` | 0.5 | P1 |
-| `related(rid, limit)` | 0.5 | P2 |
+| `related(id, limit)` | planned | P2 |
 
 `search` finds the published entities of a locale holding every word of the
 query in a field their type declares `.searchable(weight)` (text, or a list of
@@ -864,7 +900,7 @@ digits without case; each CJK ideograph is a word. English locales (`en`,
 `en-*`) also match word forms (Porter stemming) and skip common words; other
 locales match words as they are. `Search::new(text)` (at most 1,024 bytes and
 16 words) with `.kind(k)`, `.site(s)`, `.term(t)`, `.limit(n)` (1 to 1,000,
-default 10), and `.offset(n)`; `Hits` gives `items()` (each `Hit` has `rid()`
+default 10), and `.offset(n)`; `Hits` gives `items()` (each `Hit` has `id()`
 and `score()`) and `total()`. Read the entries with `get_many`.
 
 Listings return pages of at most 1,000 (default 100) with an opaque `Cursor`;
@@ -880,7 +916,7 @@ published entities are listed.
 
 `db.feed(from: Position) -> Result<Feed>` (0.4, P1) reads committed changes in
 order, each with the `Position` of its commit. `Change` (non-exhaustive):
-`EntityChanged { rid, revision }` (the published revision after the commit, 0
+`EntityChanged { entity, revision }` (the published revision after the commit, 0
 for none), `RouteChanged { site, path }`, `AccountCreated { account }`,
 `SessionRevoked { account: Option<AccountId> }` (one session, or every
 session of the account), `StandingChanged { account }`, and
@@ -906,15 +942,15 @@ use nex_db::{Change, Entity};
 # let _ = std::fs::remove_dir_all(&dir);
 # let db = nex_db::open(&dir)?;
 let mut feed = db.feed(db.position())?;
-let rid = db.content().create(Entity::new("page").path("/hello"))?;
-db.content().publish(rid)?;
+let id = db.content().create(Entity::new("page").path("/hello"))?;
+db.content().publish(id)?;
 let mut changed = Vec::new();
 while let Some((_, change)) = feed.next_timeout(Duration::from_millis(10))? {
-    if let Change::EntityChanged { rid, revision } = change {
-        changed.push((rid, revision));
+    if let Change::EntityChanged { entity, revision } = change {
+        changed.push((entity, revision));
     }
 }
-assert_eq!(changed, [(rid, 0), (rid, 1)]);
+assert_eq!(changed, [(id, 0), (id, 1)]);
 # drop(feed);
 # drop(db);
 # std::fs::remove_dir_all(&dir).unwrap();

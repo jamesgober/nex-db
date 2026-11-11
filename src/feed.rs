@@ -19,7 +19,7 @@ use crate::{
     Database,
     core::record::Seq,
     error::{Error, Result},
-    ids::{AccountId, Rid},
+    ids::{AccountId, EntityId},
 };
 
 /// Commits kept, counting only those that changed something the feed
@@ -53,7 +53,7 @@ pub enum Change {
     /// is the published one (0 when nothing is).
     EntityChanged {
         /// The entity.
-        rid: Rid,
+        entity: EntityId,
         /// Its published revision after the commit.
         revision: u32,
     },
@@ -213,9 +213,9 @@ impl FeedLog {
 /// let db = nex_db::open("data/site")?;
 /// let mut feed = db.feed(db.position())?;
 /// while let Some((_position, change)) = feed.next_timeout(Duration::from_secs(1))? {
-///     if let Change::EntityChanged { rid, .. } = change {
-///         // drop cached pages built from `rid`
-///         # let _ = rid;
+///     if let Change::EntityChanged { entity, .. } = change {
+///         // drop cached pages built from `entity`
+///         # let _ = entity;
 ///     }
 /// }
 /// # Ok(())

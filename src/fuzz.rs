@@ -108,13 +108,13 @@ mod tests {
                     entity::{Body, Entity, Revision, encode_route},
                     locale::Locale,
                 },
-                ids::Rid,
+                ids::EntityId,
             };
             let head = Entity::new("page")
                 .field("title", "Hello")
                 .field("n", 7_i64)
                 .path("/hello")
-                .into_head(Rid::from_bytes([3; 16]), 1, Locale::EN)
+                .into_head(EntityId::from_bytes([3; 16]), 1, Locale::EN)
                 .unwrap();
             seeds.push(head.encode().unwrap());
             let revision = Revision::new(

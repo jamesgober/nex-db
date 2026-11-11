@@ -21,7 +21,7 @@ use std::{
 use super::{entity::Head, locale::Locale};
 use crate::{
     error::{Error, Result},
-    ids::{AccountId, Rid},
+    ids::{AccountId, EntityId},
 };
 
 /// The most entries one page holds.
@@ -59,7 +59,7 @@ pub struct Listing {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Filter {
     Author(AccountId),
-    Refers(Rid),
+    Refers(EntityId),
     Outdated(Locale),
 }
 
@@ -117,7 +117,7 @@ impl Listing {
     /// terms field ([`Type::terms`](crate::Type::terms)), or any entity
     /// referred to, for "posts in this series". Replaces a
     /// [`by_author`](Self::by_author) filter.
-    pub fn term(mut self, term: Rid) -> Listing {
+    pub fn term(mut self, term: EntityId) -> Listing {
         self.filter = Some(Filter::Refers(term));
         self
     }
@@ -219,7 +219,7 @@ impl Cursor {
                 };
                 match text.split_at_checked(1) {
                     Some(("a", hex)) => Some(Filter::Author(AccountId::from_bytes(id(hex)?))),
-                    Some(("t", hex)) => Some(Filter::Refers(Rid::from_bytes(id(hex)?))),
+                    Some(("t", hex)) => Some(Filter::Refers(EntityId::from_bytes(id(hex)?))),
                     Some(("o", hex)) => {
                         let tag =
                             String::from_utf8(unhex(hex).ok_or_else(bad)?).map_err(|_| bad())?;
@@ -293,7 +293,7 @@ struct Inner {
     /// The group number of each (site, type, filter).
     groups: HashMap<Group, u32>,
     /// Each listed entity's rows, to remove them when it changes.
-    placed: HashMap<Rid, Vec<Row>>,
+    placed: HashMap<EntityId, Vec<Row>>,
     /// The listed entities that are sticky.
     sticky: HashSet<[u8; 16]>,
 }
@@ -317,7 +317,7 @@ impl ListIndex {
     }
 
     /// Drop `rid` from every listing.
-    pub(crate) fn remove(&self, rid: Rid) {
+    pub(crate) fn remove(&self, rid: EntityId) {
         let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         if let Some(rows) = inner.placed.remove(&rid) {
             for row in rows {
@@ -384,7 +384,7 @@ impl ListIndex {
         &self,
         listing: &Listing,
         after: Option<(u64, [u8; 16])>,
-    ) -> (Vec<Rid>, Option<(u64, [u8; 16])>) {
+    ) -> (Vec<EntityId>, Option<(u64, [u8; 16])>) {
         let inner = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let Some(group) = inner
             .groups
@@ -414,7 +414,7 @@ impl ListIndex {
             if ids.len() == listing.limit {
                 return (ids, last);
             }
-            ids.push(Rid::from_bytes(rid));
+            ids.push(EntityId::from_bytes(rid));
             last = Some((inv, rid));
         }
         (ids, None)
@@ -429,7 +429,7 @@ mod tests {
     fn head(n: u8, first: u64, last: u64) -> Head {
         let mut head = Entity::new("post")
             .into_head(
-                Rid::from_bytes([n; 16]),
+                EntityId::from_bytes([n; 16]),
                 0,
                 crate::content::locale::Locale::EN,
             )
@@ -451,7 +451,7 @@ mod tests {
         index.update(&head(2, 20, 20));
         index.update(&head(3, 30, 30));
         let ids = |listing: &Listing| index.page(listing, None).0;
-        let n = |v: Vec<Rid>| v.iter().map(|r| r.as_bytes()[0]).collect::<Vec<_>>();
+        let n = |v: Vec<EntityId>| v.iter().map(|r| r.as_bytes()[0]).collect::<Vec<_>>();
         assert_eq!(n(ids(&Listing::latest("post"))), [3, 2, 1]);
         assert_eq!(n(ids(&Listing::latest("post").updated())), [1, 3, 2]);
         assert!(ids(&Listing::latest("page")).is_empty());
@@ -475,7 +475,7 @@ mod tests {
         index.update(&by_ann);
         assert!(ids(&Listing::latest("post").by_author(ann)).is_empty());
         // By an entity a published body refers to.
-        let tag = Rid::from_bytes([7; 16]);
+        let tag = EntityId::from_bytes([7; 16]);
         if let Some(p) = by_ann.variants[0].published.as_mut() {
             p.refs = vec![tag];
         }
@@ -503,7 +503,7 @@ mod tests {
         };
         assert_eq!(Cursor::parse(&by.to_string()).unwrap(), by);
         let term = Cursor {
-            listing: Listing::latest("post").term(Rid::from_bytes([4; 16])),
+            listing: Listing::latest("post").term(EntityId::from_bytes([4; 16])),
             after: (1, [2; 16]),
         };
         assert_eq!(Cursor::parse(&term.to_string()).unwrap(), term);

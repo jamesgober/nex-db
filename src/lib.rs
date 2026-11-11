@@ -19,32 +19,49 @@
 //!
 //! let db = nex_db::open("data/site")?;
 //!
-//! // Sign up: an account (auth) and a profile page (content) in one commit.
+//! // Put a page and get it back.
+//! let id = db.content().put(Entity::new("page").field("title", "Hello").path("/hello"))?;
+//! let page = db.content().get(id)?;
+//!
+//! // Sign a user up and in.
+//! let account = db.auth().sign_up("ann@example.com", "correct horse battery staple")?;
+//! let signed_in = db.auth().sign_in("ann@example.com", "correct horse battery staple", SessionSpec::web())?;
+//!
+//! // On each request: check the session cookie, then find the page at the path.
+//! if let SignIn::Success { token, .. } = signed_in {
+//!     assert!(matches!(db.auth().validate(&token)?, Validation::Valid(s) if s.account() == account));
+//! }
+//! if let Some(route) = db.content().resolve(nex_db::DEFAULT_SITE, "/hello")? {
+//!     assert_eq!(route.entity(), id);
+//! }
+//! # let _ = page;
+//! # Ok(())
+//! # }
+//! # #[cfg(not(all(feature = "auth", feature = "content")))]
+//! # fn main() {}
+//! ```
+//!
+//! ## One commit across engines
+//!
+//! ```no_run
+//! # #[cfg(all(feature = "auth", feature = "content"))]
+//! # fn main() -> nex_db::Result<()> {
+//! use nex_db::Entity;
+//!
+//! let db = nex_db::open("data/site")?;
+//!
+//! // An account (auth) and its profile page (content): both or neither.
 //! let password = db.auth().hash_password("correct horse battery staple")?;
-//! let account = db.commit(|tx| {
+//! db.commit(|tx| {
 //!     let account = tx.auth().create_account("ann@example.com", &password)?;
-//!     tx.content().create(
+//!     tx.content().put(
 //!         Entity::new("profile")
 //!             .field("account", account)
-//!             .field("display_name", "Ann")
 //!             .site("example.com")
 //!             .path("/u/ann"),
 //!     )?;
-//!     Ok(account)
+//!     Ok(())
 //! })?;
-//!
-//! // Sign in, then check the session on each request.
-//! if let SignIn::Success { token, .. } =
-//!     db.auth().sign_in("ann@example.com", "correct horse battery staple", SessionSpec::web())?
-//! {
-//!     assert!(matches!(db.auth().validate(&token)?, Validation::Valid(s) if s.account() == account));
-//! }
-//!
-//! // Serve the profile page.
-//! if let Some(route) = db.content().resolve("example.com", "/u/ann")? {
-//!     let page = db.content().get(route.entity())?;
-//!     # let _ = page;
-//! }
 //! # Ok(())
 //! # }
 //! # #[cfg(not(all(feature = "auth", feature = "content")))]
@@ -72,8 +89,9 @@
 //!
 //! ## Status
 //!
-//! Version 0.3: the core and the auth engine. The API through 1.0 is in
-//! `docs/API.md`; the file formats and the API may still change before 1.0.
+//! Version 0.8, before 1.0: the file formats and the API may still change,
+//! each change recorded in the changelog with how to migrate. The API
+//! through 1.0 is in `docs/API.md`.
 
 #![doc(html_root_url = "https://docs.rs/nex-db")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -131,8 +149,8 @@ pub use crate::auth::{
     roles::{Account, Role, RoleId},
     token::Token,
     types::{
-        HashedPassword, Login, Purpose, RevokeReason, Session, SessionId, SessionInfo, SessionSpec,
-        SignIn, Standing, Validation,
+        HashedPassword, PasswordCheck, Purpose, RevokeReason, Session, SessionId, SessionInfo,
+        SessionSpec, SignIn, Standing, Validation,
     },
 };
 #[cfg(feature = "mfa")]
@@ -166,14 +184,27 @@ pub use crate::{
     db::{Builder, CollectionInfo, CollectionKind, Database, Read, Transaction, open},
     error::{Error, Result},
     feed::{Change, Feed, Position},
-    ids::{AccountId, Rid},
+    ids::{AccountId, EntityId},
     observe::{CommitInfo, Health, Observer, SecurityEvent},
 };
+
+#[cfg(feature = "auth")]
+#[allow(deprecated)]
+#[doc(hidden)]
+pub use crate::auth::types::Login;
+#[allow(deprecated)]
+#[doc(hidden)]
+pub use crate::ids::Rid;
 
 // Every Rust example in docs/API.md runs as a doctest.
 #[cfg(all(doctest, feature = "auth", feature = "content"))]
 #[doc = include_str!("../docs/API.md")]
 struct ApiDoc;
+
+// The README's examples compile as doctests.
+#[cfg(all(doctest, feature = "auth", feature = "content"))]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoc;
 
 /// Crate version string, populated by Cargo at build time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

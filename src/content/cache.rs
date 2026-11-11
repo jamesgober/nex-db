@@ -25,7 +25,7 @@ use std::{
 };
 
 use super::{entity::Entry, locale::Locale};
-use crate::ids::Rid;
+use crate::ids::EntityId;
 
 const SHARDS: usize = 64;
 
@@ -33,7 +33,7 @@ const SHARDS: usize = 64;
 /// generation, raised whenever an entity of the shard changes.
 #[derive(Default)]
 struct Shard {
-    map: RwLock<HashMap<Rid, Vec<(Locale, Entry)>>>,
+    map: RwLock<HashMap<EntityId, Vec<(Locale, Entry)>>>,
     generation: AtomicU64,
 }
 
@@ -65,13 +65,13 @@ impl EntryCache {
         }
     }
 
-    fn shard(&self, rid: Rid) -> &Shard {
+    fn shard(&self, rid: EntityId) -> &Shard {
         // Ids end in random bits.
         &self.shards[usize::from(rid.as_bytes()[15]) % SHARDS]
     }
 
     /// The cached entry of `rid` asked for in `asked`.
-    pub(crate) fn get(&self, rid: Rid, asked: Locale) -> Option<Entry> {
+    pub(crate) fn get(&self, rid: EntityId, asked: Locale) -> Option<Entry> {
         if self.per_shard == 0 {
             return None;
         }
@@ -86,13 +86,13 @@ impl EntryCache {
     }
 
     /// Take before reading the store for an entry to cache.
-    pub(crate) fn ticket(&self, rid: Rid) -> Ticket {
+    pub(crate) fn ticket(&self, rid: EntityId) -> Ticket {
         Ticket(self.shard(rid).generation.load(Ordering::Acquire))
     }
 
     /// Cache `entry`, read after `ticket`, unless `rid`'s shard changed
     /// since.
-    pub(crate) fn fill(&self, ticket: Ticket, rid: Rid, asked: Locale, entry: &Entry) {
+    pub(crate) fn fill(&self, ticket: Ticket, rid: EntityId, asked: Locale, entry: &Entry) {
         if self.per_shard == 0 {
             return;
         }
@@ -116,7 +116,7 @@ impl EntryCache {
 
     /// Forget `rid`: after an apply wrote its change to the store, before
     /// the commit becomes visible.
-    pub(crate) fn forget(&self, rid: Rid) {
+    pub(crate) fn forget(&self, rid: EntityId) {
         let shard = self.shard(rid);
         let mut map = shard.map.write().unwrap_or_else(PoisonError::into_inner);
         let _ = shard.generation.fetch_add(1, Ordering::AcqRel);
@@ -138,8 +138,8 @@ mod tests {
     use super::*;
     use crate::content::entity::Entity;
 
-    fn entry(n: u8) -> (Rid, Entry) {
-        let rid = Rid::from_bytes([n; 16]);
+    fn entry(n: u8) -> (EntityId, Entry) {
+        let rid = EntityId::from_bytes([n; 16]);
         let head = Entity::new("page")
             .field("n", i64::from(n))
             .into_head(rid, 1, Locale::EN)

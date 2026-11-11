@@ -1,4 +1,4 @@
-//! Identifiers: [`AccountId`] and [`Rid`].
+//! Identifiers: [`AccountId`] and [`EntityId`].
 //!
 //! Both are 128-bit ULIDs (a millisecond timestamp and random bits), shown as
 //! 26 Crockford base32 characters. They name records; they are not secrets.
@@ -74,19 +74,23 @@ ulid_id!(
 );
 
 ulid_id!(
-    /// A record id, assigned by the content engine when an entity is
+    /// An entity id, assigned by the content engine when an entity is
     /// created. Never reused; independent of the entity's path.
     ///
     /// ```
-    /// use nex_db::Rid;
-    /// let rid: Rid = "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse()?;
-    /// assert_eq!(rid.to_string(), "01ARZ3NDEKTSV4RRFFQ69G5FAV");
-    /// assert!("not-a-rid".parse::<Rid>().is_err());
+    /// use nex_db::EntityId;
+    /// let id: EntityId = "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse()?;
+    /// assert_eq!(id.to_string(), "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+    /// assert!("not-an-id".parse::<EntityId>().is_err());
     /// # Ok::<(), nex_db::Error>(())
     /// ```
-    Rid,
-    "record id"
+    EntityId,
+    "entity id"
 );
+
+/// The name of [`EntityId`] before 0.8.
+#[deprecated(since = "0.8.0", note = "renamed to `EntityId`")]
+pub type Rid = EntityId;
 
 #[cfg(test)]
 mod tests {
@@ -101,14 +105,14 @@ mod tests {
 
     #[test]
     fn test_generate_is_ordered_within_a_process() {
-        let a = Rid::generate();
-        let b = Rid::generate();
+        let a = EntityId::generate();
+        let b = EntityId::generate();
         assert!(b > a);
     }
 
     #[test]
     fn test_debug_names_the_type() {
-        let id = Rid::from_bytes([0; 16]);
-        assert_eq!(format!("{id:?}"), "Rid(00000000000000000000000000)");
+        let id = EntityId::from_bytes([0; 16]);
+        assert_eq!(format!("{id:?}"), "EntityId(00000000000000000000000000)");
     }
 }

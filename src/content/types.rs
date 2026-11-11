@@ -16,7 +16,7 @@ use super::{
 use crate::{
     core::codec::{Reader, Writer},
     error::{Error, Result},
-    ids::Rid,
+    ids::EntityId,
 };
 
 /// Format of the stored types: 2 adds the taxonomy of each terms field, 3
@@ -567,13 +567,13 @@ type Held = (Locale, u32, Vec<Vec<u8>>);
 /// published bodies, and the entity of each singleton type.
 #[derive(Debug, Default)]
 pub(crate) struct TypeIndex {
-    unique: HashMap<Vec<u8>, Rid>,
+    unique: HashMap<Vec<u8>, EntityId>,
     /// Each entity's unique keys by published locale, to drop them when it
     /// changes and to keep them while its published revision does not.
-    held: HashMap<Rid, Vec<Held>>,
+    held: HashMap<EntityId, Vec<Held>>,
     /// Entities by type, counted, with one of them.
-    kinds: HashMap<String, (usize, Rid)>,
-    known: HashSet<Rid>,
+    kinds: HashMap<String, (usize, EntityId)>,
+    known: HashSet<EntityId>,
 }
 
 impl TypeIndex {
@@ -619,7 +619,7 @@ impl TypeIndex {
         Ok(())
     }
 
-    fn release(&mut self, rid: Rid, held: Vec<Held>) {
+    fn release(&mut self, rid: EntityId, held: Vec<Held>) {
         for key in held.into_iter().flat_map(|(_, _, keys)| keys) {
             if self.unique.get(&key) == Some(&rid) {
                 let _ = self.unique.remove(&key);
@@ -628,7 +628,7 @@ impl TypeIndex {
     }
 
     /// Forget `rid`: it was deleted.
-    pub(crate) fn remove(&mut self, rid: Rid, kind: &str) {
+    pub(crate) fn remove(&mut self, rid: EntityId, kind: &str) {
         let held = self.held.remove(&rid).unwrap_or_default();
         self.release(rid, held);
         if self.known.remove(&rid) {
@@ -642,12 +642,12 @@ impl TypeIndex {
     }
 
     /// The published entity holding unique `key`, if any.
-    pub(crate) fn holder(&self, key: &[u8]) -> Option<Rid> {
+    pub(crate) fn holder(&self, key: &[u8]) -> Option<EntityId> {
         self.unique.get(key).copied()
     }
 
     /// How many entities of `kind` exist, and one of them.
-    pub(crate) fn count(&self, kind: &str) -> (usize, Option<Rid>) {
+    pub(crate) fn count(&self, kind: &str) -> (usize, Option<EntityId>) {
         self.kinds
             .get(kind)
             .map_or((0, None), |(n, rid)| (*n, Some(*rid)))
@@ -751,7 +751,7 @@ mod tests {
             path: None,
             fields: vec![("tags".into(), v)],
         };
-        let rid = Rid::from_bytes([1; 16]);
+        let rid = EntityId::from_bytes([1; 16]);
         assert!(types.check("post", &body(Value::from([rid]))).is_ok());
         assert!(
             types

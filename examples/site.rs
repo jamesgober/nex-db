@@ -138,7 +138,7 @@ fn report_validation(
     Ok(check.session())
 }
 
-fn report_route(db: &Database, path: &str) -> nex_db::Result<Option<nex_db::Rid>> {
+fn report_route(db: &Database, path: &str) -> nex_db::Result<Option<nex_db::EntityId>> {
     let Some(route) = db.content().resolve(SITE, path)? else {
         println!("{SITE}{path}: not found");
         return Ok(None);

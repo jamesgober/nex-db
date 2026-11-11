@@ -68,7 +68,10 @@ fn test_the_feed_reports_content_and_auth_changes_in_order() {
 
     let changes = drain(&mut feed);
     assert_eq!(changes[0], Change::AccountCreated { account: ann });
-    assert!(changes.contains(&Change::EntityChanged { rid, revision: 1 }));
+    assert!(changes.contains(&Change::EntityChanged {
+        entity: rid,
+        revision: 1
+    }));
     assert!(changes.contains(&Change::RouteChanged {
         site: DEFAULT_SITE.to_owned(),
         path: "/p".to_owned()
@@ -84,7 +87,10 @@ fn test_the_feed_reports_content_and_auth_changes_in_order() {
     assert_eq!(
         drain(&mut later),
         [
-            Change::EntityChanged { rid, revision: 0 },
+            Change::EntityChanged {
+                entity: rid,
+                revision: 0
+            },
             Change::RouteChanged {
                 site: DEFAULT_SITE.to_owned(),
                 path: "/p".to_owned()

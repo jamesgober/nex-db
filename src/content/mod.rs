@@ -60,7 +60,7 @@ use crate::{
     engine::{Conflict, Engine, EngineId, Staged},
     error::{Error, Result},
     feed::Change,
-    ids::{AccountId, Rid},
+    ids::{AccountId, EntityId},
 };
 
 /// Deepest a page tree goes: an entity has at most 64 ancestors.
@@ -71,7 +71,7 @@ const ENTRY_CACHE: usize = 4096;
 /// Conflict key of an entity's place in the page tree: written by a parent
 /// change for the entity and each ancestor of its new parent, so two
 /// concurrent changes that together make a cycle never both land.
-fn tree_conflict(rid: Rid) -> Vec<u8> {
+fn tree_conflict(rid: EntityId) -> Vec<u8> {
     let mut key = Vec::with_capacity(17);
     key.push(b'p');
     key.extend_from_slice(rid.as_bytes());
@@ -125,14 +125,14 @@ fn entity_prefix(collection: u32) -> Vec<u8> {
     prefix(collection, b'e')
 }
 
-fn entity_key(collection: u32, rid: Rid) -> Vec<u8> {
+fn entity_key(collection: u32, rid: EntityId) -> Vec<u8> {
     let mut key = entity_prefix(collection);
     key.extend_from_slice(rid.as_bytes());
     key
 }
 
 /// [`entity_key`] on the stack, for reads that must not allocate.
-fn entity_key_array(collection: u32, rid: Rid) -> [u8; 21] {
+fn entity_key_array(collection: u32, rid: EntityId) -> [u8; 21] {
     let mut key = [0; 21];
     key[..4].copy_from_slice(&collection.to_be_bytes());
     key[4] = b'e';
@@ -140,19 +140,19 @@ fn entity_key_array(collection: u32, rid: Rid) -> [u8; 21] {
     key
 }
 
-fn revision_prefix(collection: u32, rid: Rid) -> Vec<u8> {
+fn revision_prefix(collection: u32, rid: EntityId) -> Vec<u8> {
     let mut key = prefix(collection, b'v');
     key.extend_from_slice(rid.as_bytes());
     key
 }
 
-fn revision_key(collection: u32, rid: Rid, n: u32) -> Vec<u8> {
+fn revision_key(collection: u32, rid: EntityId, n: u32) -> Vec<u8> {
     let mut key = revision_prefix(collection, rid);
     key.extend_from_slice(&n.to_be_bytes());
     key
 }
 
-fn link_prefix(collection: u32, target: Rid) -> Vec<u8> {
+fn link_prefix(collection: u32, target: EntityId) -> Vec<u8> {
     let mut key = prefix(collection, b'b');
     key.extend_from_slice(target.as_bytes());
     key
@@ -160,7 +160,7 @@ fn link_prefix(collection: u32, target: Rid) -> Vec<u8> {
 
 /// The stored record that `source` refers to `target`: found by a scan of
 /// the target's prefix.
-fn link_key(collection: u32, target: Rid, source: Rid) -> Vec<u8> {
+fn link_key(collection: u32, target: EntityId, source: EntityId) -> Vec<u8> {
     let mut key = link_prefix(collection, target);
     key.extend_from_slice(source.as_bytes());
     key
@@ -169,7 +169,7 @@ fn link_key(collection: u32, target: Rid, source: Rid) -> Vec<u8> {
 /// Conflict key of the references to `target`: written by a commit that
 /// adds one and by a commit that deletes the target, so the two never
 /// both land.
-fn link_conflict(target: Rid) -> Vec<u8> {
+fn link_conflict(target: EntityId) -> Vec<u8> {
     let mut key = Vec::with_capacity(17);
     key.push(b'l');
     key.extend_from_slice(target.as_bytes());
@@ -398,13 +398,13 @@ impl ContentEngine {
     }
 
     /// The stored head bytes of `rid` as a snapshot at `at` sees them.
-    fn head_bytes_at(&self, rid: Rid, at: Seq) -> Result<Option<Vec<u8>>> {
+    fn head_bytes_at(&self, rid: EntityId, at: Seq) -> Result<Option<Vec<u8>>> {
         Ok(self.head_bytes_latest(rid, at)?.0)
     }
 
     /// As [`head_bytes_at`](Self::head_bytes_at), and whether they are the
     /// store's latest (no version kept for snapshots stood in for them).
-    fn head_bytes_latest(&self, rid: Rid, at: Seq) -> Result<(Option<Vec<u8>>, bool)> {
+    fn head_bytes_latest(&self, rid: EntityId, at: Seq) -> Result<(Option<Vec<u8>>, bool)> {
         let key = entity_key(self.collection, rid);
         // The store first, the versions second (see `core::versions`).
         let stored = self.store.get(&key)?;
@@ -422,7 +422,7 @@ impl ContentEngine {
             .default_locale
     }
 
-    fn head_at(&self, rid: Rid, at: Seq) -> Result<Option<Head>> {
+    fn head_at(&self, rid: EntityId, at: Seq) -> Result<Option<Head>> {
         self.head_bytes_at(rid, at)?
             .map(|bytes| Head::decode(&bytes, at))
             .transpose()
@@ -431,7 +431,7 @@ impl ContentEngine {
     /// The head of `rid` as the store holds it. A head an apply in
     /// progress recorded for snapshots, but has not written yet, is not
     /// seen: its revision may not be in the store yet.
-    fn head(&self, rid: Rid) -> Result<Option<Head>> {
+    fn head(&self, rid: EntityId) -> Result<Option<Head>> {
         self.head_at(rid, self.latest())
     }
 
@@ -440,7 +440,7 @@ impl ContentEngine {
         self.applied.load(Ordering::Acquire)
     }
 
-    fn revision(&self, rid: Rid, n: u32) -> Result<Option<Revision>> {
+    fn revision(&self, rid: EntityId, n: u32) -> Result<Option<Revision>> {
         self.store
             .get(revision_key(self.collection, rid, n))?
             .map(|bytes| Revision::decode(&bytes, 0))
@@ -461,14 +461,14 @@ impl ContentEngine {
     }
 
     /// The entities whose stored references name `target`.
-    fn stored_referrers(&self, target: Rid) -> Result<Vec<Rid>> {
+    fn stored_referrers(&self, target: EntityId) -> Result<Vec<EntityId>> {
         let start = link_prefix(self.collection, target);
         self.store
             .scan(start.clone()..after(&start))?
             .map(|(key, _)| {
                 key.get(start.len()..)
                     .and_then(|b| <[u8; 16]>::try_from(b).ok())
-                    .map(Rid::from_bytes)
+                    .map(EntityId::from_bytes)
                     .ok_or_else(|| Error::corrupt("a reference key", 0))
             })
             .collect()
@@ -495,7 +495,7 @@ impl ContentEngine {
     /// The published entry of `rid` as a snapshot at `at` sees it: in
     /// `asked` (the space's default locale when `None`), else along its
     /// fallback chain, else in the entity's own locale.
-    fn published_in(&self, rid: Rid, asked: Option<Locale>, at: Seq) -> Result<Option<Entry>> {
+    fn published_in(&self, rid: EntityId, asked: Option<Locale>, at: Seq) -> Result<Option<Entry>> {
         let asked = asked.unwrap_or_else(|| self.default_locale());
         // The cache holds the store's latest state, which is what `at` sees
         // unless a version is kept for the entity (checked after the cache,
@@ -525,7 +525,7 @@ impl ContentEngine {
     /// The published entry of `rid` from its head `bytes`.
     fn published_from(
         &self,
-        rid: Rid,
+        rid: EntityId,
         bytes: Option<Vec<u8>>,
         asked: Locale,
         at: Seq,
@@ -570,7 +570,7 @@ impl ContentEngine {
     }
 
     /// The working draft of `rid` in `locale` (its own when `None`).
-    fn draft_in(&self, rid: Rid, locale: Option<Locale>, at: Seq) -> Result<Option<Entry>> {
+    fn draft_in(&self, rid: EntityId, locale: Option<Locale>, at: Seq) -> Result<Option<Entry>> {
         Ok(self.head_at(rid, at)?.and_then(|head| {
             let variant = match locale {
                 Some(l) => head.variant(l)?,
@@ -585,7 +585,7 @@ impl ContentEngine {
         }))
     }
 
-    fn revisions(&self, rid: Rid) -> Result<Vec<RevisionInfo>> {
+    fn revisions(&self, rid: EntityId) -> Result<Vec<RevisionInfo>> {
         let start = revision_prefix(self.collection, rid);
         let mut out = Vec::new();
         for (key, value) in self.store.scan(start.clone()..after(&start))? {
@@ -662,15 +662,15 @@ fn page(head: &Head, locale: Locale, revision: u32) -> RouteEntry {
 /// One operation as read from a section.
 enum Op<'a> {
     Create(&'a [u8]),
-    PutHead(Rid, &'a [u8]),
-    PutRevision(Rid, u32, &'a [u8]),
+    PutHead(EntityId, &'a [u8]),
+    PutRevision(EntityId, u32, &'a [u8]),
     PutRoute(&'a str, &'a str, &'a [u8]),
     DeleteRoute(&'a str, &'a str),
     SetSpace(&'a [u8]),
     SetTypes(&'a [u8]),
-    DeleteEntity(Rid),
-    PutLink(Rid, Rid),
-    DeleteLink(Rid, Rid),
+    DeleteEntity(EntityId),
+    PutLink(EntityId, EntityId),
+    DeleteLink(EntityId, EntityId),
 }
 
 fn decode_ops(seq: Seq, format: u16, body: &[u8]) -> Result<Vec<Op<'_>>> {
@@ -679,21 +679,23 @@ fn decode_ops(seq: Seq, format: u16, body: &[u8]) -> Result<Vec<Op<'_>>> {
     while !r.is_empty() {
         let op = match (format, r.u8()?) {
             (FORMAT_CREATE_ONLY, OP_CREATE) => Op::Create(r.bytes32()?),
-            (FORMAT, OP_PUT_HEAD) => Op::PutHead(Rid::from_bytes(r.fixed()?), r.bytes32()?),
+            (FORMAT, OP_PUT_HEAD) => Op::PutHead(EntityId::from_bytes(r.fixed()?), r.bytes32()?),
             (FORMAT, OP_PUT_REVISION) => {
-                Op::PutRevision(Rid::from_bytes(r.fixed()?), r.u32()?, r.bytes32()?)
+                Op::PutRevision(EntityId::from_bytes(r.fixed()?), r.u32()?, r.bytes32()?)
             }
             (FORMAT, OP_PUT_ROUTE) => Op::PutRoute(r.str16()?, r.str16()?, r.bytes16()?),
             (FORMAT, OP_DELETE_ROUTE) => Op::DeleteRoute(r.str16()?, r.str16()?),
             (FORMAT, OP_SET_SPACE) => Op::SetSpace(r.bytes16()?),
             (FORMAT, OP_SET_TYPES) => Op::SetTypes(r.bytes32()?),
-            (FORMAT, OP_DELETE_ENTITY) => Op::DeleteEntity(Rid::from_bytes(r.fixed()?)),
-            (FORMAT, OP_PUT_LINK) => {
-                Op::PutLink(Rid::from_bytes(r.fixed()?), Rid::from_bytes(r.fixed()?))
-            }
-            (FORMAT, OP_DELETE_LINK) => {
-                Op::DeleteLink(Rid::from_bytes(r.fixed()?), Rid::from_bytes(r.fixed()?))
-            }
+            (FORMAT, OP_DELETE_ENTITY) => Op::DeleteEntity(EntityId::from_bytes(r.fixed()?)),
+            (FORMAT, OP_PUT_LINK) => Op::PutLink(
+                EntityId::from_bytes(r.fixed()?),
+                EntityId::from_bytes(r.fixed()?),
+            ),
+            (FORMAT, OP_DELETE_LINK) => Op::DeleteLink(
+                EntityId::from_bytes(r.fixed()?),
+                EntityId::from_bytes(r.fixed()?),
+            ),
             _ => return Err(Error::corrupt("a content operation", seq)),
         };
         ops.push(op);
@@ -752,7 +754,7 @@ impl Engine for ContentEngine {
                         batch.put(link_key(self.collection, target, head.rid), []);
                     }
                     changes.push(Change::EntityChanged {
-                        rid: head.rid,
+                        entity: head.rid,
                         revision: 1,
                     });
                     let base = head.base();
@@ -778,7 +780,7 @@ impl Engine for ContentEngine {
                         }
                     }
                     changes.push(Change::EntityChanged {
-                        rid: *rid,
+                        entity: *rid,
                         revision: head.base().published.as_ref().map_or(0, |p| p.revision),
                     });
                     heads.push((head, false));
@@ -816,7 +818,7 @@ impl Engine for ContentEngine {
                         batch.delete(rev);
                     }
                     changes.push(Change::EntityChanged {
-                        rid: *rid,
+                        entity: *rid,
                         revision: 0,
                     });
                 }
@@ -943,11 +945,11 @@ impl Engine for ContentEngine {
 /// An operation staged in a transaction.
 #[derive(Debug)]
 enum StagedOp {
-    Revision(Rid, u32, Vec<u8>),
+    Revision(EntityId, u32, Vec<u8>),
     Route(String, String, Option<RouteEntry>),
     Space(Vec<u8>),
     Types(Vec<u8>),
-    Delete(Rid),
+    Delete(EntityId),
 }
 
 /// One transaction's content work.
@@ -957,18 +959,18 @@ pub(crate) struct ContentStaged<'e> {
     heads: Vec<Head>,
     ops: Vec<StagedOp>,
     /// Revisions this work recorded, by entity and number.
-    revisions: HashMap<(Rid, u32), (Locale, Body)>,
+    revisions: HashMap<(EntityId, u32), (Locale, Body)>,
     /// Routes as this work left them.
     routes: HashMap<(String, String), Option<RouteEntry>>,
     /// The space's types as this work left them.
     types: Option<Types>,
     /// Unique values this work published, and the entity holding each.
-    unique: HashMap<Vec<u8>, Rid>,
+    unique: HashMap<Vec<u8>, EntityId>,
     /// References this work added (`true`) or removed, by target and
     /// source.
-    links: HashMap<(Rid, Rid), bool>,
+    links: HashMap<(EntityId, EntityId), bool>,
     /// Entities this work deleted.
-    deleted: HashSet<Rid>,
+    deleted: HashSet<EntityId>,
     writes: Vec<Vec<u8>>,
     /// Checked at commit as well as the writes: a serializable commit.
     serializable: bool,
@@ -1130,7 +1132,7 @@ impl fmt::Debug for ContentTx<'_, '_> {
 
 impl ContentTx<'_, '_> {
     /// The head of `rid` as this transaction sees it.
-    fn head(&self, rid: Rid) -> Result<Head> {
+    fn head(&self, rid: EntityId) -> Result<Head> {
         self.staged
             .note(entity_key(self.staged.engine.collection, rid));
         if let Some(head) = self.staged.heads.iter().find(|h| h.rid == rid) {
@@ -1153,7 +1155,7 @@ impl ContentTx<'_, '_> {
     /// # Errors
     ///
     /// [`Error::Storage`] or [`Error::Corrupt`] when the store cannot be read.
-    pub fn draft(&self, rid: Rid) -> Result<Option<Entry>> {
+    pub fn draft(&self, rid: EntityId) -> Result<Option<Entry>> {
         match self.head(rid) {
             Ok(head) => {
                 let base = head.base();
@@ -1209,7 +1211,7 @@ impl ContentTx<'_, '_> {
 
     /// Refuse a term added to a terms field that is not of the field's
     /// taxonomy. Terms already there (in `old`) are not read again.
-    fn check_terms(&self, types: &Types, head: &Head, old: &[Rid]) -> Result<()> {
+    fn check_terms(&self, types: &Types, head: &Head, old: &[EntityId]) -> Result<()> {
         for variant in &head.variants {
             for (name, value) in &variant.draft.fields {
                 let Some(taxonomy) = types.taxonomy(&head.kind, name) else {
@@ -1235,7 +1237,7 @@ impl ContentTx<'_, '_> {
     /// The references of the stored head of `rid`, before this work
     /// rewrites it. A head stored by 0.1 to 0.3 is its own published body:
     /// that body is kept as the revision the rewritten head points at.
-    fn stored_refs(&mut self, rid: Rid) -> Result<Vec<Rid>> {
+    fn stored_refs(&mut self, rid: EntityId) -> Result<Vec<EntityId>> {
         let engine = self.staged.engine;
         let Some(bytes) = engine.head_bytes_at(rid, engine.latest())? else {
             return Ok(Vec::new());
@@ -1262,7 +1264,7 @@ impl ContentTx<'_, '_> {
 
     /// Stage the change of `source`'s references from `old` to `new`. An
     /// added reference must name an entity that exists.
-    fn link(&mut self, source: Rid, old: &[Rid], new: &[Rid]) -> Result<()> {
+    fn link(&mut self, source: EntityId, old: &[EntityId], new: &[EntityId]) -> Result<()> {
         for &target in new.iter().filter(|t| !old.contains(t)) {
             if target != source && !self.exists(target)? {
                 return Err(Error::invalid("field value", "refers to no entity"));
@@ -1276,7 +1278,7 @@ impl ContentTx<'_, '_> {
         Ok(())
     }
 
-    fn exists(&self, rid: Rid) -> Result<bool> {
+    fn exists(&self, rid: EntityId) -> Result<bool> {
         self.staged
             .note(entity_key(self.staged.engine.collection, rid));
         if self.staged.heads.iter().any(|h| h.rid == rid) {
@@ -1291,9 +1293,9 @@ impl ContentTx<'_, '_> {
 
     /// The entities referring to `target` as this transaction sees it,
     /// other than `target` itself.
-    fn referrers(&self, target: Rid) -> Result<Vec<Rid>> {
+    fn referrers(&self, target: EntityId) -> Result<Vec<EntityId>> {
         self.staged.note(link_conflict(target));
-        let mut out: Vec<Rid> = self
+        let mut out: Vec<EntityId> = self
             .staged
             .engine
             .stored_referrers(target)?
@@ -1415,7 +1417,7 @@ impl ContentTx<'_, '_> {
     /// Refuse `path` on `site` when another entity's page (or this
     /// entity's page in another locale) is there. Redirects and gone
     /// markers give way.
-    fn check_free(&self, site: &str, path: &str, rid: Rid, locale: Locale) -> Result<()> {
+    fn check_free(&self, site: &str, path: &str, rid: EntityId, locale: Locale) -> Result<()> {
         match self.route(site, path) {
             Some(RouteEntry {
                 entity,
@@ -1461,7 +1463,7 @@ impl ContentTx<'_, '_> {
 
     /// The locale and body of revision `n` of `rid` as this transaction
     /// sees it.
-    fn revision_body(&self, rid: Rid, n: u32) -> Result<Option<(Locale, Body)>> {
+    fn revision_body(&self, rid: EntityId, n: u32) -> Result<Option<(Locale, Body)>> {
         if let Some(found) = self.staged.revisions.get(&(rid, n)) {
             return Ok(Some(found.clone()));
         }
@@ -1525,8 +1527,8 @@ impl ContentTx<'_, '_> {
     /// - [`Error::AlreadyExists`] (`what = "path"`) when another entity is
     ///   served at the path on its site.
     /// - [`Error::Invalid`] when a name, path, site, or value breaks its rule.
-    pub fn create(&mut self, entity: Entity) -> Result<Rid> {
-        let rid = Rid::generate();
+    pub fn create(&mut self, entity: Entity) -> Result<EntityId> {
+        let rid = EntityId::generate();
         let engine = self.staged.engine;
         if self
             .types()
@@ -1559,6 +1561,18 @@ impl ContentTx<'_, '_> {
         Ok(rid)
     }
 
+    /// Create an entity and publish it: [`create`](Self::create), then
+    /// [`publish`](Self::publish), in this transaction.
+    ///
+    /// # Errors
+    ///
+    /// As [`create`](Self::create) and [`publish`](Self::publish).
+    pub fn put(&mut self, entity: Entity) -> Result<EntityId> {
+        let id = self.create(entity)?;
+        let _ = self.publish(id)?;
+        Ok(id)
+    }
+
     /// Change the working draft of the entity's own locale. Records no
     /// revision.
     ///
@@ -1566,7 +1580,7 @@ impl ContentTx<'_, '_> {
     ///
     /// [`Error::Invalid`] when the entity does not exist or the result
     /// breaks a rule of [`create`](Self::create).
-    pub fn save_draft(&mut self, rid: Rid, patch: Patch) -> Result<()> {
+    pub fn save_draft(&mut self, rid: EntityId, patch: Patch) -> Result<()> {
         let mut head = self.head(rid)?;
         let locale = head.base().locale;
         self.patch_variant(&mut head, locale, patch)?;
@@ -1591,7 +1605,7 @@ impl ContentTx<'_, '_> {
     ///
     /// [`Error::Invalid`] when the entity does not exist, has 64 locales,
     /// or the result breaks a rule of [`create`](Self::create).
-    pub fn translate(&mut self, rid: Rid, locale: Locale, patch: Patch) -> Result<()> {
+    pub fn translate(&mut self, rid: EntityId, locale: Locale, patch: Patch) -> Result<()> {
         let mut head = self.head(rid)?;
         let source = head.base().published.as_ref().map_or(0, |p| p.revision);
         match head.variant_mut(locale) {
@@ -1616,7 +1630,7 @@ impl ContentTx<'_, '_> {
     ///
     /// [`Error::Invalid`] when the entity does not exist or the message is
     /// too long.
-    pub fn save_revision(&mut self, rid: Rid, message: &str) -> Result<u32> {
+    pub fn save_revision(&mut self, rid: EntityId, message: &str) -> Result<u32> {
         let mut head = self.head(rid)?;
         let locale = head.base().locale;
         let n = self.record_revision(&mut head, locale, message)?;
@@ -1630,7 +1644,7 @@ impl ContentTx<'_, '_> {
     /// # Errors
     ///
     /// As [`publish_in`](Self::publish_in).
-    pub fn publish(&mut self, rid: Rid) -> Result<u32> {
+    pub fn publish(&mut self, rid: EntityId) -> Result<u32> {
         let locale = self.head(rid)?.base().locale;
         self.publish_in(rid, &[locale])
     }
@@ -1647,7 +1661,7 @@ impl ContentTx<'_, '_> {
     ///   served at a path.
     /// - [`Error::Invalid`] when the entity does not exist, is trashed, or
     ///   has no translation for a locale.
-    pub fn publish_in(&mut self, rid: Rid, locales: &[Locale]) -> Result<u32> {
+    pub fn publish_in(&mut self, rid: EntityId, locales: &[Locale]) -> Result<u32> {
         let mut head = self.head(rid)?;
         if head.status == Status::Trashed {
             return Err(Error::invalid("entity", "is in the trash"));
@@ -1706,7 +1720,7 @@ impl ContentTx<'_, '_> {
     /// # Errors
     ///
     /// As [`unpublish_in`](Self::unpublish_in).
-    pub fn unpublish(&mut self, rid: Rid) -> Result<bool> {
+    pub fn unpublish(&mut self, rid: EntityId) -> Result<bool> {
         let locales: Vec<Locale> = self.head(rid)?.variants.iter().map(|v| v.locale).collect();
         self.unpublish_in(rid, &locales)
     }
@@ -1719,7 +1733,7 @@ impl ContentTx<'_, '_> {
     /// # Errors
     ///
     /// [`Error::Invalid`] when the entity does not exist.
-    pub fn unpublish_in(&mut self, rid: Rid, locales: &[Locale]) -> Result<bool> {
+    pub fn unpublish_in(&mut self, rid: EntityId, locales: &[Locale]) -> Result<bool> {
         let mut head = self.head(rid)?;
         let site = head.site.clone();
         let mut any = false;
@@ -1744,7 +1758,7 @@ impl ContentTx<'_, '_> {
     /// # Errors
     ///
     /// As [`set_path_in`](Self::set_path_in).
-    pub fn set_path(&mut self, rid: Rid, path: &str) -> Result<()> {
+    pub fn set_path(&mut self, rid: EntityId, path: &str) -> Result<()> {
         let locale = self.head(rid)?.base().locale;
         self.set_path_in(rid, locale, path)
     }
@@ -1759,7 +1773,7 @@ impl ContentTx<'_, '_> {
     ///   served at the path.
     /// - [`Error::Invalid`] when the entity does not exist, has no such
     ///   translation, or the path breaks its rule.
-    pub fn set_path_in(&mut self, rid: Rid, locale: Locale, path: &str) -> Result<()> {
+    pub fn set_path_in(&mut self, rid: EntityId, locale: Locale, path: &str) -> Result<()> {
         let mut head = self.head(rid)?;
         self.patch_variant(&mut head, locale, Patch::new().path(path))?;
         self.check_free(&head.site, path, rid, locale)?;
@@ -1783,7 +1797,7 @@ impl ContentTx<'_, '_> {
     /// [`Error::Invalid`] when the entity does not exist, for
     /// [`Status::Published`] (use [`publish`](Self::publish)) and
     /// [`Status::Trashed`], and for `Draft` or `Review` while published.
-    pub fn set_status(&mut self, rid: Rid, status: Status) -> Result<()> {
+    pub fn set_status(&mut self, rid: EntityId, status: Status) -> Result<()> {
         match status {
             Status::Archived => {
                 let _ = self.unpublish(rid)?;
@@ -1812,7 +1826,7 @@ impl ContentTx<'_, '_> {
     /// # Errors
     ///
     /// [`Error::Invalid`] when the entity does not exist.
-    pub fn set_visibility(&mut self, rid: Rid, visibility: Visibility) -> Result<()> {
+    pub fn set_visibility(&mut self, rid: EntityId, visibility: Visibility) -> Result<()> {
         let mut head = self.head(rid)?;
         head.visibility = visibility;
         let site = head.site.clone();
@@ -1840,7 +1854,7 @@ impl ContentTx<'_, '_> {
     ///
     /// [`Error::Invalid`] when the entity does not exist or is already in
     /// the trash.
-    pub fn trash(&mut self, rid: Rid) -> Result<()> {
+    pub fn trash(&mut self, rid: EntityId) -> Result<()> {
         let mut head = self.head(rid)?;
         if head.status == Status::Trashed {
             return Err(Error::invalid("entity", "is in the trash"));
@@ -1878,7 +1892,7 @@ impl ContentTx<'_, '_> {
     ///
     /// [`Error::Invalid`] when the entity does not exist or is not in the
     /// trash.
-    pub fn restore(&mut self, rid: Rid) -> Result<()> {
+    pub fn restore(&mut self, rid: EntityId) -> Result<()> {
         let mut head = self.head(rid)?;
         if head.status != Status::Trashed {
             return Err(Error::invalid("entity", "is not in the trash"));
@@ -1914,12 +1928,12 @@ impl ContentTx<'_, '_> {
     ///   one it cascades to).
     /// - [`Error::Invalid`] when the entity does not exist or the delete
     ///   cascades to more than 1,000 entities.
-    pub fn delete(&mut self, rid: Rid) -> Result<()> {
+    pub fn delete(&mut self, rid: EntityId) -> Result<()> {
         let _ = self.head(rid)?;
         // Plan first, so a refusal stages nothing.
         let types = self.types();
         let mut doomed = vec![rid];
-        let mut seen: HashSet<Rid> = doomed.iter().copied().collect();
+        let mut seen: HashSet<EntityId> = doomed.iter().copied().collect();
         let mut detach = Vec::new();
         let mut stale = Vec::new();
         let mut next = 0;
@@ -1965,7 +1979,7 @@ impl ContentTx<'_, '_> {
 
     /// The strongest rule of the fields of `head` that refer to `target`:
     /// restrict, then cascade, then detach. `None` when no field does.
-    fn rule_for(&self, types: &Types, head: &Head, target: Rid) -> Result<Option<Rule>> {
+    fn rule_for(&self, types: &Types, head: &Head, target: EntityId) -> Result<Option<Rule>> {
         // A parent keeps its children: move or delete them first.
         if head.parent == Some(target) {
             return Ok(Some(Rule::Restrict));
@@ -1997,7 +2011,7 @@ impl ContentTx<'_, '_> {
     /// Remove every field of `source` that refers to `target`: from its
     /// drafts, and from each published body by publishing a new revision
     /// without it.
-    fn detach(&mut self, source: Rid, target: Rid) -> Result<()> {
+    fn detach(&mut self, source: EntityId, target: EntityId) -> Result<()> {
         let mut head = self.head(source)?;
         let before = head.clone();
         for variant in &mut head.variants {
@@ -2034,7 +2048,7 @@ impl ContentTx<'_, '_> {
     }
 
     /// Delete `rid` itself: trash it, then remove it and its references.
-    fn remove(&mut self, rid: Rid) -> Result<()> {
+    fn remove(&mut self, rid: EntityId) -> Result<()> {
         let head = self.head(rid)?;
         if head.status != Status::Trashed {
             self.trash(rid)?;
@@ -2059,7 +2073,7 @@ impl ContentTx<'_, '_> {
     /// Walk up from `parent`: refuse it when `rid` is among its ancestors
     /// (a cycle) or the tree would be deeper than 64. Returns `parent` and
     /// its ancestors.
-    fn check_parent(&self, rid: Rid, parent: Rid) -> Result<Vec<Rid>> {
+    fn check_parent(&self, rid: EntityId, parent: EntityId) -> Result<Vec<EntityId>> {
         let mut line = Vec::new();
         let mut at = Some(parent);
         while let Some(p) = at {
@@ -2083,7 +2097,7 @@ impl ContentTx<'_, '_> {
     /// [`Error::Invalid`] when the entity or the parent does not exist, the
     /// parent is the entity or one of its descendants, or the tree would be
     /// deeper than 64.
-    pub fn set_parent(&mut self, rid: Rid, parent: Option<Rid>) -> Result<()> {
+    pub fn set_parent(&mut self, rid: EntityId, parent: Option<EntityId>) -> Result<()> {
         let mut head = self.head(rid)?;
         if let Some(parent) = parent {
             let line = self.check_parent(rid, parent)?;
@@ -2101,7 +2115,7 @@ impl ContentTx<'_, '_> {
     /// # Errors
     ///
     /// [`Error::Invalid`] when the entity does not exist.
-    pub fn set_order(&mut self, rid: Rid, order: i64) -> Result<()> {
+    pub fn set_order(&mut self, rid: EntityId, order: i64) -> Result<()> {
         let mut head = self.head(rid)?;
         head.order = order;
         self.put_head(head)
@@ -2113,7 +2127,7 @@ impl ContentTx<'_, '_> {
     /// # Errors
     ///
     /// [`Error::Invalid`] when the entity does not exist.
-    pub fn set_sticky(&mut self, rid: Rid, sticky: bool) -> Result<()> {
+    pub fn set_sticky(&mut self, rid: EntityId, sticky: bool) -> Result<()> {
         let mut head = self.head(rid)?;
         head.sticky = sticky;
         self.put_head(head)
@@ -2132,7 +2146,13 @@ impl ContentTx<'_, '_> {
     ///   served at `from`.
     /// - [`Error::Invalid`] when the site, the path, or the status breaks
     ///   its rule, or `to` names no entity.
-    pub fn add_redirect(&mut self, site: &str, from: &str, to: Rid, status: u16) -> Result<()> {
+    pub fn add_redirect(
+        &mut self,
+        site: &str,
+        from: &str,
+        to: EntityId,
+        status: u16,
+    ) -> Result<()> {
         entity::check_site(site)?;
         entity::check_path(from)?;
         if !matches!(status, 301 | 302 | 307 | 308) {
@@ -2182,7 +2202,7 @@ impl ContentTx<'_, '_> {
             return Err(Error::AlreadyExists { what: "path" });
         }
         let entry = RouteEntry {
-            entity: Rid::from_bytes([0; 16]),
+            entity: EntityId::from_bytes([0; 16]),
             revision: 0,
             kind: RouteKind::Gone,
             visibility: Visibility::Public,
@@ -2221,7 +2241,7 @@ impl ContentTx<'_, '_> {
     ///
     /// [`Error::Invalid`] when the entity does not exist or there are more
     /// than 16 authors.
-    pub fn set_authors(&mut self, rid: Rid, authors: &[AccountId]) -> Result<()> {
+    pub fn set_authors(&mut self, rid: EntityId, authors: &[AccountId]) -> Result<()> {
         let mut head = self.head(rid)?;
         let mut list = Vec::with_capacity(authors.len());
         for author in authors {
@@ -2242,7 +2262,7 @@ impl ContentTx<'_, '_> {
     /// # Errors
     ///
     /// As [`schedule_in`](Self::schedule_in).
-    pub fn schedule(&mut self, rid: Rid, action: Action, at: SystemTime) -> Result<()> {
+    pub fn schedule(&mut self, rid: EntityId, action: Action, at: SystemTime) -> Result<()> {
         let locale = self.head(rid)?.base().locale;
         self.schedule_in(rid, locale, action, at)
     }
@@ -2262,7 +2282,7 @@ impl ContentTx<'_, '_> {
     /// has no such translation, or `at` is before 1970.
     pub fn schedule_in(
         &mut self,
-        rid: Rid,
+        rid: EntityId,
         locale: Locale,
         action: Action,
         at: SystemTime,
@@ -2287,7 +2307,7 @@ impl ContentTx<'_, '_> {
     /// # Errors
     ///
     /// As [`cancel_schedule_in`](Self::cancel_schedule_in).
-    pub fn cancel_schedule(&mut self, rid: Rid) -> Result<bool> {
+    pub fn cancel_schedule(&mut self, rid: EntityId) -> Result<bool> {
         let locale = self.head(rid)?.base().locale;
         self.cancel_schedule_in(rid, locale)
     }
@@ -2297,7 +2317,7 @@ impl ContentTx<'_, '_> {
     /// # Errors
     ///
     /// [`Error::Invalid`] when the entity does not exist.
-    pub fn cancel_schedule_in(&mut self, rid: Rid, locale: Locale) -> Result<bool> {
+    pub fn cancel_schedule_in(&mut self, rid: EntityId, locale: Locale) -> Result<bool> {
         let mut head = self.head(rid)?;
         let Some(variant) = head.variant_mut(locale) else {
             return Ok(false);
@@ -2311,7 +2331,13 @@ impl ContentTx<'_, '_> {
 
     /// Run the schedule `action` at `at` of `locale` of `rid`, if it is
     /// still there: drop it, then publish or unpublish.
-    pub(crate) fn fire(&mut self, rid: Rid, locale: Locale, action: Action, at: u64) -> Result<()> {
+    pub(crate) fn fire(
+        &mut self,
+        rid: EntityId,
+        locale: Locale,
+        action: Action,
+        at: u64,
+    ) -> Result<()> {
         if !self.clear_schedule(rid, locale, action, at)? {
             return Ok(());
         }
@@ -2330,7 +2356,7 @@ impl ContentTx<'_, '_> {
     /// still there; true when it was.
     pub(crate) fn clear_schedule(
         &mut self,
-        rid: Rid,
+        rid: EntityId,
         locale: Locale,
         action: Action,
         at: u64,
@@ -2387,7 +2413,7 @@ impl Content<'_> {
     ///
     /// [`Error::Storage`] when the store cannot be read, [`Error::Corrupt`]
     /// when a stored record fails its checks.
-    pub fn get(&self, rid: Rid) -> Result<Option<Entry>> {
+    pub fn get(&self, rid: EntityId) -> Result<Option<Entry>> {
         self.engine().published_in(rid, None, self.db.visible())
     }
 
@@ -2398,7 +2424,7 @@ impl Content<'_> {
     /// # Errors
     ///
     /// As [`get`](Self::get).
-    pub fn get_in(&self, rid: Rid, locale: Locale) -> Result<Option<Entry>> {
+    pub fn get_in(&self, rid: EntityId, locale: Locale) -> Result<Option<Entry>> {
         self.engine()
             .published_in(rid, Some(locale), self.db.visible())
     }
@@ -2409,7 +2435,7 @@ impl Content<'_> {
     /// # Errors
     ///
     /// As [`get`](Self::get).
-    pub fn draft_in(&self, rid: Rid, locale: Locale) -> Result<Option<Entry>> {
+    pub fn draft_in(&self, rid: EntityId, locale: Locale) -> Result<Option<Entry>> {
         self.engine().draft_in(rid, Some(locale), self.db.visible())
     }
 
@@ -2472,7 +2498,7 @@ impl Content<'_> {
     /// # Errors
     ///
     /// As [`get`](Self::get).
-    pub fn draft(&self, rid: Rid) -> Result<Option<Entry>> {
+    pub fn draft(&self, rid: EntityId) -> Result<Option<Entry>> {
         self.engine().draft_in(rid, None, self.db.visible())
     }
 
@@ -2481,7 +2507,7 @@ impl Content<'_> {
     /// # Errors
     ///
     /// As [`get`](Self::get).
-    pub fn revisions(&self, rid: Rid) -> Result<Vec<RevisionInfo>> {
+    pub fn revisions(&self, rid: EntityId) -> Result<Vec<RevisionInfo>> {
         self.engine().revisions(rid)
     }
 
@@ -2490,7 +2516,7 @@ impl Content<'_> {
     /// # Errors
     ///
     /// As [`get`](Self::get).
-    pub fn revision(&self, rid: Rid, n: u32) -> Result<Option<Entry>> {
+    pub fn revision(&self, rid: EntityId, n: u32) -> Result<Option<Entry>> {
         let engine = self.engine();
         let Some(head) = engine.head(rid)? else {
             return Ok(None);
@@ -2601,7 +2627,7 @@ impl Content<'_> {
     /// use nex_db::{Locale, Search};
     /// let db = nex_db::open("data/site")?;
     /// let hits = db.content().search(Locale::EN, &Search::new("rust tips").kind("post"))?;
-    /// let ids: Vec<_> = hits.items().iter().map(|h| h.rid()).collect();
+    /// let ids: Vec<_> = hits.items().iter().map(|h| h.entity()).collect();
     /// let entries = db.content().get_many(&ids, Locale::EN)?;
     /// # let _ = entries;
     /// # Ok(())
@@ -2648,7 +2674,7 @@ impl Content<'_> {
     ///
     /// [`Error::Invalid`] for more than 1,000 ids, and the errors of
     /// [`get`](Self::get).
-    pub fn get_many(&self, rids: &[Rid], locale: Locale) -> Result<Vec<Option<Entry>>> {
+    pub fn get_many(&self, rids: &[EntityId], locale: Locale) -> Result<Vec<Option<Entry>>> {
         if rids.len() > lists::MAX_PAGE {
             return Err(Error::invalid("ids", "at most 1,000"));
         }
@@ -2666,7 +2692,7 @@ impl Content<'_> {
     ///
     /// As [`ContentTx::set_sticky`], plus the errors of
     /// [`Database::commit`].
-    pub fn set_sticky(&self, rid: Rid, sticky: bool) -> Result<()> {
+    pub fn set_sticky(&self, rid: EntityId, sticky: bool) -> Result<()> {
         self.db.commit(|tx| {
             tx.content_of(self.engine.collection)
                 .set_sticky(rid, sticky)
@@ -2679,7 +2705,7 @@ impl Content<'_> {
     ///
     /// As [`ContentTx::add_redirect`], plus the errors of
     /// [`Database::commit`].
-    pub fn add_redirect(&self, site: &str, from: &str, to: Rid, status: u16) -> Result<()> {
+    pub fn add_redirect(&self, site: &str, from: &str, to: EntityId, status: u16) -> Result<()> {
         self.db.commit(|tx| {
             tx.content_of(self.engine.collection)
                 .add_redirect(site, from, to, status)
@@ -2717,9 +2743,39 @@ impl Content<'_> {
     /// # Errors
     ///
     /// As [`ContentTx::create`], plus the errors of [`Database::commit`].
-    pub fn create(&self, entity: Entity) -> Result<Rid> {
+    pub fn create(&self, entity: Entity) -> Result<EntityId> {
         self.db
             .commit(|tx| tx.content_of(self.engine.collection).create(entity.clone()))
+    }
+
+    /// Create an entity and publish it, in one commit: the shortest way to
+    /// store a page. [`get`](Self::get) and [`resolve`](Self::resolve) see
+    /// it once this returns. Use [`create`](Self::create) for a draft.
+    ///
+    /// ```
+    /// # #[cfg(feature = "content")]
+    /// # fn main() -> nex_db::Result<()> {
+    /// use nex_db::Entity;
+    /// # let dir = std::env::temp_dir().join(format!("nex-db-doc-put-{}", std::process::id()));
+    /// # let _ = std::fs::remove_dir_all(&dir);
+    /// let db = nex_db::open(&dir)?;
+    /// let id = db.content().put(Entity::new("page").field("title", "Hello").path("/hello"))?;
+    /// let page = db.content().get(id)?.expect("published");
+    /// assert_eq!(page.field("title").and_then(|v| v.as_text()), Some("Hello"));
+    /// # drop(db);
+    /// # let _ = std::fs::remove_dir_all(&dir);
+    /// # Ok(())
+    /// # }
+    /// # #[cfg(not(feature = "content"))]
+    /// # fn main() {}
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`ContentTx::put`], plus the errors of [`Database::commit`].
+    pub fn put(&self, entity: Entity) -> Result<EntityId> {
+        self.db
+            .commit(|tx| tx.content_of(self.engine.collection).put(entity.clone()))
     }
 
     /// Change a draft in its own commit. See [`ContentTx::save_draft`].
@@ -2728,7 +2784,7 @@ impl Content<'_> {
     ///
     /// As [`ContentTx::save_draft`], plus the errors of
     /// [`Database::commit`].
-    pub fn save_draft(&self, rid: Rid, patch: Patch) -> Result<()> {
+    pub fn save_draft(&self, rid: EntityId, patch: Patch) -> Result<()> {
         self.db.commit(|tx| {
             tx.content_of(self.engine.collection)
                 .save_draft(rid, patch.clone())
@@ -2742,7 +2798,7 @@ impl Content<'_> {
     ///
     /// As [`ContentTx::save_revision`], plus the errors of
     /// [`Database::commit`].
-    pub fn save_revision(&self, rid: Rid, message: &str) -> Result<u32> {
+    pub fn save_revision(&self, rid: EntityId, message: &str) -> Result<u32> {
         self.db.commit(|tx| {
             tx.content_of(self.engine.collection)
                 .save_revision(rid, message)
@@ -2754,7 +2810,7 @@ impl Content<'_> {
     /// # Errors
     ///
     /// As [`ContentTx::publish`], plus the errors of [`Database::commit`].
-    pub fn publish(&self, rid: Rid) -> Result<u32> {
+    pub fn publish(&self, rid: EntityId) -> Result<u32> {
         self.db
             .commit(|tx| tx.content_of(self.engine.collection).publish(rid))
     }
@@ -2764,7 +2820,7 @@ impl Content<'_> {
     /// # Errors
     ///
     /// As [`ContentTx::unpublish`], plus the errors of [`Database::commit`].
-    pub fn unpublish(&self, rid: Rid) -> Result<bool> {
+    pub fn unpublish(&self, rid: EntityId) -> Result<bool> {
         self.db
             .commit(|tx| tx.content_of(self.engine.collection).unpublish(rid))
     }
@@ -2774,7 +2830,7 @@ impl Content<'_> {
     /// # Errors
     ///
     /// As [`ContentTx::trash`], plus the errors of [`Database::commit`].
-    pub fn trash(&self, rid: Rid) -> Result<()> {
+    pub fn trash(&self, rid: EntityId) -> Result<()> {
         self.db
             .commit(|tx| tx.content_of(self.engine.collection).trash(rid))
     }
@@ -2784,7 +2840,7 @@ impl Content<'_> {
     /// # Errors
     ///
     /// As [`ContentTx::restore`], plus the errors of [`Database::commit`].
-    pub fn restore(&self, rid: Rid) -> Result<()> {
+    pub fn restore(&self, rid: EntityId) -> Result<()> {
         self.db
             .commit(|tx| tx.content_of(self.engine.collection).restore(rid))
     }
@@ -2794,7 +2850,7 @@ impl Content<'_> {
     /// # Errors
     ///
     /// As [`ContentTx::delete`], plus the errors of [`Database::commit`].
-    pub fn delete(&self, rid: Rid) -> Result<()> {
+    pub fn delete(&self, rid: EntityId) -> Result<()> {
         self.db
             .commit(|tx| tx.content_of(self.engine.collection).delete(rid))
     }
@@ -2807,7 +2863,7 @@ impl Content<'_> {
     /// # Errors
     ///
     /// As [`get`](Self::get).
-    pub fn referenced_by(&self, rid: Rid) -> Result<Vec<Rid>> {
+    pub fn referenced_by(&self, rid: EntityId) -> Result<Vec<EntityId>> {
         let mut out = self.engine().stored_referrers(rid)?;
         out.retain(|s| *s != rid);
         Ok(out)
@@ -2818,7 +2874,7 @@ impl Content<'_> {
     /// and section pages. An index read; read each with
     /// [`get`](Self::get) to serve only published ones.
     #[must_use]
-    pub fn children(&self, rid: Rid) -> Vec<Rid> {
+    pub fn children(&self, rid: EntityId) -> Vec<EntityId> {
         self.engine().tree.children(rid)
     }
 
@@ -2829,7 +2885,7 @@ impl Content<'_> {
     /// # Errors
     ///
     /// As [`get`](Self::get).
-    pub fn ancestors(&self, rid: Rid) -> Result<Vec<Rid>> {
+    pub fn ancestors(&self, rid: EntityId) -> Result<Vec<EntityId>> {
         let engine = self.engine();
         let mut out = Vec::new();
         let mut at = engine.head(rid)?.and_then(|h| h.parent);
@@ -2862,7 +2918,7 @@ impl Content<'_> {
     ///
     /// As [`ContentTx::schedule_in`], plus the errors of
     /// [`Database::commit`].
-    pub fn schedule(&self, rid: Rid, action: Action, at: SystemTime) -> Result<()> {
+    pub fn schedule(&self, rid: EntityId, action: Action, at: SystemTime) -> Result<()> {
         self.db.commit(|tx| {
             tx.content_of(self.engine.collection)
                 .schedule(rid, action, at)
@@ -2901,7 +2957,7 @@ impl Content<'_> {
     ///
     /// As [`ContentTx::set_parent`], plus the errors of
     /// [`Database::commit`].
-    pub fn set_parent(&self, rid: Rid, parent: Option<Rid>) -> Result<()> {
+    pub fn set_parent(&self, rid: EntityId, parent: Option<EntityId>) -> Result<()> {
         self.db.commit(|tx| {
             tx.content_of(self.engine.collection)
                 .set_parent(rid, parent)
@@ -2915,7 +2971,7 @@ impl Content<'_> {
     ///
     /// As [`ContentTx::set_authors`], plus the errors of
     /// [`Database::commit`].
-    pub fn set_authors(&self, rid: Rid, authors: &[AccountId]) -> Result<()> {
+    pub fn set_authors(&self, rid: EntityId, authors: &[AccountId]) -> Result<()> {
         self.db.commit(|tx| {
             tx.content_of(self.engine.collection)
                 .set_authors(rid, authors)
@@ -2927,7 +2983,7 @@ impl Content<'_> {
     /// # Errors
     ///
     /// As [`ContentTx::set_path`], plus the errors of [`Database::commit`].
-    pub fn set_path(&self, rid: Rid, path: &str) -> Result<()> {
+    pub fn set_path(&self, rid: EntityId, path: &str) -> Result<()> {
         self.db
             .commit(|tx| tx.content_of(self.engine.collection).set_path(rid, path))
     }
@@ -2996,7 +3052,7 @@ impl ContentRead<'_> {
     ///
     /// [`Error::SnapshotTooOld`] past the snapshot age limit, and the errors
     /// of [`Content::get`].
-    pub fn get(&self, rid: Rid) -> Result<Option<Entry>> {
+    pub fn get(&self, rid: EntityId) -> Result<Option<Entry>> {
         let at = self.at()?;
         self.engine.published_in(rid, None, at)
     }
@@ -3006,7 +3062,7 @@ impl ContentRead<'_> {
     /// # Errors
     ///
     /// As [`get`](Self::get).
-    pub fn get_in(&self, rid: Rid, locale: Locale) -> Result<Option<Entry>> {
+    pub fn get_in(&self, rid: EntityId, locale: Locale) -> Result<Option<Entry>> {
         let at = self.at()?;
         self.engine.published_in(rid, Some(locale), at)
     }
@@ -3016,7 +3072,7 @@ impl ContentRead<'_> {
     /// # Errors
     ///
     /// As [`get`](Self::get).
-    pub fn draft(&self, rid: Rid) -> Result<Option<Entry>> {
+    pub fn draft(&self, rid: EntityId) -> Result<Option<Entry>> {
         let at = self.at()?;
         self.engine.draft_in(rid, None, at)
     }
@@ -3053,7 +3109,7 @@ mod tests {
     use super::*;
 
     /// A section that publishes `rid` with title `n` as revision `n`.
-    fn publish_section(rid: Rid, n: u32) -> Vec<u8> {
+    fn publish_section(rid: EntityId, n: u32) -> Vec<u8> {
         let mut head = Entity::new("page")
             .field("title", n.to_string().as_str())
             .into_head(rid, 1, Locale::EN)
@@ -3095,7 +3151,7 @@ mod tests {
             .unwrap();
     }
 
-    fn title_at(engine: &ContentEngine, rid: Rid, at: Seq) -> Option<String> {
+    fn title_at(engine: &ContentEngine, rid: EntityId, at: Seq) -> Option<String> {
         engine.published_in(rid, None, at).unwrap().and_then(|e| {
             e.field("title")
                 .and_then(|v| v.as_text())
@@ -3117,7 +3173,7 @@ mod tests {
         ));
         {
             let engine = ContentEngine::open(&dir, 2, Arc::default()).unwrap();
-            let rid = Rid::from_bytes([5; 16]);
+            let rid = EntityId::from_bytes([5; 16]);
             apply_section(&engine, 1, &publish_section(rid, 1));
             engine.reclaim(1);
             apply_section(&engine, 2, &publish_section(rid, 2));
@@ -3140,7 +3196,7 @@ mod tests {
 
     #[test]
     fn test_entity_key_array_matches_entity_key() {
-        let rid = Rid::from_bytes([7; 16]);
+        let rid = EntityId::from_bytes([7; 16]);
         assert_eq!(entity_key_array(3, rid).to_vec(), entity_key(3, rid));
     }
 
@@ -3151,7 +3207,7 @@ mod tests {
 
     #[test]
     fn test_keys_start_with_their_prefixes() {
-        let rid = Rid::from_bytes([4; 16]);
+        let rid = EntityId::from_bytes([4; 16]);
         assert!(entity_key(2, rid).starts_with(&entity_prefix(2)));
         assert!(!entity_key(2, rid).starts_with(META_APPLIED));
         assert!(revision_key(2, rid, 7).starts_with(&revision_prefix(2, rid)));
@@ -3174,8 +3230,8 @@ mod tests {
             std::process::id(),
             now_ms()
         ));
-        let rid = Rid::from_bytes([6; 16]);
-        let home = Rid::from_bytes([7; 16]);
+        let rid = EntityId::from_bytes([6; 16]);
+        let home = EntityId::from_bytes([7; 16]);
         let record = Entity::new("page")
             .field("title", "Old")
             .field("up", home)

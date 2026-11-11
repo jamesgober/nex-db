@@ -3,7 +3,8 @@
 use std::{path::PathBuf, sync::Arc, thread, time::Duration};
 
 use nex_db::{
-    Database, Entity, Error, Login, RevokeReason, SessionSpec, SignIn, Standing, Validation, Value,
+    Database, Entity, Error, PasswordCheck, RevokeReason, SessionSpec, SignIn, Standing,
+    Validation, Value,
 };
 
 struct TempDir(PathBuf);
@@ -31,7 +32,7 @@ impl Drop for TempDir {
 const PASSWORD: &str = "correct horse battery staple";
 
 /// Create `entity` and publish it in one commit.
-fn publish(db: &Database, entity: Entity) -> nex_db::Result<nex_db::Rid> {
+fn publish(db: &Database, entity: Entity) -> nex_db::Result<nex_db::EntityId> {
     db.commit(|tx| {
         let rid = tx.content().create(entity.clone())?;
         let _ = tx.content().publish(rid)?;
@@ -463,7 +464,7 @@ fn test_ban_ends_sessions_and_blocks_sign_in_only_with_the_right_password() {
         db.auth()
             .verify_password("ann@example.com", "wrong")
             .unwrap(),
-        Login::Failed
+        PasswordCheck::Failed
     );
     drop(db);
 
@@ -478,7 +479,7 @@ fn test_ban_ends_sessions_and_blocks_sign_in_only_with_the_right_password() {
         db.auth()
             .verify_password("ann@example.com", "right pw")
             .unwrap(),
-        Login::Verified(ann)
+        PasswordCheck::Verified(ann)
     );
     assert_eq!(
         db.auth()
@@ -503,7 +504,7 @@ fn test_ten_failures_lock_the_account_out() {
             db.auth()
                 .verify_password("ann@example.com", "wrong")
                 .unwrap(),
-            Login::Failed
+            PasswordCheck::Failed
         );
     }
     // Nine failures: still open.
@@ -516,7 +517,7 @@ fn test_ten_failures_lock_the_account_out() {
         db.auth()
             .verify_password("ann@example.com", "wrong")
             .unwrap(),
-        Login::Failed
+        PasswordCheck::Failed
     );
     assert!(matches!(
         db.auth().standing(ann).unwrap(),
@@ -530,7 +531,7 @@ fn test_ten_failures_lock_the_account_out() {
         db.auth()
             .verify_password("ann@example.com", "right pw")
             .unwrap(),
-        Login::LockedOut { until: Some(_) }
+        PasswordCheck::LockedOut { until: Some(_) }
     ));
 }
 
@@ -841,7 +842,7 @@ fn test_identifiers_can_be_added_and_removed_but_not_the_last() {
     let signed_in = |id: &str| {
         matches!(
             db.auth().verify_password(id, PASSWORD).unwrap(),
-            Login::Verified(a) if a == ann
+            PasswordCheck::Verified(a) if a == ann
         )
     };
     assert!(signed_in("ann.work@example.com"));
@@ -863,11 +864,11 @@ fn test_identifiers_can_be_added_and_removed_but_not_the_last() {
     let db = Database::open(&dir.0).unwrap();
     assert!(matches!(
         db.auth().verify_password("ann@example.com", PASSWORD).unwrap(),
-        Login::Verified(a) if a == bob
+        PasswordCheck::Verified(a) if a == bob
     ));
     assert!(matches!(
         db.auth().verify_password("ann.work@example.com", PASSWORD).unwrap(),
-        Login::Verified(a) if a == ann
+        PasswordCheck::Verified(a) if a == ann
     ));
 }
 
@@ -900,13 +901,13 @@ fn test_set_password_ends_sessions_and_changes_the_password() {
         db.auth()
             .verify_password("ann@example.com", PASSWORD)
             .unwrap(),
-        Login::Failed
+        PasswordCheck::Failed
     );
     assert!(matches!(
         db.auth()
             .verify_password("ann@example.com", "a new long password")
             .unwrap(),
-        Login::Verified(_)
+        PasswordCheck::Verified(_)
     ));
 }
 
@@ -1238,7 +1239,7 @@ fn test_totp_second_factor_signs_in_once_per_code() {
         db.auth()
             .verify_password("ann@example.com", PASSWORD)
             .unwrap(),
-        Login::NeedsSecondFactor { account: ann }
+        PasswordCheck::NeedsSecondFactor { account: ann }
     );
     let SignIn::NeedsSecondFactor { challenge } = db
         .auth()

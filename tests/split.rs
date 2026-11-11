@@ -11,7 +11,7 @@ use std::{
 };
 
 use nex_db::{
-    ApiKeyCheck, AuthMode, Change, Database, Entity, Error, Health, Keys, Login, Purpose,
+    ApiKeyCheck, AuthMode, Change, Database, Entity, Error, Health, Keys, PasswordCheck, Purpose,
     RealmPolicy, RestorePoint, RevokeReason, Role, SessionSpec, SignIn, Standing, Validation,
 };
 
@@ -186,12 +186,12 @@ fn test_sessions_revoke_and_standing() {
         db.auth()
             .verify_password("ann@example.com", "wrong")
             .unwrap(),
-        Login::Failed
+        PasswordCheck::Failed
     );
     db.auth().set_standing(ann, Standing::Active, None).unwrap();
     assert!(matches!(
         db.auth().verify_password("ann@example.com", PASSWORD).unwrap(),
-        Login::Verified(a) if a == ann
+        PasswordCheck::Verified(a) if a == ann
     ));
 
     // Single-use tokens and identifiers.
@@ -273,7 +273,7 @@ fn test_lock_out_after_failures() {
                 db.auth()
                     .verify_password("ann@example.com", "wrong")
                     .unwrap(),
-                Login::Failed
+                PasswordCheck::Failed
             );
         }
         assert!(matches!(
@@ -737,7 +737,7 @@ fn test_totp_and_passkey_challenges() {
         db.auth()
             .verify_password("ann@example.com", PASSWORD)
             .unwrap(),
-        Login::NeedsSecondFactor { account: ann }
+        PasswordCheck::NeedsSecondFactor { account: ann }
     );
     let SignIn::NeedsSecondFactor { challenge } = sign_in(&db, "ann@example.com") else {
         panic!("needs a second factor");

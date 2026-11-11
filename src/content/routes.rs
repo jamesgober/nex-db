@@ -82,12 +82,12 @@ mod tests {
     use super::*;
     use crate::{
         content::entity::{RouteKind, Visibility},
-        ids::Rid,
+        ids::EntityId,
     };
 
     fn entry(revision: u32) -> RouteEntry {
         RouteEntry {
-            entity: Rid::from_bytes([1; 16]),
+            entity: EntityId::from_bytes([1; 16]),
             revision,
             kind: RouteKind::Page,
             visibility: Visibility::Public,

@@ -46,8 +46,8 @@ use self::{
     sessions::{EpochTable, SessionTable, Slot},
     token::Token,
     types::{
-        HashedPassword, Login, Payload, Purpose, RevokeReason, Session, SessionSpec, SignIn,
-        Standing, Validation, ms_of, time_of,
+        HashedPassword, PasswordCheck, Payload, Purpose, RevokeReason, Session, SessionSpec,
+        SignIn, Standing, Validation, ms_of, time_of,
     },
 };
 use crate::{
@@ -4679,6 +4679,38 @@ impl Auth<'_> {
         })
     }
 
+    /// Create an account from a password: [`hash_password`](Self::hash_password),
+    /// then [`create_account`](Self::create_account) in its own commit. To
+    /// create the account in a commit with other changes, hash first and
+    /// call [`AuthTx::create_account`] in the transaction.
+    ///
+    /// ```
+    /// # #[cfg(feature = "auth")]
+    /// # fn main() -> nex_db::Result<()> {
+    /// use nex_db::{SessionSpec, SignIn};
+    /// # let dir = std::env::temp_dir().join(format!("nex-db-doc-sign-up-{}", std::process::id()));
+    /// # let _ = std::fs::remove_dir_all(&dir);
+    /// let db = nex_db::open(&dir)?;
+    /// let account = db.auth().sign_up("ann@example.com", "correct horse battery staple")?;
+    /// let signed_in = db.auth().sign_in("ann@example.com", "correct horse battery staple", SessionSpec::web())?;
+    /// assert!(matches!(signed_in, SignIn::Success { account: a, .. } if a == account));
+    /// # drop(db);
+    /// # let _ = std::fs::remove_dir_all(&dir);
+    /// # Ok(())
+    /// # }
+    /// # #[cfg(not(feature = "auth"))]
+    /// # fn main() {}
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`hash_password`](Self::hash_password) and
+    /// [`create_account`](Self::create_account).
+    pub fn sign_up(&self, identifier: &str, password: &str) -> Result<AccountId> {
+        let hashed = self.hash_password(password)?;
+        self.create_account(identifier, &hashed)
+    }
+
     /// Issue a session in its own commit. See [`AuthTx::issue_session`].
     ///
     /// # Errors
@@ -4885,18 +4917,18 @@ impl Auth<'_> {
     /// - The errors of [`Database::commit`] when issuing the session.
     pub fn sign_in(&self, identifier: &str, password: &str, spec: SessionSpec) -> Result<SignIn> {
         match self.verify_password(identifier, password)? {
-            Login::Verified(account) => {
+            PasswordCheck::Verified(account) => {
                 let token = self.issue_session(account, spec)?;
                 Ok(SignIn::Success { account, token })
             }
-            Login::NeedsSecondFactor { account } => {
+            PasswordCheck::NeedsSecondFactor { account } => {
                 let challenge = self.db.commit(|tx| {
                     tx.auth_of(self.engine.collection())
                         .stage_challenge(account)
                 })?;
                 Ok(SignIn::NeedsSecondFactor { challenge })
             }
-            Login::LockedOut { until } => Ok(SignIn::LockedOut { until }),
+            PasswordCheck::LockedOut { until } => Ok(SignIn::LockedOut { until }),
             _ => Ok(SignIn::Failed),
         }
     }
@@ -5120,7 +5152,7 @@ impl Auth<'_> {
     /// a session. Failures are counted per account: ten within fifteen
     /// minutes lock the account out for fifteen minutes, in a durable commit.
     /// An unknown identifier costs the same work as a wrong password, and
-    /// both give [`Login::Failed`].
+    /// both give [`PasswordCheck::Failed`].
     ///
     /// # Errors
     ///
@@ -5128,19 +5160,19 @@ impl Auth<'_> {
     ///   bytes.
     /// - [`Error::Busy`] when the hashing slots are full.
     /// - The errors of [`Database::commit`] when a lock-out is written.
-    pub fn verify_password(&self, identifier: &str, password: &str) -> Result<Login> {
+    pub fn verify_password(&self, identifier: &str, password: &str) -> Result<PasswordCheck> {
         let engine = self.engine();
         match engine.check(identifier, password)? {
             Checked::Verified(account) => {
                 engine.clear_failures(account)?;
                 if engine.needs_second_factor(account)? {
-                    return Ok(Login::NeedsSecondFactor { account });
+                    return Ok(PasswordCheck::NeedsSecondFactor { account });
                 }
-                Ok(Login::Verified(account))
+                Ok(PasswordCheck::Verified(account))
             }
             Checked::Blocked(until) => {
                 self.db.observers().security(SecurityEvent::SignInBlocked);
-                Ok(Login::LockedOut { until })
+                Ok(PasswordCheck::LockedOut { until })
             }
             Checked::Wrong(Some(account)) => {
                 let observers = self.db.observers();
@@ -5158,13 +5190,13 @@ impl Auth<'_> {
                     engine.clear_failures(account)?;
                     observers.security(SecurityEvent::LockedOut { account });
                 }
-                Ok(Login::Failed)
+                Ok(PasswordCheck::Failed)
             }
             Checked::Wrong(None) => {
                 self.db
                     .observers()
                     .security(SecurityEvent::SignInFailed { account: None });
-                Ok(Login::Failed)
+                Ok(PasswordCheck::Failed)
             }
         }
     }
@@ -5840,7 +5872,7 @@ mod tests {
         {
             let db = crate::open(&dir).unwrap();
             let bo = match db.auth().verify_password("bo@example.com", "pw").unwrap() {
-                Login::Verified(bo) => bo,
+                PasswordCheck::Verified(bo) => bo,
                 other => panic!("{other:?}"),
             };
             let _ = db.auth().issue_session(bo, SessionSpec::web()).unwrap();

@@ -473,7 +473,7 @@ pub enum SignIn {
 /// sign-in without a new session.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Login {
+pub enum PasswordCheck {
     /// The password matched and the account may sign in.
     Verified(AccountId),
     /// The identifier or the password is wrong.
@@ -491,6 +491,10 @@ pub enum Login {
         account: AccountId,
     },
 }
+
+/// The name of [`PasswordCheck`] before 0.8.
+#[deprecated(since = "0.8.0", note = "renamed to `PasswordCheck`")]
+pub type Login = PasswordCheck;
 
 /// Whether an account may sign in.
 ///

@@ -6,7 +6,7 @@ use super::locale::Locale;
 use crate::{
     core::codec::{Reader, Writer},
     error::{Error, Result},
-    ids::{AccountId, Rid},
+    ids::{AccountId, EntityId},
 };
 
 /// The site an entity's path belongs to when [`Entity::site`] is not called.
@@ -79,7 +79,7 @@ pub enum Value {
     /// reads the auth engine.
     Account(AccountId),
     /// A reference to another entity.
-    Entity(Rid),
+    Entity(EntityId),
     /// A list of values, none of them a list, at most 1,000: tags, related
     /// entities, several accounts. Each [`Value::Entity`] in it is a
     /// reference.
@@ -125,7 +125,7 @@ impl Value {
 
     /// The entity, when this is [`Value::Entity`].
     #[must_use]
-    pub const fn as_entity(&self) -> Option<Rid> {
+    pub const fn as_entity(&self) -> Option<EntityId> {
         match self {
             Value::Entity(v) => Some(*v),
             _ => None,
@@ -142,8 +142,8 @@ impl Value {
     }
 
     /// The entities this value refers to: itself, or those in a list.
-    pub(crate) fn refs(&self) -> impl Iterator<Item = Rid> + '_ {
-        let (one, many): (Option<Rid>, &[Value]) = match self {
+    pub(crate) fn refs(&self) -> impl Iterator<Item = EntityId> + '_ {
+        let (one, many): (Option<EntityId>, &[Value]) = match self {
             Value::Entity(rid) => (Some(*rid), &[]),
             Value::List(values) => (None, values),
             _ => (None, &[]),
@@ -159,16 +159,16 @@ impl From<Vec<Value>> for Value {
     }
 }
 
-impl From<&[Rid]> for Value {
+impl From<&[EntityId]> for Value {
     /// A list of references.
-    fn from(v: &[Rid]) -> Self {
+    fn from(v: &[EntityId]) -> Self {
         Value::List(v.iter().copied().map(Value::Entity).collect())
     }
 }
 
-impl<const N: usize> From<[Rid; N]> for Value {
+impl<const N: usize> From<[EntityId; N]> for Value {
     /// A list of references.
-    fn from(v: [Rid; N]) -> Self {
+    fn from(v: [EntityId; N]) -> Self {
         Value::from(&v[..])
     }
 }
@@ -209,8 +209,8 @@ impl From<AccountId> for Value {
     }
 }
 
-impl From<Rid> for Value {
-    fn from(v: Rid) -> Self {
+impl From<EntityId> for Value {
+    fn from(v: EntityId) -> Self {
         Value::Entity(v)
     }
 }
@@ -235,7 +235,7 @@ pub struct Entity {
     locale: Option<Locale>,
     fields: Vec<(String, Value)>,
     authors: Vec<AccountId>,
-    parent: Option<Rid>,
+    parent: Option<EntityId>,
     order: i64,
     sticky: bool,
 }
@@ -281,7 +281,7 @@ impl Entity {
     /// ([`Content::children`](crate::Content::children)). The parent is a
     /// reference: it cannot be deleted while it has children.
     #[must_use]
-    pub fn parent(mut self, parent: Rid) -> Self {
+    pub fn parent(mut self, parent: EntityId) -> Self {
         self.parent = Some(parent);
         self
     }
@@ -338,7 +338,7 @@ impl Entity {
     /// locale (or `default_locale`) with nothing published.
     pub(crate) fn into_head(
         self,
-        rid: Rid,
+        rid: EntityId,
         created_ms: u64,
         default_locale: Locale,
     ) -> Result<Head> {
@@ -380,7 +380,7 @@ impl Entity {
 
     /// The record 0.1 to 0.3 stored for `rid` (tests read it back).
     #[cfg(test)]
-    pub(crate) fn encode_v1(&self, rid: Rid, created_ms: u64) -> Result<Vec<u8>> {
+    pub(crate) fn encode_v1(&self, rid: EntityId, created_ms: u64) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         let mut w = Writer::new(&mut out);
         w.u8(RECORD_FORMAT);
@@ -506,7 +506,7 @@ fn read_value(r: &mut Reader<'_>, at: u64, list: bool) -> Result<Value> {
             _ => return Err(Error::corrupt("an entity bool field", at)),
         },
         TAG_ACCOUNT => Value::Account(AccountId::from_bytes(r.fixed()?)),
-        TAG_ENTITY => Value::Entity(Rid::from_bytes(r.fixed()?)),
+        TAG_ENTITY => Value::Entity(EntityId::from_bytes(r.fixed()?)),
         TAG_LIST if list => {
             let count = usize::from(r.u16()?);
             if count > MAX_LIST {
@@ -594,13 +594,13 @@ pub(crate) struct Body {
 
 impl Body {
     /// The entities the body's fields refer to, in field order.
-    pub(crate) fn refs(&self) -> impl Iterator<Item = Rid> + '_ {
+    pub(crate) fn refs(&self) -> impl Iterator<Item = EntityId> + '_ {
         self.fields.iter().flat_map(|(_, v)| v.refs())
     }
 
     /// Drop every field that is a reference to `target`, and `target` from
     /// every list; true when anything was dropped.
-    pub(crate) fn detach(&mut self, target: Rid) -> bool {
+    pub(crate) fn detach(&mut self, target: EntityId) -> bool {
         let before = self.fields.clone();
         self.fields.retain(|(_, v)| *v != Value::Entity(target));
         for (_, value) in &mut self.fields {
@@ -612,7 +612,7 @@ impl Body {
     }
 
     /// The names of the fields referring to `target`, alone or in a list.
-    pub(crate) fn fields_referring(&self, target: Rid) -> impl Iterator<Item = &str> + '_ {
+    pub(crate) fn fields_referring(&self, target: EntityId) -> impl Iterator<Item = &str> + '_ {
         self.fields
             .iter()
             .filter(move |(_, v)| v.refs().any(|r| r == target))
@@ -747,12 +747,12 @@ pub(crate) struct Published {
     pub(crate) at_ms: u64,
     pub(crate) path: Option<String>,
     /// The entities the published body refers to, sorted, each once.
-    pub(crate) refs: Vec<Rid>,
+    pub(crate) refs: Vec<EntityId>,
 }
 
 /// `refs` sorted, each once.
-pub(crate) fn ref_set(refs: impl Iterator<Item = Rid>) -> Vec<Rid> {
-    let mut out: Vec<Rid> = refs.collect();
+pub(crate) fn ref_set(refs: impl Iterator<Item = EntityId>) -> Vec<EntityId> {
+    let mut out: Vec<EntityId> = refs.collect();
     out.sort_unstable();
     out.dedup();
     out
@@ -776,7 +776,7 @@ pub(crate) struct Variant {
 /// revision). The first variant is the entity's own locale.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Head {
-    pub(crate) rid: Rid,
+    pub(crate) rid: EntityId,
     pub(crate) kind: String,
     pub(crate) site: String,
     pub(crate) created_ms: u64,
@@ -793,7 +793,7 @@ pub(crate) struct Head {
     /// Its authors, in order, shared by every locale.
     pub(crate) authors: Vec<AccountId>,
     /// Its parent in the page tree.
-    pub(crate) parent: Option<Rid>,
+    pub(crate) parent: Option<EntityId>,
     /// Its place among its parent's children.
     pub(crate) order: i64,
     /// Listed first by sticky-first listings.
@@ -837,7 +837,7 @@ impl Head {
 
     /// Every entity the head refers to: from each locale's draft and
     /// published body, sorted, each once.
-    pub(crate) fn refs(&self) -> Vec<Rid> {
+    pub(crate) fn refs(&self) -> Vec<EntityId> {
         ref_set(
             self.variants
                 .iter()
@@ -931,7 +931,7 @@ impl Head {
         let mut r = Reader::new(bytes, "an entity record", at);
         match r.u8()? {
             RECORD_FORMAT => {
-                let rid = Rid::from_bytes(r.fixed()?);
+                let rid = EntityId::from_bytes(r.fixed()?);
                 let created_ms = r.u64()?;
                 let revision = r.u32()?;
                 let kind = r.str16()?.to_owned();
@@ -971,7 +971,7 @@ impl Head {
             }
             format @ (HEAD_FORMAT_2 | HEAD_FORMAT_3 | HEAD_FORMAT_4 | HEAD_FORMAT_5
             | HEAD_FORMAT) => {
-                let rid = Rid::from_bytes(r.fixed()?);
+                let rid = EntityId::from_bytes(r.fixed()?);
                 let created_ms = r.u64()?;
                 let updated_ms = r.u64()?;
                 let kind = r.str16()?.to_owned();
@@ -994,7 +994,7 @@ impl Head {
                     let mut refs = Vec::new();
                     if format != HEAD_FORMAT_2 {
                         for _ in 0..r.u16()? {
-                            refs.push(Rid::from_bytes(r.fixed()?));
+                            refs.push(EntityId::from_bytes(r.fixed()?));
                         }
                     }
                     let draft_path = Some(r.str16()?.to_owned()).filter(|p| !p.is_empty());
@@ -1042,7 +1042,7 @@ impl Head {
                     }
                     parent = match r.u8()? {
                         0 => None,
-                        1 => Some(Rid::from_bytes(r.fixed()?)),
+                        1 => Some(EntityId::from_bytes(r.fixed()?)),
                         _ => return Err(Error::corrupt("an entity's parent", at)),
                     };
                     order = r.i64()?;
@@ -1274,8 +1274,8 @@ pub(crate) fn decode_route(bytes: &[u8], at: u64) -> Result<RouteEntry> {
     }
     let kind = r.u8()?;
     let status = r.u16()?;
-    let target = Rid::from_bytes(r.fixed()?);
-    let entity = Rid::from_bytes(r.fixed()?);
+    let target = EntityId::from_bytes(r.fixed()?);
+    let entity = EntityId::from_bytes(r.fixed()?);
     let revision = r.u32()?;
     let visibility = Visibility::of(r.u8()?, at)?;
     let locale = Locale::read(&mut r, at)?;
@@ -1320,7 +1320,7 @@ pub(crate) fn check_name(what: &'static str, name: &str) -> Result<()> {
 /// Cloning is cheap: the type, route, fields, and authors are shared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
-    rid: Rid,
+    rid: EntityId,
     created_ms: u64,
     updated_ms: u64,
     revision: u32,
@@ -1331,7 +1331,7 @@ pub struct Entry {
     first_published_ms: u64,
     locale: Locale,
     fallback: Option<Locale>,
-    parent: Option<Rid>,
+    parent: Option<EntityId>,
     order: i64,
     sticky: bool,
     schedule: Option<(Action, u64)>,
@@ -1363,7 +1363,7 @@ impl Entry {
 
     /// The entity's parent in the page tree, if it has one.
     #[must_use]
-    pub const fn parent(&self) -> Option<Rid> {
+    pub const fn parent(&self) -> Option<EntityId> {
         self.parent
     }
 
@@ -1392,9 +1392,16 @@ impl Entry {
         self.fallback
     }
 
-    /// The entity's record id.
+    /// The entity's id.
     #[must_use]
-    pub const fn rid(&self) -> Rid {
+    pub const fn id(&self) -> EntityId {
+        self.rid
+    }
+
+    /// The entity's id: the name of [`id`](Self::id) before 0.8.
+    #[deprecated(since = "0.8.0", note = "renamed to `id`")]
+    #[must_use]
+    pub const fn rid(&self) -> EntityId {
         self.rid
     }
 
@@ -1483,7 +1490,7 @@ pub enum RouteKind {
     /// [`Entry::route`] gives.
     Redirect {
         /// The entity the path now belongs to.
-        to: Rid,
+        to: EntityId,
         /// The HTTP status: 301, 302, 307, or 308.
         status: u16,
     },
@@ -1495,7 +1502,7 @@ pub enum RouteKind {
 /// it. Resolving allocates nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RouteEntry {
-    pub(crate) entity: Rid,
+    pub(crate) entity: EntityId,
     pub(crate) revision: u32,
     pub(crate) kind: RouteKind,
     pub(crate) visibility: Visibility,
@@ -1509,7 +1516,7 @@ pub struct RouteEntry {
 impl RouteEntry {
     /// The entity the path names.
     #[must_use]
-    pub const fn entity(&self) -> Rid {
+    pub const fn entity(&self) -> EntityId {
         self.entity
     }
 
@@ -1543,8 +1550,8 @@ impl RouteEntry {
 mod tests {
     use super::*;
 
-    fn rid() -> Rid {
-        Rid::from_bytes([9; 16])
+    fn rid() -> EntityId {
+        EntityId::from_bytes([9; 16])
     }
 
     #[test]
@@ -1556,7 +1563,7 @@ mod tests {
             .field("public", true)
             .field("account", account)
             .field("parent", rid())
-            .field("tags", [rid(), Rid::from_bytes([8; 16])])
+            .field("tags", [rid(), EntityId::from_bytes([8; 16])])
             .site("example.com")
             .path("/u/ann");
         let mut head = entity.into_head(rid(), 5, Locale::EN).unwrap();
@@ -1571,7 +1578,7 @@ mod tests {
             .unwrap();
         head.last_revision = 3;
         head.authors = vec![account];
-        head.parent = Some(Rid::from_bytes([4; 16]));
+        head.parent = Some(EntityId::from_bytes([4; 16]));
         head.order = -7;
         head.sticky = true;
         head.variants[1].schedule = Some((Action::Unpublish, 99));
@@ -1581,7 +1588,7 @@ mod tests {
         let entry = back.entry(Locale::EN, 2, back.base().draft.clone(), Some(fr));
         assert_eq!(entry.fallback(), Some(fr));
         assert_eq!(back.variant(fr).map(|v| v.source), Some(2));
-        assert_eq!(entry.rid(), rid());
+        assert_eq!(entry.id(), rid());
         assert_eq!(entry.kind(), "profile");
         assert_eq!(entry.revision(), 2);
         assert_eq!(entry.route(), Some(("example.com", "/u/ann")));
@@ -1685,7 +1692,7 @@ mod tests {
         for kind in [
             RouteKind::Page,
             RouteKind::Redirect {
-                to: Rid::from_bytes([3; 16]),
+                to: EntityId::from_bytes([3; 16]),
                 status: 301,
             },
             RouteKind::Gone,

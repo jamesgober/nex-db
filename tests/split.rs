@@ -720,6 +720,61 @@ fn base32_decode(text: &str) -> Vec<u8> {
     out
 }
 
+/// Every reply reaches the request that asked for it, whichever request
+/// read it off the pipe: sixteen threads, each checking its own session,
+/// so a reply handed to the wrong request names the wrong account.
+fn test_replies_reach_their_own_requests() {
+    let t = TempDir::new("replies");
+    let db = split(&t.at("db"));
+    let people: Vec<(nex_db::AccountId, nex_db::Token)> = (0..16)
+        .map(|i| {
+            let who = format!("user{i}@example.com");
+            let account = sign_up(&db, &who);
+            let token = db
+                .auth()
+                .issue_session(account, SessionSpec::web())
+                .unwrap();
+            (account, token)
+        })
+        .collect();
+    std::thread::scope(|s| {
+        for (account, token) in &people {
+            let db = &db;
+            let _ = s.spawn(move || {
+                for n in 0..500 {
+                    let session = db.auth().validate(token).unwrap().session();
+                    assert_eq!(session.map(|s| s.account()), Some(*account), "round {n}");
+                    if n % 100 == 0 {
+                        // Another kind of request in between.
+                        let _ = db.auth().standing(*account).unwrap();
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// An auth process that ends while no request is waiting still stops
+/// writes: the watchdog sees it within its interval.
+fn test_an_idle_auth_process_that_ends_stops_writes() {
+    let t = TempDir::new("idle");
+    let db = split(&t.at("db"));
+    let _ = sign_up(&db, "ann@example.com");
+    kill(db.auth_process_id().unwrap());
+    let started = std::time::Instant::now();
+    while !matches!(db.health(), Health::ReadOnly { .. }) {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "writes did not stop after the auth process ended"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(matches!(
+        db.content().create(Entity::new("page").path("/b")),
+        Err(Error::Storage { .. })
+    ));
+}
+
 #[cfg(feature = "mfa")]
 fn test_totp_and_passkey_challenges() {
     let t = TempDir::new("mfa");
@@ -856,6 +911,14 @@ const TESTS: &[Test] = &[
         test_a_killed_auth_process_fails_calls_and_stops_writes,
     ),
     ("threads_share_the_channel", test_threads_share_the_channel),
+    (
+        "replies_reach_their_own_requests",
+        test_replies_reach_their_own_requests,
+    ),
+    (
+        "an_idle_auth_process_that_ends_stops_writes",
+        test_an_idle_auth_process_that_ends_stops_writes,
+    ),
     (
         "a_decoy_raises_its_event_in_the_application",
         test_a_decoy_raises_its_event_in_the_application,

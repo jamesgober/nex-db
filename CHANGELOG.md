@@ -32,6 +32,11 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 ### Fixed
 
+- **A lock-out did not slow guessing, and its answer named the password.** During a lock-out every guess was still checked, a wrong one answered `Failed`, and only the right one answered `LockedOut`. Now no password is checked while sign-in is locked out, and every password answers `LockedOut` after the same work.
+- **`check_totp` counted no failures**, so an application using `verify_password` and `check_totp` allowed unlimited code guessing. Second-factor checks now count toward the account's lock-out, and while it holds they answer `false` for every code.
+- **Ten wrong passwords signed the owner out of every device.** The lock-out after repeated failures no longer changes the account's standing: it blocks new sign-ins only, commits nothing (so the tenth failure of a real account no longer takes longer than any other), and ends no session. It counts failures for identifiers that name no account too, so a lock-out does not tell which accounts exist. It is kept in the session checkpoint (format 2) and survives a clean restart.
+- **Counting stopped once 100,000 accounts had a recent failure.** The oldest windows now go first when the table fills.
+- **A decoy presented to `revoke`, `rotate`, or `redeem` raised nothing**, and `revoke` removed it. Each now raises `SecurityEvent::DecoyPresented` and answers as for a token never issued; the decoy stays planted until `retire_decoy` (new) removes it.
 - Store prefix scans share one helper (they were two copies of the same code). A prefix of only `0xFF` bytes now scans to the end of the key space instead of an empty range. No key nex-db writes starts that way, so no stored data was missed.
 - The scheduling thread allocated on every pass, even with nothing due. Its first pass could fall inside `tests/alloc.rs`'s count on a loaded machine, so the test failed now and then. A pass with nothing due now allocates nothing.
 - The README and crate-level examples published a page without `publish`, so the page they resolved was a draft and not served. They now use `put` and compile as doctests.

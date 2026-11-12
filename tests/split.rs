@@ -182,11 +182,12 @@ fn test_sessions_revoke_and_standing() {
         sign_in(&db, "ann@example.com"),
         SignIn::LockedOut { until: None }
     ));
+    // Any password answers the same while blocked.
     assert_eq!(
         db.auth()
             .verify_password("ann@example.com", "wrong")
             .unwrap(),
-        PasswordCheck::Failed
+        PasswordCheck::LockedOut { until: None }
     );
     db.auth().set_standing(ann, Standing::Active, None).unwrap();
     assert!(matches!(
@@ -268,6 +269,7 @@ fn test_lock_out_after_failures() {
         )
         .unwrap();
         let ann = sign_up(&db, "ann@example.com");
+        let token = token_of(sign_in(&db, "ann@example.com"));
         for _ in 0..2 {
             assert_eq!(
                 db.auth()
@@ -276,15 +278,27 @@ fn test_lock_out_after_failures() {
                 PasswordCheck::Failed
             );
         }
-        assert!(matches!(
-            db.auth().standing(ann).unwrap(),
-            Some(Standing::LockedOut { .. })
-        ));
+        // The auth process counts and holds the lock-out: every password
+        // answers the same, the standing and the session are unchanged.
+        assert_eq!(db.auth().standing(ann).unwrap(), Some(Standing::Active));
+        assert!(db.auth().validate(&token).unwrap().session().is_some());
         assert!(matches!(
             sign_in(&db, "ann@example.com"),
             SignIn::LockedOut { until: Some(_) }
         ));
+        assert!(matches!(
+            db.auth()
+                .verify_password("ann@example.com", "wrong")
+                .unwrap(),
+            PasswordCheck::LockedOut { until: Some(_) }
+        ));
     }
+    // The lock-out survives a restart of both processes.
+    let db = split(&dir);
+    assert!(matches!(
+        sign_in(&db, "ann@example.com"),
+        SignIn::LockedOut { until: Some(_) }
+    ));
 }
 
 fn test_erase_account() {

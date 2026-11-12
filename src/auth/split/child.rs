@@ -283,10 +283,14 @@ impl<'h> State<'h> {
                 let password = get_str(r)?;
                 wire::put_checked(w, &engine.check(identifier, password)?);
             }
-            op::CLEAR_FAILURES => engine.clear_failures(wire::get_account(r)?),
+            op::CLEAR_FAILURES => engine.clear_failures(r.fixed()?),
             op::COUNT_FAILURE => {
-                let account = wire::get_account(r)?;
-                w.u32(engine.count_failure(account, r.u64()?));
+                let key = r.fixed()?;
+                w.u64(engine.count_failure(key, r.u64()?).unwrap_or(0));
+            }
+            op::LOCKED_UNTIL => {
+                let key = r.fixed()?;
+                w.u64(engine.locked_until(key, r.u64()?).unwrap_or(0));
             }
             op::NEEDS_SECOND_FACTOR => {
                 wire::put_bool(w, engine.needs_second_factor(wire::get_account(r)?)?);
@@ -538,10 +542,6 @@ impl<'h> State<'h> {
                 let account = wire::get_account(r)?;
                 tx.assign_roles(account, &wire::get_roles(r)?)?;
             }
-            op::LOCK_OUT => {
-                let account = wire::get_account(r)?;
-                tx.lock_out(account, wire::get_time(r)?)?;
-            }
             op::NEW_RECOVERY_CODES => {
                 wire::put_codes(w, &tx.new_recovery_codes(wire::get_account(r)?)?)?;
             }
@@ -567,6 +567,7 @@ impl<'h> State<'h> {
                 wire::put_bool(w, tx.revoke_session(account, SessionId(r.fixed()?))?);
             }
             op::REVOKE => wire::put_bool(w, tx.revoke(get_str(r)?)?),
+            op::RETIRE_DECOY => wire::put_bool(w, tx.retire_decoy(get_str(r)?)?),
             #[cfg(feature = "mfa")]
             _ => return mfa_op(op, r, tx, w),
             #[cfg(not(feature = "mfa"))]

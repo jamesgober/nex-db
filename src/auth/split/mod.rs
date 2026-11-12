@@ -61,6 +61,7 @@ pub(crate) mod op {
     #[cfg(feature = "mfa")]
     pub(crate) const PASSKEYS: u16 = 21;
     pub(crate) const POLICY: u16 = 22;
+    pub(crate) const LOCKED_UNTIL: u16 = 23;
 
     pub(crate) const TX_VALIDATE_READS: u16 = 40;
     pub(crate) const TX_SEAL: u16 = 41;
@@ -84,7 +85,6 @@ pub(crate) mod op {
     pub(crate) const REMOVE_IDENTIFIER: u16 = 63;
     pub(crate) const DEFINE_ROLE: u16 = 64;
     pub(crate) const ASSIGN_ROLES: u16 = 65;
-    pub(crate) const LOCK_OUT: u16 = 66;
     pub(crate) const NEW_RECOVERY_CODES: u16 = 67;
     pub(crate) const USE_RECOVERY_CODE: u16 = 68;
     pub(crate) const CREATE_API_KEY: u16 = 69;
@@ -92,6 +92,7 @@ pub(crate) mod op {
     pub(crate) const REVOKE_SESSION: u16 = 71;
     pub(crate) const REVOKE: u16 = 72;
     pub(crate) const PLANT_DECOY: u16 = 73;
+    pub(crate) const RETIRE_DECOY: u16 = 74;
     #[cfg(feature = "mfa")]
     pub(crate) const ADD_TOTP: u16 = 80;
     #[cfg(feature = "mfa")]

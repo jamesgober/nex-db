@@ -191,6 +191,7 @@ pub(crate) fn put_time(w: &mut Writer<'_>, t: SystemTime) {
     }
 }
 
+#[cfg(any(fuzzing, test))]
 pub(crate) fn get_time(r: &mut Reader<'_>) -> Result<SystemTime> {
     let tag = r.u8()?;
     let d = get_duration(r)?;
@@ -421,9 +422,10 @@ pub(crate) fn put_checked(w: &mut Writer<'_>, c: &Checked) {
             w.u8(1);
             put_account(w, *account);
         }
-        Checked::Wrong(account) => {
+        Checked::Wrong { account, key } => {
             w.u8(2);
             put_opt_account(w, *account);
+            w.bytes(key);
         }
         Checked::Blocked(until) => {
             w.u8(3);
@@ -435,7 +437,10 @@ pub(crate) fn put_checked(w: &mut Writer<'_>, c: &Checked) {
 pub(crate) fn get_checked(r: &mut Reader<'_>) -> Result<Checked> {
     Ok(match r.u8()? {
         1 => Checked::Verified(get_account(r)?),
-        2 => Checked::Wrong(get_opt_account(r)?),
+        2 => Checked::Wrong {
+            account: get_opt_account(r)?,
+            key: r.fixed()?,
+        },
         3 => Checked::Blocked(get_opt_time(r)?),
         _ => return Err(Error::corrupt(REPLY, 0)),
     })

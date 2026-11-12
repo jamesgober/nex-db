@@ -432,7 +432,7 @@ fn test_rotate_replaces_the_token_and_keeps_the_expiry() {
 }
 
 #[test]
-fn test_ban_ends_sessions_and_blocks_sign_in_only_with_the_right_password() {
+fn test_ban_ends_sessions_and_blocks_sign_in_for_any_password() {
     let dir = TempDir::new("ban");
     let db = Database::open(&dir.0).unwrap();
     let password = db.auth().hash_password("right pw").unwrap();
@@ -459,12 +459,13 @@ fn test_ban_ends_sessions_and_blocks_sign_in_only_with_the_right_password() {
             .unwrap(),
         SignIn::LockedOut { until: None }
     ));
-    // A wrong password says nothing about the ban.
+    // While blocked no password is checked: a wrong one answers the same,
+    // so the answer never confirms a guess.
     assert_eq!(
         db.auth()
             .verify_password("ann@example.com", "wrong")
             .unwrap(),
-        PasswordCheck::Failed
+        PasswordCheck::LockedOut { until: None }
     );
     drop(db);
 
@@ -490,7 +491,7 @@ fn test_ban_ends_sessions_and_blocks_sign_in_only_with_the_right_password() {
 }
 
 #[test]
-fn test_ten_failures_lock_the_account_out() {
+fn test_ten_failures_lock_sign_in_out_for_any_password() {
     let dir = TempDir::new("lockout");
     let db = Database::open(&dir.0).unwrap();
     let password = db.auth().hash_password("right pw").unwrap();
@@ -499,7 +500,7 @@ fn test_ten_failures_lock_the_account_out() {
         .create_account("ann@example.com", &password)
         .unwrap();
     let token = db.auth().issue_session(ann, SessionSpec::web()).unwrap();
-    for _ in 0..9 {
+    for _ in 0..10 {
         assert_eq!(
             db.auth()
                 .verify_password("ann@example.com", "wrong")
@@ -507,29 +508,36 @@ fn test_ten_failures_lock_the_account_out() {
             PasswordCheck::Failed
         );
     }
-    // Nine failures: still open.
+    // Locked out: every password answers the same (the right one learns
+    // nothing more than a guess), and no password is checked.
+    for guess in ["wrong", "right pw", "another guess"] {
+        assert!(matches!(
+            db.auth().verify_password("ann@example.com", guess).unwrap(),
+            PasswordCheck::LockedOut { until: Some(_) }
+        ));
+    }
+    // A lock-out by failures blocks new sign-ins only: someone who never had
+    // the password cannot sign the owner out of their devices, and the
+    // account's standing is unchanged.
     assert!(matches!(
         db.auth().validate(&token).unwrap(),
         Validation::Valid(_)
     ));
     assert_eq!(db.auth().standing(ann).unwrap(), Some(Standing::Active));
-    assert_eq!(
-        db.auth()
-            .verify_password("ann@example.com", "wrong")
-            .unwrap(),
-        PasswordCheck::Failed
-    );
-    assert!(matches!(
-        db.auth().standing(ann).unwrap(),
-        Some(Standing::LockedOut { .. })
-    ));
-    assert!(!matches!(
-        db.auth().validate(&token).unwrap(),
-        Validation::Valid(_)
-    ));
+
+    // An identifier that names no account locks out after the same failures
+    // and answers the same: the lock-out does not tell which accounts exist.
+    for _ in 0..10 {
+        assert_eq!(
+            db.auth()
+                .verify_password("nobody@example.com", "wrong")
+                .unwrap(),
+            PasswordCheck::Failed
+        );
+    }
     assert!(matches!(
         db.auth()
-            .verify_password("ann@example.com", "right pw")
+            .verify_password("nobody@example.com", "wrong")
             .unwrap(),
         PasswordCheck::LockedOut { until: Some(_) }
     ));

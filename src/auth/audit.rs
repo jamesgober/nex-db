@@ -130,6 +130,9 @@ impl Clock for GivenClock {
 pub(crate) struct AuditChain {
     path: PathBuf,
     chain: Mutex<Option<Chain<KeyedHasher, FileSink, GivenClock>>>,
+    /// The chain key, to verify the file for an export.
+    #[cfg(feature = "audit-export")]
+    key: Zeroizing<[u8; 32]>,
 }
 
 impl std::fmt::Debug for AuditChain {
@@ -156,6 +159,8 @@ impl AuditChain {
     ) -> Result<Self> {
         let path = auth_dir.join(AUDIT_FILE);
         let tail = tail.unwrap_or(Tail::EMPTY);
+        #[cfg(feature = "audit-export")]
+        let verify_key = key.clone();
         let storage = |e| Error::storage("opening the audit chain", e);
         let mut file = OpenOptions::new()
             .read(true)
@@ -202,7 +207,62 @@ impl AuditChain {
         Ok(AuditChain {
             path,
             chain: Mutex::new(Some(chain)),
+            #[cfg(feature = "audit-export")]
+            key: verify_key,
         })
+    }
+
+    /// Every record the chain holds, read from the file and verified from
+    /// the first: what an export signs. Appends wait only while the length
+    /// written so far is read; the file is read up to it without the lock.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] at the first record that does not verify;
+    /// [`Error::Storage`] when the file cannot be read.
+    #[cfg(feature = "audit-export")]
+    pub(crate) fn verified(&self) -> Result<Vec<super::export::Verified>> {
+        let len = {
+            let mut guard = self.chain.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(chain) = guard.as_mut() else {
+                return Err(Error::storage(
+                    "reading the audit chain",
+                    "the chain was closed",
+                ));
+            };
+            chain.sink_mut().len
+        };
+        let storage = |e| Error::storage("reading the audit chain", e);
+        let mut bytes = Vec::new();
+        let file = File::open(&self.path).map_err(storage)?;
+        let _ = std::io::Read::read_to_end(&mut std::io::Read::take(file, len), &mut bytes)
+            .map_err(storage)?;
+        codec::verify_file_header(&bytes)
+            .map_err(|_| Error::corrupt("the audit chain header", 0))?;
+        let mut verifier = audit_trail::Verifier::new(KeyedHasher {
+            key: self.key.clone(),
+            input: Vec::new(),
+        });
+        let mut at = FILE_HEADER_LEN;
+        let mut out = Vec::new();
+        while at < bytes.len() {
+            let (record, used) = codec::decode_record(&bytes[at..])
+                .map_err(|_| Error::corrupt("an audit record", at as u64))?;
+            verifier
+                .verify(&record.as_record())
+                .map_err(|_| Error::corrupt("the audit chain", at as u64))?;
+            out.push(super::export::Verified {
+                id: record.id.as_u64(),
+                nanos: record.timestamp.as_nanos(),
+                actor: record.actor,
+                action: record.action,
+                target: record.target,
+                prev_hash: record.prev_hash.into_bytes(),
+                hash: record.hash.into_bytes(),
+            });
+            at += used;
+        }
+        Ok(out)
     }
 
     /// Append the `n`-th event of commit `seq`, at `at_ms` (moved forward

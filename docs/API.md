@@ -65,6 +65,7 @@ nex-db = { git = "https://github.com/jamesgober/nex-db", tag = "v0.7.0" }
 | `split-auth` (0.5) | no | the auth engine in its own process (see [Split auth](#split-auth-05)) |
 | `metrics` (0.4) | no | an observer that reports into metrics-lib |
 | `mfa` (0.4.1) | no | TOTP and passkeys, through crypt-io's AWS-LC backend: needs a C compiler; on Windows x86-64 no NASM |
+| `audit-export` (0.8) | no | signed audit exports (`Auth::audit_export`), through crypt-io's Ed25519 on the same backend as `mfa` |
 
 The core (commit log, catalog, recovery) is always built. A database that uses
 an engine the build leaves out refuses to open with `Error::Invalid`.
@@ -516,9 +517,27 @@ every session of the account in the same commit.
 
 Every security-relevant write (account created, signed in, failed, locked,
 standing changed, revoked) adds an event to the realm's hash-chained audit
-log in the same commit. `audit_export(range) -> Result<AuditExport>` (0.8,
-P3) returns the events (ids, kinds, and times only) with a proof that none was
-changed or removed.
+log in the same commit. The chain is keyed (BLAKE3 under a key derived from
+the root key), so checking it takes the key.
+
+With the `audit-export` feature (0.8, P3), `db.auth().audit_export(ids) ->
+Result<AuditExport>` verifies the whole chain and signs the records with ids
+in `ids` (any range of `u64`) with the realm's Ed25519 key, derived from the
+root key. An auditor checks the export with the realm's public key alone
+(`db.auth().audit_public_key()`, published out of band):
+
+| Call | Since | Grade |
+|---|---|---|
+| `audit_export(ids) -> Result<AuditExport>`, `audit_public_key() -> Result<[u8; 32]>` | 0.8 | P3 |
+| `AuditExport::from_bytes(bytes, &public_key) -> Result<AuditExport>`, `to_bytes()` | 0.8 | P3 |
+| `export.events() -> &[AuditEvent]` (`id()`, `at()`, `commit()`, `action()`, `target()`), `range()`, `chain_len()` | 0.8 | P3 |
+| `later.continues(&earlier) -> bool`: the ranges join with nothing left out | 0.8 | P3 |
+
+A valid export proves that the chain verified when it was made and that
+these are its records with consecutive ids over the range, unchanged and
+none left out. Events carry ids, kinds, and times only. Each export carries
+the chain's link before and after its range, so exports of consecutive
+ranges join (`continues`). Not with split auth in 0.8.
 
 ### Transactions
 

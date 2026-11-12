@@ -12,6 +12,8 @@
 
 mod audit;
 mod datakeys;
+#[cfg(feature = "audit-export")]
+pub(crate) mod export;
 pub(crate) mod keys;
 pub(crate) mod mode;
 #[cfg(feature = "mfa")]
@@ -234,6 +236,9 @@ const IDENTIFIER_KEY_LABEL: &[u8] = b"nex-db 2026 auth identifier digest";
 const SEAL_KEY_LABEL: &[u8] = b"nex-db 2026 auth log seal";
 const FILE_KEY_LABEL: &[u8] = b"nex-db 2026 auth file";
 const AUDIT_KEY_LABEL: &[u8] = b"nex-db 2026 auth audit";
+/// The seed of a realm's Ed25519 key for signed audit exports.
+#[cfg(feature = "audit-export")]
+const AUDIT_SIGN_LABEL: &[u8] = b"nex-db audit export signing v1";
 
 /// First byte of a sealed account-store value. Plain values from 0.1 and 0.2
 /// start with their format byte, 1.
@@ -446,6 +451,9 @@ pub(crate) struct AuthEngine {
     epochs: EpochTable,
     /// The realm's audit chain.
     audit: AuditChain,
+    /// The seed of the realm's key for signed audit exports.
+    #[cfg(feature = "audit-export")]
+    audit_sign: Zeroizing<[u8; 32]>,
     /// Account record versions kept for running snapshots.
     versions: Versions,
     /// Failed sign-ins per account: count and window start.
@@ -530,6 +538,8 @@ impl AuthEngine {
             sessions: SessionTable::new(max_sessions, now_ms()),
             epochs: EpochTable::new(),
             audit,
+            #[cfg(feature = "audit-export")]
+            audit_sign: root.derive(AUDIT_SIGN_LABEL),
             versions: Versions::new(),
             failures: Mutex::new(HashMap::new()),
             conflicts: ConflictTable::new(),
@@ -4600,6 +4610,69 @@ impl Auth<'_> {
         self.engine.collection()
     }
 
+    /// A signed export of the realm's audit records with ids in `ids`
+    /// (feature `audit-export`): every record of the chain is verified
+    /// first, then the range is signed with the realm's Ed25519 key, so an
+    /// auditor checks it with [`audit_public_key`](Self::audit_public_key)
+    /// and no other secret. See [`AuditExport`](crate::AuditExport).
+    ///
+    /// ```
+    /// # fn main() -> nex_db::Result<()> {
+    /// # let dir = std::env::temp_dir().join(format!("nex-db-doc-audit-{}", std::process::id()));
+    /// # let _ = std::fs::remove_dir_all(&dir);
+    /// let db = nex_db::open(&dir)?;
+    /// let _ = db.auth().sign_up("ann@example.com", "correct horse battery staple")?;
+    /// let bytes = db.auth().audit_export(..)?.to_bytes();
+    ///
+    /// // The auditor, with the published key only:
+    /// let public_key = db.auth().audit_public_key()?;
+    /// let export = nex_db::AuditExport::from_bytes(&bytes, &public_key)?;
+    /// assert_eq!(export.events()[0].action(), "account.created");
+    /// # drop(db);
+    /// # let _ = std::fs::remove_dir_all(&dir);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Corrupt`] when the chain does not verify.
+    /// - [`Error::Invalid`] with split auth (the export is made in this
+    ///   process, which then holds no key).
+    /// - [`Error::Storage`] when the chain file cannot be read.
+    #[cfg(feature = "audit-export")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "audit-export")))]
+    pub fn audit_export(&self, ids: impl std::ops::RangeBounds<u64>) -> Result<crate::AuditExport> {
+        match self.engine() {
+            AuthRef::Local(engine) => engine.audit_export((ids.start_bound(), ids.end_bound())),
+            #[cfg(feature = "split-auth")]
+            AuthRef::Remote(_) => Err(Error::invalid(
+                "audit export",
+                "not with the auth engine in its own process",
+            )),
+        }
+    }
+
+    /// The realm's public key for its signed audit exports (feature
+    /// `audit-export`): publish it where auditors find it. It is derived
+    /// from the root key, so it stays the same across restarts.
+    ///
+    /// # Errors
+    ///
+    /// As [`audit_export`](Self::audit_export).
+    #[cfg(feature = "audit-export")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "audit-export")))]
+    pub fn audit_public_key(&self) -> Result<[u8; 32]> {
+        match self.engine() {
+            AuthRef::Local(engine) => export::public_key(&engine.audit_sign),
+            #[cfg(feature = "split-auth")]
+            AuthRef::Remote(_) => Err(Error::invalid(
+                "audit export",
+                "not with the auth engine in its own process",
+            )),
+        }
+    }
+
     /// Check a session token. Reads memory only and allocates nothing.
     ///
     /// ```no_run
@@ -5412,6 +5485,32 @@ impl Auth<'_> {
             tx.auth_of(self.engine.collection())
                 .remove_identifier(account, identifier)
         })
+    }
+}
+
+#[cfg(feature = "audit-export")]
+impl AuthEngine {
+    /// Sign the audit records with ids in `ids`, after verifying the chain.
+    fn audit_export(
+        &self,
+        ids: (std::ops::Bound<&u64>, std::ops::Bound<&u64>),
+    ) -> Result<export::AuditExport> {
+        use std::ops::Bound;
+        let chain = self.audit.verified()?;
+        let len = chain.len() as u64;
+        let first = match ids.0 {
+            Bound::Included(&id) => id,
+            Bound::Excluded(&id) => id.saturating_add(1),
+            Bound::Unbounded => 0,
+        }
+        .min(len);
+        let end = match ids.1 {
+            Bound::Included(&id) => id.saturating_add(1),
+            Bound::Excluded(&id) => id,
+            Bound::Unbounded => len,
+        }
+        .clamp(first, len);
+        export::export(self.collection, &chain, first, end, &self.audit_sign)
     }
 }
 

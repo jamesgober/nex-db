@@ -88,6 +88,17 @@ pub enum Error {
         /// The oldest position the feed can resume after.
         oldest: u64,
     },
+    /// A write was asked of a read replica (0.8). A replica serves reads
+    /// only and changes only by following its primary's log: send the write
+    /// to the primary.
+    ReadOnlyReplica,
+    /// A primary was asked to ship commits to a replica that it no longer
+    /// holds (0.8): a checkpoint has dropped them from its log. Seed the
+    /// replica again from a new backup of the primary.
+    ReplicaBehind {
+        /// The oldest position the primary can ship after.
+        oldest: u64,
+    },
 }
 
 impl Error {
@@ -110,6 +121,8 @@ impl Error {
             Error::SnapshotTooOld => "NEX-1009",
             Error::Restricted { .. } => "NEX-1010",
             Error::FeedBehind { .. } => "NEX-1012",
+            Error::ReadOnlyReplica => "NEX-1013",
+            Error::ReplicaBehind { .. } => "NEX-1014",
         }
     }
 
@@ -180,6 +193,14 @@ impl fmt::Display for Error {
                 f,
                 "{code}: the change feed no longer holds changes before position {oldest}; drop \
                  what was built from it and start again from the current position"
+            ),
+            Error::ReadOnlyReplica => write!(
+                f,
+                "{code}: a read replica takes no writes; send the write to the primary"
+            ),
+            Error::ReplicaBehind { oldest } => write!(
+                f,
+                "{code}: the primary no longer holds the commits this replica needs (it can                  ship after position {oldest}); seed the replica again from a new backup"
             ),
         }
     }

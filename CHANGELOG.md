@@ -8,6 +8,7 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 ### Added
 
+- Read replicas: `db.ship(after, out)` writes the commits after a position as a shipment; `nex_db::open_replica(dir)` opens a directory restored from a backup of the primary as a `Replica`, and `replica.receive(from)` commits a shipment's records in order through the commit path. A replica serves the database's reads, refuses writes with `Error::ReadOnlyReplica` (NEX-1013), and its directory opens as a database to promote it. Shipments are sealed end to end (XChaCha20-Poly1305 under a key derived from the root key) and checked to continue the replica's own history. A primary behind which a checkpoint dropped a replica's commits answers `Error::ReplicaBehind` (NEX-1014). `tests/replica.rs` includes a deterministic simulation of a primary and a replica with cut and repeated shipments and restarts, compared at every checked position.
 - `db.content().put(entity)` (also in a transaction): create and publish in one step, so a page is served once the commit returns.
 - `db.auth().sign_up(identifier, password)`: hash the password and create the account in one call.
 

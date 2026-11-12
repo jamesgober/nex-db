@@ -96,6 +96,9 @@ struct Engines {
     /// Hosting takes one collection at a time.
     #[cfg_attr(not(any(feature = "auth", feature = "content")), allow(dead_code))]
     hosting: Mutex<()>,
+    /// The key shipments to and from read replicas are sealed with;
+    /// `None` with split auth, where this process holds no root key.
+    ship_key: Option<crypt_io::Zeroizing<[u8; 32]>>,
 }
 
 impl Engines {
@@ -308,6 +311,8 @@ pub struct Builder {
     #[cfg(feature = "auth")]
     auth: AuthMode,
     observers: Observers,
+    /// Open as a read replica.
+    replica: bool,
 }
 
 impl Builder {
@@ -364,6 +369,22 @@ impl Builder {
     /// is not the one the database was created with.
     pub fn open(self) -> Result<Database> {
         Database::open_with(self)
+    }
+
+    /// Open the directory as a read replica (0.8): see
+    /// [`Replica`](crate::Replica). The keys must be the primary's.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Invalid`] when the directory holds no database (a replica
+    ///   starts from a restored backup of its primary), holds revocations
+    ///   still to apply again after a restore to an earlier point (restore
+    ///   with `RestorePoint::Latest`), or the auth engine runs in its own
+    ///   process.
+    /// - As [`open`](Self::open).
+    pub fn open_replica(mut self) -> Result<crate::Replica> {
+        self.replica = true;
+        crate::Replica::new(Database::open_with(self)?)
     }
 }
 
@@ -427,12 +448,40 @@ impl Database {
             #[cfg(feature = "auth")]
             auth: AuthMode::default(),
             observers: Observers::default(),
+            replica: false,
         }
     }
 
     fn open_with(builder: Builder) -> Result<Database> {
         let (core, new_database) = Core::open(&builder.dir)?;
         core.set_checkpoint_every(builder.checkpoint_every);
+        if builder.replica {
+            if new_database {
+                return Err(Error::invalid(
+                    "replica",
+                    "start from a restored backup of the primary",
+                ));
+            }
+            if core
+                .dir()
+                .join("core")
+                .join(crate::backup::REAPPLY)
+                .exists()
+            {
+                return Err(Error::invalid(
+                    "replica",
+                    "restored to an earlier point: restore with RestorePoint::Latest",
+                ));
+            }
+            #[cfg(feature = "split-auth")]
+            if !matches!(builder.auth.0, crate::auth::mode::Mode::Embedded) {
+                return Err(Error::invalid(
+                    "replica",
+                    "the auth engine must be embedded in a replica",
+                ));
+            }
+            core.set_replica();
+        }
         let dir = core.dir().to_path_buf();
         let auth_dir = dir.join("auth");
         fs::create_dir(&auth_dir)?;
@@ -457,6 +506,9 @@ impl Database {
             Some(_) => None,
             None => Some(keys::root_key(&builder.keys, &auth_dir, new_database)?),
         };
+        let ship_key = root
+            .as_ref()
+            .map(|root| root.derive(crate::replica::KEY_LABEL));
         #[cfg(feature = "auth")]
         let auth_lock = match &root {
             Some(_) => Some(crate::auth::lock_auth(&auth_dir)?),
@@ -498,6 +550,7 @@ impl Database {
             #[cfg(feature = "content")]
             wake,
             hosting: Mutex::new(()),
+            ship_key,
         };
         // Collections the catalog already holds get their engines before
         // the log replays into them; ones the log defines, as it replays.
@@ -525,6 +578,12 @@ impl Database {
             #[cfg(feature = "content")]
             scheduler: None,
         };
+        if builder.replica {
+            // A replica changes only by following its primary: no
+            // revocations to apply again (refused above), and no schedules
+            // fired here (the primary fires them as commits it ships).
+            return Ok(db);
+        }
         // A restored database applies again the revocations made after its
         // restore point, before anything else.
         crate::backup::reapply(&db)?;
@@ -613,6 +672,40 @@ impl Database {
     #[cfg_attr(not(feature = "auth"), allow(dead_code))]
     pub(crate) fn observers(&self) -> &Observers {
         &self.inner.observers
+    }
+
+    /// Write the commits after `after` to `out` as one shipment for a read
+    /// replica, and return the position of the last commit in it (`after`
+    /// when there is nothing new). See [`Replica`](crate::Replica).
+    ///
+    /// The shipment is sealed under a key derived from the root key, so it
+    /// may travel over any transport. It holds at most about 16 MiB of
+    /// records; a replica further behind takes several. From the first call
+    /// the database keeps its recent records (up to 32 MiB) in memory so
+    /// later shipments read no file; a replica behind those is shipped
+    /// records read from the log, while writes wait.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ReplicaBehind`] when the log no longer holds `after` (a
+    ///   checkpoint has dropped it): seed the replica again from a backup.
+    /// - [`Error::Invalid`] with split auth (this process holds no root key).
+    /// - [`Error::Storage`] when writing to `out` fails.
+    pub fn ship(&self, after: Position, out: &mut impl std::io::Write) -> Result<Position> {
+        crate::replica::ship(self, after, out)
+    }
+
+    pub(crate) fn core(&self) -> &Core {
+        &self.inner.core
+    }
+
+    pub(crate) fn ship_key(&self) -> Option<&[u8; 32]> {
+        self.inner.engines.ship_key.as_deref()
+    }
+
+    /// Commit records shipped from a primary. See [`Core::receive`].
+    pub(crate) fn receive(&self, records: Vec<Arc<[u8]>>) -> Result<crate::core::record::Seq> {
+        self.inner.core.receive(&self.inner.engines, records)
     }
 
     /// The position of the last visible commit, to start a change feed

@@ -8,6 +8,7 @@ pub(crate) mod keys;
 pub(crate) mod log;
 pub(crate) mod pipeline;
 pub(crate) mod record;
+pub(crate) mod ship;
 pub(crate) mod turn;
 pub(crate) mod versions;
 

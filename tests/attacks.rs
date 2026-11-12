@@ -351,17 +351,25 @@ fn test_a_decoy_answers_unknown_and_raises_an_event() {
         Validation::Unknown
     ));
     assert_eq!(hits.load(Ordering::Relaxed), 3);
-    assert!(db.auth().revoke(&decoy).unwrap());
+    // Since 0.8 `revoke` raises the alarm too and leaves the decoy planted;
+    // `retire_decoy` removes it.
+    assert!(!db.auth().revoke(&decoy).unwrap());
+    assert_eq!(hits.load(Ordering::Relaxed), 4);
+    assert!(db.auth().retire_decoy(&decoy).unwrap());
     assert!(matches!(
         db.auth().validate(decoy.as_str()).unwrap(),
         Validation::Unknown
     ));
-    assert_eq!(hits.load(Ordering::Relaxed), 3);
+    assert_eq!(hits.load(Ordering::Relaxed), 4);
     drop(db);
     let db = open();
     assert!(matches!(
         db.auth().validate(decoy.as_str()).unwrap(),
         Validation::Unknown
     ));
-    assert_eq!(hits.load(Ordering::Relaxed), 3);
+    assert_eq!(
+        hits.load(Ordering::Relaxed),
+        4,
+        "a retired decoy stays gone"
+    );
 }

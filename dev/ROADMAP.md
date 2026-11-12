@@ -2,7 +2,7 @@
 
 > One milestone at a time, each ending with something that runs. Work only on the current milestone. Requirements (FR, NFR) are in [`PLAN.md`](./PLAN.md).
 
-**Current milestone: the 0.8 exit run (two weeks in production from the 0.8.0 release), then 0.9.0 (beta). 0.1.0 to 0.8.0 are released (GitHub pre-releases).**
+**Current milestone: the 0.8 exit run (two weeks in production from the 0.8.0 release), then 0.9.0 (beta). 0.1.0 to 0.8.1 are released (GitHub pre-releases).**
 
 ---
 
@@ -132,7 +132,7 @@
 ## 0.9.0 Beta
 
 - Moved from 0.8 (`PLAN.md` D-128): sealed mode, per-operation budgets for admin listings, online re-keying, secure deletion at compaction, the preview index (`resolve_draft`), device-bound sessions, the P2 items.
-- lsm-db 1.4 (its review fixes: no run deleted without a manifest, a directory lock, a checked footer, no stale write-ahead log replay) as soon as it is released, in a 0.8.x.
+- [x] lsm-db 1.4 (its review fixes: no run deleted without a manifest, a directory lock, a checked footer, no stale write-ahead log replay), in 0.8.1.
 - Seal the audit chain (review F-11) once crypt-io offers deterministic sealing.
 - Format freeze rehearsal; documentation complete; `docs/STABILITY-1.0.md` drafted.
 - **Exit:** every 0.8 database opens, and a downgrade is refused cleanly.

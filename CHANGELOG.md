@@ -6,6 +6,14 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-12
+
+lsm-db 1.4 for the account and content stores.
+
+### Changed
+
+- lsm-db 1.4 (from an independent review of it): a store whose manifest is missing or unreadable is never treated as new and nothing in it is deleted; a store directory is locked for its handle's life; a run's footer is checked (and carries a checksum in new runs), so a damaged count can no longer abort the process at compaction; a failed compaction leaves no temporary file behind; the block cache counts bytes. nex-db opens each store once, under its own directory lock, so none of this changes what it does; it removes those failure modes underneath it. Stores 0.8.0 wrote open as they are, and a store 0.8.1 writes still opens in 0.8.0.
+
 ## [0.8.0] - 2026-11-12
 
 Alpha: read replicas, signed audit exports, a simpler API, a faster split-auth check, and fixes from an independent review of the auth engine.
@@ -232,7 +240,8 @@ The walking skeleton.
 - Repository scaffold: `Cargo.toml` (edition 2024, MSRV 1.85), `src/lib.rs` with `VERSION`, CI on Linux, macOS, and Windows (stable and 1.85), `cargo deny` configuration.
 - `dev/PLAN.md`, `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/nex-db/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/jamesgober/nex-db/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/jamesgober/nex-db/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/jamesgober/nex-db/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/nex-db/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/nex-db/compare/v0.5.0...v0.6.0

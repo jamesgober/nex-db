@@ -124,7 +124,7 @@
 - [x] Verifiable audit export: `audit_export`, signed with Ed25519, feature `audit-export` (`PLAN.md` D-127).
 - [x] Split auth: the check over the channel at its target (median 5.6 to 6.0 us on Linux, 11 to 27 us on Windows; `PLAN.md` D-125).
 - [x] lsm-db 1.3 and wal-db 1.4 adopted: prefix scans seek (`scan_prefix`); every log segment flushed by a sync and at open.
-- [x] Review fixes: guessing defences (D-129), split frames (D-130), session room, key holds, TOTP re-enrolment, and hash cost (D-131). Blocked: sealing the audit chain (review F-11) needs deterministic sealing in crypt-io first; the docs say the chain is plaintext.
+- [x] Security fixes: guessing defences (D-129), split frames (D-130), session room, key holds, TOTP re-enrolment, and hash cost (D-131). Blocked: sealing the audit chain needs deterministic sealing in crypt-io first; the docs say the chain is plaintext.
 - Moved to 0.9 (`PLAN.md` D-128): sealed mode, per-operation budgets for admin listings, online re-keying, secure deletion at compaction, the preview index (`resolve_draft`), device-bound sessions, the P2 items.
 - Released 2026-11-12 as 0.8.0.
 - **Exit:** two weeks in production on James's site with no data issue, with a follower; runs from the 0.8.0 release.
@@ -132,8 +132,8 @@
 ## 0.9.0 Beta
 
 - Moved from 0.8 (`PLAN.md` D-128): sealed mode, per-operation budgets for admin listings, online re-keying, secure deletion at compaction, the preview index (`resolve_draft`), device-bound sessions, the P2 items.
-- [x] lsm-db 1.4 (its review fixes: no run deleted without a manifest, a directory lock, a checked footer, no stale write-ahead log replay), in 0.8.1.
-- Seal the audit chain (review F-11) once crypt-io offers deterministic sealing.
+- [x] lsm-db 1.4 (its data-safety fixes: no run deleted without a manifest, a directory lock, a checked footer, no stale write-ahead log replay), in 0.8.1.
+- Seal the audit chain once crypt-io offers deterministic sealing.
 - Format freeze rehearsal; documentation complete; `docs/STABILITY-1.0.md` drafted.
 - **Exit:** every 0.8 database opens, and a downgrade is refused cleanly.
 

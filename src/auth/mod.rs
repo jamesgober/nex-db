@@ -250,18 +250,6 @@ const ACCOUNT_FORMAT_SEALED: u8 = 2;
 /// The same with the account's further identifiers and its roles (0.4).
 const ACCOUNT_FORMAT_SEALED_ROLES: u8 = 3;
 
-/// The first key after every key starting with `start`.
-fn prefix_end(start: &[u8]) -> Vec<u8> {
-    let mut end = start.to_vec();
-    while let Some(last) = end.pop() {
-        if last < u8::MAX {
-            end.push(last + 1);
-            break;
-        }
-    }
-    end
-}
-
 fn store_key(collection: u32, tag: u8, id: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(5 + id.len());
     key.extend_from_slice(&collection.to_be_bytes());
@@ -838,7 +826,7 @@ impl AuthEngine {
         batch.delete(totp_key(self.collection, account));
         batch.delete(recovery_key(self.collection, account));
         let start = store_key(self.collection, b'W', account.as_bytes());
-        for (index, _) in self.accounts.scan(start.clone()..prefix_end(&start))? {
+        for (index, _) in self.accounts.scan(crate::core::prefix_range(&start))? {
             if let Some(digest) = index.get(start.len()..) {
                 batch.delete(store_key(self.collection, b'w', digest));
             }
@@ -847,7 +835,7 @@ impl AuthEngine {
         // API keys have no index by account: every key record is read, which
         // an erasure, a rare call, can afford.
         let start = store_key(self.collection, b'k', b"");
-        for (key, value) in self.accounts.scan(start.clone()..prefix_end(&start))? {
+        for (key, value) in self.accounts.scan(crate::core::prefix_range(&start))? {
             let record = keys::KeyRecord::decode(&open_value(&self.file_key, &key, &value)?)?;
             if record.account == account {
                 batch.delete(api_key_id_key(self.collection, &record.id));

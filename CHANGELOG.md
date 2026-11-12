@@ -30,6 +30,7 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 ### Fixed
 
+- Store prefix scans share one helper (they were two copies of the same code). A prefix of only `0xFF` bytes now scans to the end of the key space instead of an empty range. No key nex-db writes starts that way, so no stored data was missed.
 - The scheduling thread allocated on every pass, even with nothing due. Its first pass could fall inside `tests/alloc.rs`'s count on a loaded machine, so the test failed now and then. A pass with nothing due now allocates nothing.
 - The README and crate-level examples published a page without `publish`, so the page they resolved was a draft and not served. They now use `put` and compile as doctests.
 

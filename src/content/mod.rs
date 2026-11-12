@@ -212,18 +212,6 @@ fn route_key(site: &str, path: &str) -> Vec<u8> {
     key
 }
 
-/// The end of a prefix scan: the prefix with its last byte raised.
-fn after(prefix: &[u8]) -> Vec<u8> {
-    let mut end = prefix.to_vec();
-    while let Some(last) = end.pop() {
-        if last < u8::MAX {
-            end.push(last + 1);
-            break;
-        }
-    }
-    end
-}
-
 /// The content engine.
 pub(crate) struct ContentEngine {
     collection: u32,
@@ -301,7 +289,7 @@ impl ContentEngine {
         let mut any_links = false;
         let mut published_ms = 0;
         let start = entity_prefix(collection);
-        for (_, value) in store.scan(start.clone()..after(&start))? {
+        for (_, value) in store.scan(crate::core::prefix_range(&start))? {
             let head = Head::decode(&value, applied)?;
             lists.update(&head);
             tree.update(&head);
@@ -328,7 +316,7 @@ impl ContentEngine {
             }
         }
         let start = route_prefix(collection);
-        for (key, value) in store.scan(start.clone()..after(&start))? {
+        for (key, value) in store.scan(crate::core::prefix_range(&start))? {
             let name = key.get(start.len()..).unwrap_or_default();
             let (site, path) = split_route(name, applied)?;
             routes.set(site, path, 0, Some(decode_route(&value, applied)?));
@@ -464,7 +452,7 @@ impl ContentEngine {
     fn stored_referrers(&self, target: EntityId) -> Result<Vec<EntityId>> {
         let start = link_prefix(self.collection, target);
         self.store
-            .scan(start.clone()..after(&start))?
+            .scan(crate::core::prefix_range(&start))?
             .map(|(key, _)| {
                 key.get(start.len()..)
                     .and_then(|b| <[u8; 16]>::try_from(b).ok())
@@ -479,7 +467,7 @@ impl ContentEngine {
     fn all_heads(&self) -> Result<Vec<(Head, bool)>> {
         let start = entity_prefix(self.collection);
         self.store
-            .scan(start.clone()..after(&start))?
+            .scan(crate::core::prefix_range(&start))?
             .map(|(_, value)| Ok((Head::decode(&value, 0)?, Head::is_legacy(&value))))
             .collect()
     }
@@ -588,7 +576,7 @@ impl ContentEngine {
     fn revisions(&self, rid: EntityId) -> Result<Vec<RevisionInfo>> {
         let start = revision_prefix(self.collection, rid);
         let mut out = Vec::new();
-        for (key, value) in self.store.scan(start.clone()..after(&start))? {
+        for (key, value) in self.store.scan(crate::core::prefix_range(&start))? {
             let n = key
                 .get(start.len()..)
                 .and_then(|b| <[u8; 4]>::try_from(b).ok())
@@ -814,7 +802,7 @@ impl Engine for ContentEngine {
                     self.versions.record(&key, seq, None, || Ok(old.clone()))?;
                     batch.delete(key);
                     let start = revision_prefix(self.collection, *rid);
-                    for (rev, _) in self.store.scan(start.clone()..after(&start))? {
+                    for (rev, _) in self.store.scan(crate::core::prefix_range(&start))? {
                         batch.delete(rev);
                     }
                     changes.push(Change::EntityChanged {
@@ -3214,13 +3202,6 @@ mod tests {
         assert!(stored_route_key(2, "a", "/b").starts_with(&route_prefix(2)));
         let name = &stored_route_key(2, "a.com", "/x/y")[route_prefix(2).len()..];
         assert_eq!(split_route(name, 0).unwrap(), ("a.com", "/x/y"));
-    }
-
-    #[test]
-    fn test_after_bounds_a_prefix_scan() {
-        assert_eq!(after(&[1, 2]), vec![1, 3]);
-        assert_eq!(after(&[1, 0xFF]), vec![2]);
-        assert!(after(&[0xFF]).is_empty());
     }
 
     #[test]

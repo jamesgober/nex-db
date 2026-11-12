@@ -32,6 +32,8 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 ### Fixed
 
+- **Split auth with `Keys::env` left the root key in the application process**: the auth process inherits its environment from the application. Split auth now refuses `Keys::env`; use a key file. `docs/API.md` also says what the split defends against (memory disclosure in the application) and what it does not (code execution as the same OS user).
+- `docs/API.md` said reads inside `db.commit` are snapshot isolation; they see the latest committed state. It now says so, and points to `commit_serializable` for writes derived from reads.
 - **`rotate` renewed a session past its idle limit**, which `validate` already answered `Expired` for. Both now use one rule: the absolute expiry and the idle limit against the last use.
 - **A delete in the commit that also wrote a revision left that revision in the store** for good (listed, and in every backup). The delete now removes revisions written earlier in the same commit, also when an older log is replayed.
 - **A lock-out did not slow guessing, and its answer named the password.** During a lock-out every guess was still checked, a wrong one answered `Failed`, and only the right one answered `LockedOut`. Now no password is checked while sign-in is locked out, and every password answers `LockedOut` after the same work.

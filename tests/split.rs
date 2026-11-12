@@ -688,6 +688,17 @@ fn test_a_killed_auth_process_fails_calls_and_stops_writes() {
     assert!(db.content().draft(rid).unwrap().is_some());
 }
 
+/// Before 0.8 split auth accepted `Keys::env`, so the root key sat in the
+/// application's own environment (the auth process inherits it from there).
+fn test_split_auth_refuses_a_key_from_the_environment() {
+    let t = TempDir::new("env");
+    let opened = Database::builder(t.at("db"))
+        .keys(Keys::env("NEX_DB_SPLIT_KEY_FOR_THIS_TEST"))
+        .auth(AuthMode::separate_process())
+        .open();
+    assert!(matches!(opened, Err(Error::Invalid { field: "keys", .. })));
+}
+
 fn test_threads_share_the_channel() {
     let t = TempDir::new("threads");
     let db = split(&t.at("db"));
@@ -925,6 +936,10 @@ const TESTS: &[Test] = &[
         test_a_killed_auth_process_fails_calls_and_stops_writes,
     ),
     ("threads_share_the_channel", test_threads_share_the_channel),
+    (
+        "split_auth_refuses_a_key_from_the_environment",
+        test_split_auth_refuses_a_key_from_the_environment,
+    ),
     (
         "replies_reach_their_own_requests",
         test_replies_reach_their_own_requests,

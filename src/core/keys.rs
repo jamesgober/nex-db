@@ -155,7 +155,15 @@ impl Keys {
                         .ok_or(Error::invalid("key file", "must be UTF-8 with split auth"))?,
                 ),
             ),
-            Source::Env(var) => (3, Some(var.as_str())),
+            // The auth process inherits its environment from the application,
+            // so a key in the environment is in the application too: refused,
+            // since keeping the key out of the application is the point.
+            Source::Env(_) => {
+                return Err(Error::invalid(
+                    "keys",
+                    "Keys::env leaves the root key in the application's environment; use Keys::file or Keys::in_directory with split auth",
+                ));
+            }
         })
     }
 }

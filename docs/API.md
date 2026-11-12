@@ -586,7 +586,20 @@ hashes, and seals and opens the auth parts of the log. The application
 process keeps the commit log, the catalog, and the content engine, and holds
 no auth key: it stores the auth parts of each commit as they come sealed. A
 commit across auth and content is still one record of one log, so it stays
-atomic.
+atomic. Split auth takes the key from a file (`Keys::file`, or
+`Keys::in_directory`); since 0.8 it refuses `Keys::env`, because the auth
+process inherits its environment from the application, which would then hold
+the key in its environment for its whole life.
+
+What the split defends against: a bug in the application that discloses its
+memory (a buffer over-read, a leaked core dump) shows no auth key, no
+password hash, and no decrypted auth record. What it does not: the auth
+process runs as the same OS user, so an attacker who runs code in the
+application can read the auth process's memory (ptrace on Linux unless
+restricted, `ReadProcessMemory` on Windows) and can drive every auth operation
+over the channel. Running the auth process as another user, with its key file
+readable by that user only, would add protection against a compromised
+application; nex-db does not do that itself.
 
 | Call | Since | Grade |
 |---|---|---|

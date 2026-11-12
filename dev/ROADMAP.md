@@ -2,7 +2,7 @@
 
 > One milestone at a time, each ending with something that runs. Work only on the current milestone. Requirements (FR, NFR) are in [`PLAN.md`](./PLAN.md).
 
-**Current milestone: 0.8.0 (alpha). 0.1.0 to 0.7.0 are released (GitHub pre-releases).**
+**Current milestone: the 0.8 exit run (two weeks in production from the 0.8.0 release), then 0.9.0 (beta). 0.1.0 to 0.8.0 are released (GitHub pre-releases).**
 
 ---
 
@@ -122,13 +122,18 @@
 - [x] API simplified: one-line Tier 1 (`put`, `sign_up`), plain names, one way to do each thing (`PLAN.md` D-124).
 - [x] Read replica following the log (FR-15): `ship`, `open_replica`, `receive`; a deterministic simulation of a primary and a replica (`PLAN.md` D-126).
 - [x] Verifiable audit export: `audit_export`, signed with Ed25519, feature `audit-export` (`PLAN.md` D-127).
-- Split auth: the check over the channel nearer its target.
-- Review fixes: guessing defences (D-129), split frames (D-130), session room and key holds (D-131). **Blocked:** sealing the audit chain (review F-11) needs deterministic sealing (a replay must append the same bytes, or exports of the same records would differ), which crypt-io does not offer: an AEAD with a caller-given nonce (the nonce derived from the record id) or an SIV mode, added to crypt-io in its own release first. Until then the docs say the chain is plaintext.
-- Moved from 0.7: sealed mode, per-operation budgets for admin listings, online re-keying, secure deletion at compaction, the preview index, device-bound sessions, the P2 items.
-- **Exit:** two weeks in production on James's site with no data issue.
+- [x] Split auth: the check over the channel at its target (median 5.6 to 6.0 us on Linux, 11 to 27 us on Windows; `PLAN.md` D-125).
+- [x] lsm-db 1.3 and wal-db 1.4 adopted: prefix scans seek (`scan_prefix`); every log segment flushed by a sync and at open.
+- [x] Review fixes: guessing defences (D-129), split frames (D-130), session room, key holds, TOTP re-enrolment, and hash cost (D-131). Blocked: sealing the audit chain (review F-11) needs deterministic sealing in crypt-io first; the docs say the chain is plaintext.
+- Moved to 0.9 (`PLAN.md` D-128): sealed mode, per-operation budgets for admin listings, online re-keying, secure deletion at compaction, the preview index (`resolve_draft`), device-bound sessions, the P2 items.
+- Released 2026-11-12 as 0.8.0.
+- **Exit:** two weeks in production on James's site with no data issue, with a follower; runs from the 0.8.0 release.
 
 ## 0.9.0 Beta
 
+- Moved from 0.8 (`PLAN.md` D-128): sealed mode, per-operation budgets for admin listings, online re-keying, secure deletion at compaction, the preview index (`resolve_draft`), device-bound sessions, the P2 items.
+- lsm-db 1.4 (its review fixes: no run deleted without a manifest, a directory lock, a checked footer, no stale write-ahead log replay) as soon as it is released, in a 0.8.x.
+- Seal the audit chain (review F-11) once crypt-io offers deterministic sealing.
 - Format freeze rehearsal; documentation complete; `docs/STABILITY-1.0.md` drafted.
 - **Exit:** every 0.8 database opens, and a downgrade is refused cleanly.
 

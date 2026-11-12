@@ -61,6 +61,9 @@ split-auth = ["auth"]
 metrics = ["dep:metrics-lib"]
 # Second factors: TOTP and passkeys, through crypt-io's `otp` and `sign`
 # modules. Off by default: it builds crypt-io's C backend (AWS-LC).
+# Signed audit exports (`Auth::audit_export`), through crypt-io's Ed25519.
+# Off by default: it builds crypt-io's C backend (AWS-LC), as `mfa` does.
+audit-export = ["auth", "crypt-io/sign-ed25519"]
 mfa = [
     "auth",
     "crypt-io/otp",

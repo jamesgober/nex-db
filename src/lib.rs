@@ -86,6 +86,7 @@
 //! | `auth` | yes | the auth engine |
 //! | `content` | yes | the content engine |
 //! | `split-auth` | no | the auth engine in a process of its own (`AuthMode::separate_process`) |
+//! | `audit-export` | no | signed audit exports (`Auth::audit_export`) |
 //!
 //! ## Status
 //!
@@ -136,6 +137,9 @@ mod replica;
 mod table;
 mod wheel;
 
+#[cfg(feature = "audit-export")]
+#[cfg_attr(docsrs, doc(cfg(feature = "audit-export")))]
+pub use crate::auth::export::{AuditEvent, AuditExport};
 #[cfg(feature = "split-auth")]
 #[cfg_attr(docsrs, doc(cfg(feature = "split-auth")))]
 pub use crate::auth::split::serve_auth_process;

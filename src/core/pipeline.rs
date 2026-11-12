@@ -35,7 +35,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -45,6 +45,7 @@ use super::{
     fs::{self, DirLock},
     log::{CommitLog, MAX_RECORD},
     record::{self, Class, Kind, RecordView, RecordWriter, Seq},
+    ship::ShipBuffer,
     turn::{Stop, Turnstile},
 };
 use crate::{
@@ -126,6 +127,10 @@ pub(crate) struct Core {
     catalog: Catalog,
     /// Recent changes for the change feed.
     feed: FeedLog,
+    /// Recent records, for shipping to read replicas.
+    ship: ShipBuffer,
+    /// True for a read replica's core: only shipped records are written.
+    replica: AtomicBool,
     _lock: DirLock,
 }
 
@@ -157,6 +162,8 @@ impl Core {
             checkpoint_every: AtomicU64::new(CHECKPOINT_EVERY),
             catalog,
             feed: FeedLog::default(),
+            ship: ShipBuffer::default(),
+            replica: AtomicBool::new(false),
             _lock: lock,
         };
         Ok((core, new_database))
@@ -494,6 +501,9 @@ impl Core {
         if self.order.halted() {
             return Err(Attempt::Failed(halted_error()));
         }
+        if self.replica.load(Ordering::Acquire) {
+            return Err(Attempt::Failed(Error::ReadOnlyReplica));
+        }
         if state.in_flight >= MAX_IN_FLIGHT {
             return Err(Attempt::Failed(Error::Busy {
                 what: "commit queue",
@@ -561,7 +571,7 @@ impl Core {
     /// Parts 2 and 3: make the record durable (writing the queued batch
     /// when no other commit is), then wait for the commit before this one,
     /// apply from the encoded bytes (the path recovery takes), and publish.
-    fn complete(&self, engines: &dyn Registry, seq: Seq, bytes: &[u8]) -> Result<()> {
+    fn complete(&self, engines: &dyn Registry, seq: Seq, bytes: &Arc<[u8]>) -> Result<()> {
         self.order
             .make_durable(seq, |batch| {
                 batch
@@ -577,9 +587,151 @@ impl Core {
                     .and_then(|view| self.apply_record(engines, &view, &mut changes))?;
                 // In commit order, before the commit is visible.
                 self.feed.push(seq, changes);
+                self.ship.push(seq, bytes);
                 Ok(())
             })
             .map_err(stopped)
+    }
+
+    /// Make this core a read replica's: from now on every local write is
+    /// refused with [`Error::ReadOnlyReplica`], and only
+    /// [`receive`](Self::receive) adds commits.
+    pub(crate) fn set_replica(&self) {
+        self.replica.store(true, Ordering::Release);
+    }
+
+    /// Commit `records`, shipped from a primary, as this database's next
+    /// commits: each through the path a local commit takes after it is
+    /// encoded (durable in the log, applied in order from its bytes, then
+    /// visible), so the replica's log and stores hold exactly the
+    /// primary's commits. Records already held are skipped; one that is not
+    /// the next is refused. Returns the last sequence number held.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Corrupt`] when a record does not decode or the records
+    ///   are not consecutive.
+    /// - [`Error::Invalid`] when the first new record is not the next one.
+    /// - As a commit, after a failed write.
+    pub(crate) fn receive(&self, engines: &dyn Registry, records: Vec<Arc<[u8]>>) -> Result<Seq> {
+        let mut decoded = Vec::with_capacity(records.len());
+        for bytes in records {
+            let (seq, time_ms) = {
+                let view = record::decode(&bytes, 0)?;
+                (view.seq, view.time_ms)
+            };
+            if decoded.last().is_some_and(|&(last, _, _)| last + 1 != seq) {
+                return Err(Error::corrupt("a shipped record (sequence)", seq));
+            }
+            decoded.push((seq, time_ms, bytes));
+        }
+        let mut queued = Vec::with_capacity(decoded.len());
+        {
+            let mut state = self.commit.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(err) = engines.failed() {
+                self.order.halt();
+                return Err(err);
+            }
+            if self.order.halted() {
+                return Err(halted_error());
+            }
+            for (seq, time_ms, bytes) in decoded {
+                if seq <= state.last {
+                    continue;
+                }
+                if seq != state.last + 1 {
+                    return Err(Error::invalid(
+                        "shipment",
+                        "it does not continue this replica's log",
+                    ));
+                }
+                let _ = self
+                    .since_checkpoint
+                    .fetch_add(bytes.len() as u64, Ordering::AcqRel);
+                state.last = seq;
+                state.last_ms = state.last_ms.max(time_ms);
+                state.in_flight += 1;
+                self.order.queue(seq, Arc::clone(&bytes));
+                queued.push((seq, bytes));
+            }
+        }
+        // The first completion writes and syncs every queued record at once.
+        let count = queued.len();
+        let mut result = Ok(());
+        for (seq, bytes) in &queued {
+            result = self.complete(engines, *seq, bytes);
+            if result.is_err() {
+                break;
+            }
+        }
+        let mut state = self.commit.lock().unwrap_or_else(PoisonError::into_inner);
+        state.in_flight -= count;
+        let last = state.last;
+        drop(state);
+        result?;
+        if count > 0 {
+            self.reclaim(engines);
+            self.maybe_checkpoint(engines);
+        }
+        Ok(last)
+    }
+
+    /// The records a replica at `from` is missing, with the record `from`
+    /// itself first (a replica checks that it holds the same one): from the
+    /// ship buffer when it holds `from`, otherwise read from the log while
+    /// writes wait. The first call starts the buffer. Stops once about
+    /// `max_bytes` of records are taken (always at least one after `from`,
+    /// when there is one).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReplicaBehind`] when the log no longer holds `from`.
+    pub(crate) fn shipment(&self, from: Seq, max_bytes: usize) -> Result<Vec<(Seq, Arc<[u8]>)>> {
+        self.ship.start();
+        let mut records = match self.ship.from(from) {
+            Some(records) => records,
+            None => {
+                let frozen = self.freeze()?;
+                let mut records = Vec::new();
+                let mut oldest = None;
+                frozen.records(|at, bytes| {
+                    let seq = record::decode(bytes, at)?.seq;
+                    let _ = oldest.get_or_insert(seq);
+                    if seq >= from {
+                        records.push((seq, Arc::<[u8]>::from(bytes)));
+                    }
+                    Ok(())
+                })?;
+                if records.first().map(|r| r.0) != Some(from) {
+                    return Err(Error::ReplicaBehind {
+                        oldest: oldest.unwrap_or(frozen.last()),
+                    });
+                }
+                records
+            }
+        };
+        let mut total = 0;
+        let mut keep = 0;
+        for (i, (_, bytes)) in records.iter().enumerate() {
+            total += bytes.len();
+            keep = i + 1;
+            if i >= 1 && total >= max_bytes {
+                break;
+            }
+        }
+        records.truncate(keep);
+        Ok(records)
+    }
+
+    /// The last record in the log, with its sequence number: what a replica
+    /// compares a shipment's first record with.
+    pub(crate) fn last_record(&self) -> Result<Option<(Seq, Vec<u8>)>> {
+        let mut last = None;
+        self.log.replay(|at, bytes| {
+            last = Some((record::decode(bytes, at)?.seq, bytes.to_vec()));
+            Ok(())
+        })?;
+        Ok(last)
     }
 
     /// Replay the log into the engines. Returns the last sequence number

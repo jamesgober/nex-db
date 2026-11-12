@@ -131,6 +131,7 @@ mod ids;
 #[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
 pub mod metrics;
 mod observe;
+mod replica;
 #[cfg(feature = "auth")]
 mod table;
 mod wheel;
@@ -186,6 +187,7 @@ pub use crate::{
     feed::{Change, Feed, Position},
     ids::{AccountId, EntityId},
     observe::{CommitInfo, Health, Observer, SecurityEvent},
+    replica::{Replica, open_replica},
 };
 
 #[cfg(feature = "auth")]

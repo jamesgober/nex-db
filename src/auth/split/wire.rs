@@ -855,6 +855,11 @@ pub(crate) fn put_error(w: &mut Writer<'_>, err: &Error) {
             w.u8(11);
             w.u64(*oldest);
         }
+        Error::ReadOnlyReplica => w.u8(12),
+        Error::ReplicaBehind { oldest } => {
+            w.u8(13);
+            w.u64(*oldest);
+        }
     }
 }
 
@@ -903,6 +908,8 @@ fn read_error(r: &mut Reader<'_>) -> Result<Error> {
         9 => Error::SnapshotTooOld,
         10 => Error::Restricted { what: text(r)? },
         11 => Error::FeedBehind { oldest: r.u64()? },
+        12 => Error::ReadOnlyReplica,
+        13 => Error::ReplicaBehind { oldest: r.u64()? },
         _ => return Err(Error::corrupt(REPLY, 0)),
     };
     r.finish()?;
@@ -967,6 +974,14 @@ mod tests {
         ));
         let storage = round(&Error::storage("syncing", "disk gone"));
         assert!(storage.to_string().contains("disk gone"));
+        assert!(matches!(
+            round(&Error::ReadOnlyReplica),
+            Error::ReadOnlyReplica
+        ));
+        assert!(matches!(
+            round(&Error::ReplicaBehind { oldest: 9 }),
+            Error::ReplicaBehind { oldest: 9 }
+        ));
     }
 
     #[test]

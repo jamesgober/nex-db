@@ -367,7 +367,87 @@ fn recovery(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, auth, split, content, core, recovery);
+/// `replica/*`: a read replica following its primary. `ship_receive_100`
+/// seals 100 commits of one page each on the primary, and opens and commits
+/// them on the replica (both on this machine, so each side's syncs count).
+/// `commit_not_shipping` and `commit_while_shipping` are one `content().put`
+/// before and after the primary first ships: after it, each commit also
+/// keeps its record for the next shipment.
+fn replica(c: &mut Criterion) {
+    let dir = std::env::temp_dir().join(format!(
+        "nex-db-bench-replica-{}-{}",
+        std::process::id(),
+        unique()
+    ));
+    let primary = Database::open(dir.join("primary")).unwrap();
+    let _ = primary
+        .content()
+        .put(Entity::new("page").path("/seed"))
+        .unwrap();
+    let _ = primary.backup(dir.join("backup")).unwrap();
+    let _ = nex_db::restore(
+        dir.join("backup"),
+        dir.join("replica"),
+        nex_db::RestorePoint::Latest,
+    )
+    .unwrap();
+    let replica = nex_db::open_replica(dir.join("replica")).unwrap();
+    c.bench_function("replica/commit_not_shipping", |b| {
+        b.iter(|| {
+            let i = unique();
+            primary
+                .content()
+                .put(
+                    Entity::new("page")
+                        .field("n", i as i64)
+                        .path(format!("/b/{i}")),
+                )
+                .unwrap()
+        });
+    });
+    let mut shipment = Vec::new();
+    c.bench_function("replica/ship_receive_100", |b| {
+        b.iter_batched(
+            || {
+                for _ in 0..100 {
+                    let i = unique();
+                    let _ = primary
+                        .content()
+                        .put(
+                            Entity::new("page")
+                                .field("n", i as i64)
+                                .path(format!("/r/{i}")),
+                        )
+                        .unwrap();
+                }
+            },
+            |()| {
+                shipment.clear();
+                let _ = primary.ship(replica.position(), &mut shipment).unwrap();
+                black_box(replica.receive(&mut shipment.as_slice()).unwrap())
+            },
+            BatchSize::PerIteration,
+        );
+    });
+    c.bench_function("replica/commit_while_shipping", |b| {
+        b.iter(|| {
+            let i = unique();
+            primary
+                .content()
+                .put(
+                    Entity::new("page")
+                        .field("n", i as i64)
+                        .path(format!("/s/{i}")),
+                )
+                .unwrap()
+        });
+    });
+    drop(replica);
+    drop(primary);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+criterion_group!(benches, auth, split, content, core, recovery, replica);
 
 // The bench program is also the auth process of `auth/validate_split`.
 fn main() {

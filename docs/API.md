@@ -1004,10 +1004,71 @@ in one commit, when the restored database first opens.
 
 ## Read replica
 
-`nex_db::open_replica(dir, source) -> Result<Replica>` (0.8, P1) opens a copy
-that follows another database's log and serves reads only: the same read
-operations as `db.auth()`, `db.content()`, and `db.read`. Revocations reach it
-ahead of ordinary changes.
+A read replica (0.8, P1) is a copy of a database that follows its primary's
+commits and serves reads. It starts from a backup of the primary, restored
+once; from then on the primary writes the commits the replica lacks as a
+*shipment*, and the replica commits them in order. The application carries
+the bytes: a socket, a pipe, a file.
+
+```rust
+use nex_db::{Entity, RestorePoint};
+
+# let dir = std::env::temp_dir().join(format!("nex-db-api-replica-{}", std::process::id()));
+# let _ = std::fs::remove_dir_all(&dir);
+let primary = nex_db::open(dir.join("primary"))?;
+let _ = primary.auth().sign_up("ann@example.com", "correct horse battery staple")?;
+
+// Seed the replica once: a backup of the primary, restored where it runs.
+primary.backup(dir.join("backup"))?;
+nex_db::restore(dir.join("backup"), dir.join("replica"), RestorePoint::Latest)?;
+let replica = nex_db::open_replica(dir.join("replica"))?;
+
+// Each round: the replica's position goes to the primary, the shipment
+// comes back.
+let id = primary.content().put(Entity::new("page").field("title", "Hello").path("/hello"))?;
+let mut shipment = Vec::new();
+primary.ship(replica.position(), &mut shipment)?;
+replica.receive(&mut shipment.as_slice())?;
+assert_eq!(replica.position(), primary.position());
+assert!(replica.content().get(id)?.is_some());
+# drop(replica);
+# drop(primary);
+# std::fs::remove_dir_all(&dir).unwrap();
+# Ok::<(), nex_db::Error>(())
+```
+
+| Call | Since | Grade |
+|---|---|---|
+| `db.ship(after: Position, out: &mut impl Write) -> Result<Position>`: the commits after `after`, at most about 16 MiB per shipment | 0.8 | P1 |
+| `nex_db::open_replica(dir) -> Result<Replica>`, `Builder::open_replica()` | 0.8 | P1 |
+| `replica.receive(from: &mut impl Read) -> Result<Position>` | 0.8 | P1 |
+| `replica.position()`, `auth()`, `content()`, `read(..)`, `feed(after)`, `health()`, `path()` | 0.8 | P1 |
+
+- **Sealed end to end.** Every frame of a shipment is encrypted and
+  authenticated (XChaCha20-Poly1305) under a key both databases derive from
+  their root key, so a shipment may travel over any transport. A replica
+  refuses a frame that was changed, reordered, or taken from another
+  shipment (`Error::Corrupt`), and a shipment from another database, from
+  another position, or for a different history (`Error::Invalid`).
+- **Same commits, same path.** The replica commits each shipped record
+  through the path a local commit takes after it is encoded: durable in its
+  own log, applied from the bytes in order, then visible. Its log and stores
+  hold exactly the primary's commits; its change feed reports them.
+  Receiving a shipment twice is harmless; one cut short commits the records
+  that arrived whole.
+- **Reads only.** Every write on a replica fails with
+  `Error::ReadOnlyReplica`; scheduled publishing fires on the primary,
+  whose commits the replica receives.
+- **Behind a checkpoint.** A primary keeps its recent records in memory once
+  it has shipped (up to 32 MiB) and reads older ones from its log while writes
+  wait. When a checkpoint has dropped the commits a replica needs, `ship`
+  fails with `Error::ReplicaBehind`: seed the replica again from a new backup.
+- **Promotion.** A replica's directory is a complete database: to promote it
+  after losing the primary, drop the replica and `nex_db::open` the
+  directory.
+- **In 0.8:** revocations arrive in commit order with everything else (a
+  priority stream comes with replica groups), and neither side may run the
+  auth engine in its own process.
 
 ## Errors
 
@@ -1028,8 +1089,10 @@ ever contains a token, password, hash, or key.
 | `Storage { what, source }` | NEX-1008 | 0.1 | the operating system refused, or a write could not be made durable | check the disk; restart |
 | `SnapshotTooOld` | NEX-1009 | 0.3 | a `db.read` outlived its limit | read again |
 | `Restricted { what }` | NEX-1010 | 0.4 | a reference rule refuses a delete | remove the references first |
-| `AuthHalted` | NEX-1011 | 0.7 | the auth engine refuses every call after a security event | an operator resumes it |
+| `AuthHalted` | NEX-1011 | planned, with sealed mode | the auth engine refuses every call after a security event | an operator resumes it |
 | `FeedBehind { oldest }` | NEX-1012 | 0.4 | a change feed was asked for changes older than it keeps | drop what was built from the feed; start again from `db.position()` |
+| `ReadOnlyReplica` | NEX-1013 | 0.8 | a write was asked of a read replica | send it to the primary |
+| `ReplicaBehind { oldest }` | NEX-1014 | 0.8 | the primary no longer holds the commits a replica needs | seed the replica again from a new backup |
 
 `error.code()` returns the code. `Display` gives the message; `source()` gives
 the operating-system error for `Storage`.

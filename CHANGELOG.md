@@ -12,11 +12,11 @@ lsm-db 1.4 for the account and content stores.
 
 ### Changed
 
-- lsm-db 1.4 (from an independent review of it): a store whose manifest is missing or unreadable is never treated as new and nothing in it is deleted; a store directory is locked for its handle's life; a run's footer is checked (and carries a checksum in new runs), so a damaged count can no longer abort the process at compaction; a failed compaction leaves no temporary file behind; the block cache counts bytes. nex-db opens each store once, under its own directory lock, so none of this changes what it does; it removes those failure modes underneath it. Stores 0.8.0 wrote open as they are, and a store 0.8.1 writes still opens in 0.8.0.
+- lsm-db 1.4: a store whose manifest is missing or unreadable is never treated as new and nothing in it is deleted; a store directory is locked for its handle's life; a run's footer is checked (and carries a checksum in new runs), so a damaged count can no longer abort the process at compaction; a failed compaction leaves no temporary file behind; the block cache counts bytes. nex-db opens each store once, under its own directory lock, so none of this changes what it does; it removes those failure modes underneath it. Stores 0.8.0 wrote open as they are, and a store 0.8.1 writes still opens in 0.8.0.
 
 ## [0.8.0] - 2026-11-12
 
-Alpha: read replicas, signed audit exports, a simpler API, a faster split-auth check, and fixes from an independent review of the auth engine.
+Alpha: read replicas, signed audit exports, a simpler API, a faster split-auth check, and a round of security and data-safety fixes in the auth engine.
 
 ### Added
 

@@ -882,7 +882,7 @@ impl AuthEngine {
         batch.delete(totp_key(self.collection, account));
         batch.delete(recovery_key(self.collection, account));
         let start = store_key(self.collection, b'W', account.as_bytes());
-        for (index, _) in self.accounts.scan(crate::core::prefix_range(&start))? {
+        for (index, _) in self.accounts.scan_prefix(&start)? {
             if let Some(digest) = index.get(start.len()..) {
                 batch.delete(store_key(self.collection, b'w', digest));
             }
@@ -891,7 +891,7 @@ impl AuthEngine {
         // API keys have no index by account: every key record is read, which
         // an erasure, a rare call, can afford.
         let start = store_key(self.collection, b'k', b"");
-        for (key, value) in self.accounts.scan(crate::core::prefix_range(&start))? {
+        for (key, value) in self.accounts.scan_prefix(&start)? {
             let record = keys::KeyRecord::decode(&open_value(&self.file_key, &key, &value)?)?;
             if record.account == account {
                 batch.delete(api_key_id_key(self.collection, &record.id));

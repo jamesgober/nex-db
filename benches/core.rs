@@ -57,6 +57,40 @@ fn unique() -> u64 {
     COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+/// `n` sessions, over accounts of 1,000 each (an account's most).
+fn issue_many(db: &Database, name: &str, n: usize) -> Vec<nex_db::Token> {
+    let password = db.auth().hash_password("bench password").unwrap();
+    let ids: Vec<usize> = (0..n.div_ceil(1_000)).collect();
+    let accounts: Vec<nex_db::AccountId> = ids
+        .chunks(100)
+        .flat_map(|chunk| {
+            db.commit(|tx| {
+                chunk
+                    .iter()
+                    .map(|i| {
+                        tx.auth()
+                            .create_account(&format!("{name}{i}@example.com"), &password)
+                    })
+                    .collect::<nex_db::Result<Vec<_>>>()
+            })
+            .unwrap()
+        })
+        .collect();
+    let mut tokens = Vec::with_capacity(n);
+    for &account in &accounts {
+        let batch = (n - tokens.len()).min(1_000);
+        let issued = db
+            .commit(|tx| {
+                (0..batch)
+                    .map(|_| tx.auth().issue_session(account, SessionSpec::web()))
+                    .collect::<nex_db::Result<Vec<_>>>()
+            })
+            .unwrap();
+        tokens.extend(issued);
+    }
+    tokens
+}
+
 fn auth(c: &mut Criterion) {
     let t = TempDb::new("auth");
     let db = t.db();
@@ -117,23 +151,7 @@ fn validate_many(c: &mut Criterion) {
     for n in sizes {
         let t = TempDb::with("validate", |b| b.max_sessions(n + 1));
         let db = t.db();
-        let password = db.auth().hash_password("bench password").unwrap();
-        let account = db
-            .auth()
-            .create_account("many@example.com", &password)
-            .unwrap();
-        let mut tokens = Vec::with_capacity(n);
-        while tokens.len() < n {
-            let batch = (n - tokens.len()).min(4_000);
-            let issued = db
-                .commit(|tx| {
-                    (0..batch)
-                        .map(|_| tx.auth().issue_session(account, SessionSpec::web()))
-                        .collect::<nex_db::Result<Vec<_>>>()
-                })
-                .unwrap();
-            tokens.extend(issued);
-        }
+        let tokens = issue_many(db, "many", n);
         let mut group = c.benchmark_group("auth/validate_hit");
         let mut i = 0usize;
         let _ = group.bench_function(format!("{n}"), |b| {
@@ -320,11 +338,6 @@ fn recovery(c: &mut Criterion) {
     let mut t = TempDb::with("recovery", |b| b.max_sessions(n + 1));
     {
         let db = t.db();
-        let password = db.auth().hash_password("bench password").unwrap();
-        let account = db
-            .auth()
-            .create_account("recover@example.com", &password)
-            .unwrap();
         for i in 0..1_000 {
             let _ = db
                 .commit(|tx| {
@@ -335,21 +348,7 @@ fn recovery(c: &mut Criterion) {
                 })
                 .unwrap();
         }
-        let issue = |count: usize| {
-            let mut left: usize = count;
-            while left > 0 {
-                let batch = left.min(4_000);
-                let _ = db
-                    .commit(|tx| {
-                        (0..batch)
-                            .map(|_| tx.auth().issue_session(account, SessionSpec::web()))
-                            .collect::<nex_db::Result<Vec<_>>>()
-                    })
-                    .unwrap();
-                left -= batch;
-            }
-        };
-        issue(n);
+        let _ = issue_many(db, "recover", n);
     }
     let mut group = c.benchmark_group("core/recovery");
     let _ = group.sample_size(10);

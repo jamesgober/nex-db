@@ -34,15 +34,29 @@ fn main() {
     {
         let db = Database::builder(&dir).max_sessions(n + 1).open().unwrap();
         let password = db.auth().hash_password("bench password").unwrap();
-        let account = db
-            .auth()
-            .create_account("memory@example.com", &password)
-            .unwrap();
+        // Accounts of 1,000 sessions each (an account's most), made before
+        // the count starts.
+        let ids: Vec<usize> = (0..n.div_ceil(1_000)).collect();
+        let accounts: Vec<nex_db::AccountId> = ids
+            .chunks(100)
+            .flat_map(|chunk| {
+                db.commit(|tx| {
+                    chunk
+                        .iter()
+                        .map(|i| {
+                            tx.auth()
+                                .create_account(&format!("memory{i}@example.com"), &password)
+                        })
+                        .collect::<nex_db::Result<Vec<_>>>()
+                })
+                .unwrap()
+            })
+            .collect();
 
         let profiler = Profiler::start();
         let mut tokens = Vec::with_capacity(n);
-        while tokens.len() < n {
-            let batch = (n - tokens.len()).min(4_000);
+        for &account in &accounts {
+            let batch = (n - tokens.len()).min(1_000);
             let issued = db
                 .commit(|tx| {
                     (0..batch)

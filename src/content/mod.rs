@@ -289,7 +289,7 @@ impl ContentEngine {
         let mut any_links = false;
         let mut published_ms = 0;
         let start = entity_prefix(collection);
-        for (_, value) in store.scan(crate::core::prefix_range(&start))? {
+        for (_, value) in store.scan_prefix(&start)? {
             let head = Head::decode(&value, applied)?;
             lists.update(&head);
             tree.update(&head);
@@ -316,7 +316,7 @@ impl ContentEngine {
             }
         }
         let start = route_prefix(collection);
-        for (key, value) in store.scan(crate::core::prefix_range(&start))? {
+        for (key, value) in store.scan_prefix(&start)? {
             let name = key.get(start.len()..).unwrap_or_default();
             let (site, path) = split_route(name, applied)?;
             routes.set(site, path, 0, Some(decode_route(&value, applied)?));
@@ -452,7 +452,7 @@ impl ContentEngine {
     fn stored_referrers(&self, target: EntityId) -> Result<Vec<EntityId>> {
         let start = link_prefix(self.collection, target);
         self.store
-            .scan(crate::core::prefix_range(&start))?
+            .scan_prefix(&start)?
             .map(|(key, _)| {
                 key.get(start.len()..)
                     .and_then(|b| <[u8; 16]>::try_from(b).ok())
@@ -467,7 +467,7 @@ impl ContentEngine {
     fn all_heads(&self) -> Result<Vec<(Head, bool)>> {
         let start = entity_prefix(self.collection);
         self.store
-            .scan(crate::core::prefix_range(&start))?
+            .scan_prefix(&start)?
             .map(|(_, value)| Ok((Head::decode(&value, 0)?, Head::is_legacy(&value))))
             .collect()
     }
@@ -576,7 +576,7 @@ impl ContentEngine {
     fn revisions(&self, rid: EntityId) -> Result<Vec<RevisionInfo>> {
         let start = revision_prefix(self.collection, rid);
         let mut out = Vec::new();
-        for (key, value) in self.store.scan(crate::core::prefix_range(&start))? {
+        for (key, value) in self.store.scan_prefix(&start)? {
             let n = key
                 .get(start.len()..)
                 .and_then(|b| <[u8; 4]>::try_from(b).ok())
@@ -730,6 +730,9 @@ impl Engine for ContentEngine {
         let mut space = None;
         let mut types = None;
         let mut deleted = Vec::new();
+        // Revisions this commit writes, by entity: a delete later in the same
+        // commit removes them too (they are not in the store yet).
+        let mut written: HashMap<EntityId, Vec<Vec<u8>>> = HashMap::new();
         for op in &ops {
             match op {
                 Op::Create(record) => {
@@ -774,7 +777,9 @@ impl Engine for ContentEngine {
                     heads.push((head, false));
                 }
                 Op::PutRevision(rid, n, value) => {
-                    batch.put(revision_key(self.collection, *rid, *n), *value);
+                    let key = revision_key(self.collection, *rid, *n);
+                    batch.put(key.clone(), *value);
+                    written.entry(*rid).or_default().push(key);
                 }
                 Op::PutRoute(site, path, value) => {
                     let entry = decode_route(value, seq)?;
@@ -802,7 +807,10 @@ impl Engine for ContentEngine {
                     self.versions.record(&key, seq, None, || Ok(old.clone()))?;
                     batch.delete(key);
                     let start = revision_prefix(self.collection, *rid);
-                    for (rev, _) in self.store.scan(crate::core::prefix_range(&start))? {
+                    for (rev, _) in self.store.scan_prefix(&start)? {
+                        batch.delete(rev);
+                    }
+                    for rev in written.remove(rid).unwrap_or_default() {
                         batch.delete(rev);
                     }
                     changes.push(Change::EntityChanged {
@@ -2049,6 +2057,12 @@ impl ContentTx<'_, '_> {
             let _ = self.staged.links.insert((target, rid), false);
         }
         self.staged.heads.retain(|h| h.rid != rid);
+        // Revisions this work recorded for the entity go with it: never
+        // written, rather than written and left behind.
+        self.staged
+            .ops
+            .retain(|op| !matches!(op, StagedOp::Revision(r, ..) if *r == rid));
+        self.staged.revisions.retain(|(r, _), _| *r != rid);
         let _ = self.staged.deleted.insert(rid);
         self.staged.ops.push(StagedOp::Delete(rid));
         self.staged

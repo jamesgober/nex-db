@@ -204,7 +204,7 @@ From 0.3 the builder configures what `open` takes by default:
 | `.auth(AuthMode::embedded())`, `AuthMode::separate_process()`, `AuthMode::separate_process_program(path)` (feature `split-auth`) | 0.5 | embedded |
 | `.max_snapshot_age(Duration)` | planned (fixed at the default until then) | 60 s |
 | `.checkpoint_every(bytes)`: log written between checkpoints, which bound the log and the time an open takes | 0.3 | 64 MiB |
-| `.max_sessions(n)`: sessions and revocations held at once; past it `issue_session` fails with `Busy` | 0.3 | 1,000,000 |
+| `.max_sessions(n)`: sessions and revocations held at once; past it `issue_session` fails with `Busy`; since 0.8 one account holds at most 1,000 live sessions and 16 live single-use tokens (a new one evicts its oldest) | 0.3 | 1,000,000 |
 | `.commit_queue(n)`, `.hashing_slots(n)` | planned (fixed at the defaults until then) | 4,096; one per CPU |
 | `.idempotency_window(Duration)` | planned, with `commit_with` | 24 hours |
 | `.cache(bytes)` | planned (until then 4,096 entities per space) | 256 MiB |
@@ -307,10 +307,15 @@ Rules:
 
 - Nothing is written until the closure returns `Ok`. An `Err` from the closure
   is returned unchanged and nothing is written.
-- Isolation is snapshot isolation: a commit conflicts when a key it writes was
-  committed by someone else after it started. On a conflict the closure runs
-  again, up to four times in all, then `commit` returns `Error::Conflict`. The
-  closure must therefore have no side effects outside `tx`.
+- Reads inside the closure see the latest committed state, not one fixed
+  snapshot: two reads can straddle another commit. Writes are first-committer
+  wins: a commit conflicts when a key it writes was committed by someone else
+  after it started. On a conflict the closure runs again, up to four times in
+  all, then `commit` returns `Error::Conflict`. The closure must therefore have
+  no side effects outside `tx`. When a write is derived from what the closure
+  read (a total, a counter, an index page), use `commit_serializable`, which
+  also conflicts when a key the closure read was committed after it started.
+  (Before 0.8 this said "snapshot isolation", which the reads did not give.)
 - Do slow work (hashing a password) before `commit`, not inside it.
 - Return what the commit made (an `AccountId`, a `Token`, a `EntityId`) from the
   closure. A value kept from an attempt that was retried never becomes valid.
@@ -403,12 +408,13 @@ opaque to nex-db.
 |---|---|---|---|
 | `validate(token) -> Result<Validation>` | 0.1 | P0 | read only |
 | `issue_session(account, spec) -> Result<Token>` | 0.1 | P0 | durable |
-| `revoke(token) -> Result<bool>` | 0.1 | P0 | takes effect ahead of ordinary commits; `false` when the token names no session or one already revoked; on a decoy, retires it |
+| `revoke(token) -> Result<bool>` | 0.1 | P0 | takes effect ahead of ordinary commits; `false` when the token names no session or one already revoked; on a decoy (0.8), `false`, `SecurityEvent::DecoyPresented`, and the decoy stays planted |
+| `retire_decoy(token) -> Result<bool>` | 0.8 | defence | removes a planted decoy; `false` when the token is not one; also in a transaction |
 | `rotate(token) -> Result<Token>` | 0.3 | P0 | the old token becomes `Revoked { Rotated }` |
 | `revoke_all(account) -> Result<u32>` | 0.3 | P0 | signs the account out everywhere; returns how many sessions ended |
 | `sessions(account) -> Result<Vec<SessionInfo>>` | 0.4 | P2 | newest first; `SessionInfo`: `id()`, `created_at()`, `expires_at()`, `last_used_at()`, `idle_limit()`; never tokens or digests; single-use tokens are not listed |
 | `revoke_session(account, SessionId) -> Result<bool>` | 0.4 | P2 | for "sign out that device"; a `SessionId` (32 hex digits as text) is a keyed digest of the session's digest: random to anyone without the keys and no way to the token; also in a transaction |
-| `plant_decoy() -> Result<Token>` | 0.7 | defence | a token that names no session, for places only an attacker would use it; `validate` answers `Unknown`, as for any token never issued, and raises `SecurityEvent::DecoyPresented`; never reclaimed; `revoke` retires it; also in a transaction |
+| `plant_decoy() -> Result<Token>` | 0.7 | defence | a token that names no session, for places only an attacker would use it; `validate` answers `Unknown`, as for any token never issued, and raises `SecurityEvent::DecoyPresented`; never reclaimed; `retire_decoy` removes it (0.8; before, `revoke` did); also in a transaction |
 
 ### Accounts and passwords
 
@@ -456,10 +462,10 @@ it.
 | `create_account(identifier, &HashedPassword) -> Result<AccountId>` | 0.1 | P0 | unique by identifier |
 | `sign_up(identifier, password) -> Result<AccountId>` | 0.8 | P0 | `hash_password` and `create_account` in one call and its own commit; in a transaction, hash first and use `create_account` |
 | `sign_in(identifier, password, spec) -> Result<SignIn>` | 0.1 | P0 | check and issue in one call |
-| `verify_password(identifier, password) -> Result<PasswordCheck>` | 0.3 | P1 | check only; ten failures within fifteen minutes lock the account out for fifteen minutes (set per realm from `RealmPolicy`) |
+| `verify_password(identifier, password) -> Result<PasswordCheck>` | 0.3 | P1 | check only; ten failures within fifteen minutes lock sign-in out for fifteen minutes (set per realm from `RealmPolicy`); see below |
 | `account(id) -> Result<Option<Account>>` | 0.4 | P0 | standing, created, roles; never the hash, never identifiers |
 | `standing(account) -> Result<Option<Standing>>` | 0.3 | P0 | the read a request makes when a session's `recheck_at` has passed |
-| `set_standing(account, Standing, by: Option<AccountId>) -> Result<()>` | 0.3 | P0 | a ban or lock-out ends every session at once; `by` is `None` for an automatic lock-out |
+| `set_standing(account, Standing, by: Option<AccountId>) -> Result<()>` | 0.3 | P0 | a ban, suspension, or lock-out set here ends every session at once; `by` names who set it |
 | `set_password(account, &HashedPassword) -> Result<()>` | 0.4 | P1 | ends the account's other sessions |
 | `add_identifier(account, identifier)`, `remove_identifier(account, identifier) -> Result<bool>` | 0.4 | P1 | a second email, a username; at most five per account, and never fewer than one |
 | `erase_account(account) -> Result<()>` (also in a transaction) | 0.5 | P2 | removes the account's records (record and password hash, identifiers, TOTP, recovery codes, passkeys, API keys) and destroys its data key, so no copy of its private records in the log, a store file, or a backup restored by nex-db can be read; its sessions end as `Revoked { Erased }`; its identifiers are free again; commits ahead of ordinary commits. Content referring to the account is the application's |
@@ -468,14 +474,28 @@ it.
 `LockedOut { until: Option<SystemTime> }` (0.3) and
 `NeedsSecondFactor { challenge }` (0.4.1). `LockedOut` covers a lock-out, a
 suspension, and a ban; `until` is `None` when only an administrator can lift
-it. It is returned only after the password matched. A wrong password on a
-locked-out account, or an unknown identifier, gives `Failed` after the same
-work, so only someone who knows the password learns the account is locked.
+it.
+
+Since 0.8, while sign-in is locked out no password is checked: every password
+answers `LockedOut`, after the same work as a check, so a guess made during a
+lock-out learns nothing (before 0.8 only the right password answered
+`LockedOut`, which named it). The lock-out after repeated failures counts
+failures per account, and per identifier for one that names no account, so a
+known and an unknown identifier lock out after the same failures and answer
+alike. It is held in memory and kept in the session checkpoint, so it
+survives a clean restart (not a crash); it commits nothing and ends no
+session: someone who never had the password cannot sign the owner out of
+their devices. A ban, a suspension, or a lock-out an administrator sets with
+`set_standing` is durable and does end the account's sessions. Second-factor
+checks (`verify_totp`, `check_totp`) count toward the same lock-out. When the
+failure table holds 100,000 live windows, the oldest go first; counting never
+stops.
 
 `PasswordCheck` is `SignIn` without the session: `Verified(AccountId)`, `Failed`,
 `LockedOut { until }`, `NeedsSecondFactor { account }` (0.4.1: the password
 matched and the account has TOTP on; it is not signed in until
-`check_totp` accepts a code).
+`check_totp` accepts a code; a wrong code counts as a failure, and while the
+account is locked out `check_totp` answers `false` for every code).
 
 An account with TOTP on never signs in on its password alone, in any build:
 one without the `mfa` feature answers `NeedsSecondFactor` too, and cannot
@@ -492,16 +512,16 @@ every session of the account in the same commit.
 
 | Operation | Grade | Notes |
 |---|---|---|
-| `add_totp(account) -> Result<TotpEnrollment>`, `confirm_totp(account, code) -> Result<bool>`, `remove_totp(account) -> Result<bool>` (0.4.1, feature `mfa`; also in a transaction) | P1 | a 160-bit secret, sealed; `TotpEnrollment::secret()` (base32) and `uri(issuer, label)` (`otpauth://`, SHA1, six digits, 30 s) shown once; TOTP is on once a code is confirmed |
+| `add_totp(account) -> Result<TotpEnrollment>`, `confirm_totp(account, code) -> Result<bool>`, `remove_totp(account) -> Result<bool>` (0.4.1, feature `mfa`; also in a transaction) | P1 | a 160-bit secret, sealed; `TotpEnrollment::secret()` (base32) and `uri(issuer, label)` (`otpauth://`, SHA1, six digits, 30 s) shown once; TOTP is on once a code is confirmed; since 0.8 `add_totp` on an account with TOTP on keeps the confirmed secret in force until a code of the new one is confirmed |
 | `verify_totp(challenge, code, spec) -> Result<SignIn>` (0.4.1, feature `mfa`) | P1 | completes `SignIn::NeedsSecondFactor`: the challenge is a single-use token that lasts five minutes; a wrong code counts toward lock-out and leaves the challenge for another try; a code works once (one step of drift either way) |
-| `check_totp(account, code) -> Result<bool>` (0.4.1, feature `mfa`; also in a transaction) | P1 | after `PasswordCheck::NeedsSecondFactor`, for an application that issues its own sessions |
+| `check_totp(account, code) -> Result<bool>` (0.4.1, feature `mfa`; also in a transaction) | P1 | after `PasswordCheck::NeedsSecondFactor`, for an application that issues its own sessions; since 0.8 a wrong code counts toward the account's lock-out, and while it is locked out every code answers `false` |
 | `new_recovery_codes(account) -> Result<RecoveryCodes>` (tx) | P1 | ten codes, `xxxxx-xxxxx` (Crockford base32, 50 bits each); replaces any earlier codes; shown once (`codes()`); stored as keyed digests |
 | `use_recovery_code(account, code) -> Result<bool>` (tx) | P1 | `true` once per code; dashes, spaces, and case ignored; two uses at once give `true` to one |
 | `passkey_registration(account) -> Result<PasskeyChallenge>`, `add_passkey(account, &RelyingParty, &PasskeyRegistration) -> Result<PasskeyId>` (0.4.1, feature `mfa`; also in a transaction) | P2 | the challenge's bytes go to `navigator.credentials.create` (`as_bytes()`, `to_base64url()`), the account's id as the user id; checks the client data (type, challenge, origin, not cross-origin), the RP ID hash, user presence (and verification with `RelyingParty::require_user_verification`), and that the key is `ES256`, `EdDSA`, or `RS256`; attestation is not checked; `PasskeyRegistration::new(client_data_json, authenticator_data)` |
 | `passkey_sign_in() -> Result<PasskeyChallenge>`, `verify_passkey(&RelyingParty, &PasskeyAssertion, spec) -> Result<SignIn>` (0.4.1, feature `mfa`) | P2 | a sign-in of its own (no password, no TOTP); the same checks, the signature, and a rising signature counter (an authenticator that keeps it at zero is allowed); `PasskeyAssertion::new(credential_id, client_data_json, authenticator_data, signature)`; challenges work once, within five minutes |
 | `passkeys(account) -> Result<Vec<PasskeyInfo>>`, `remove_passkey(account, PasskeyId) -> Result<bool>` (0.4.1, feature `mfa`) | P2 | `PasskeyInfo`: `id()`, `created_at()`, `last_used_at()` |
 | `single_use_token(purpose, account, ttl) -> Result<Token>` | P1 | email verification, magic link, preview; `Purpose` (non-exhaustive): `VerifyEmail`, `ResetPassword`, `SignInLink`, `Preview`, `Custom(u16)`; `ttl` at most 30 days; never validates as a session; also in a transaction |
-| `single_use_token_for(identifier, purpose, ttl) -> Result<Option<Token>>` | P1 | password reset by email address; the same work whether the identifier exists or not, so answer the same either way |
+| `single_use_token_for(identifier, purpose, ttl) -> Result<Option<Token>>` | P1 | password reset by email address; the same work whether the identifier exists or not, so answer the same either way; since 0.8 a request for an unknown identifier takes no room in the session table; rate-limit the requests (each is a commit and an email) |
 | `redeem(token, purpose) -> Result<Option<AccountId>>` | P1 | works once, for the purpose it was issued for; two redeems at once give the account to one; also in a transaction |
 | `create_api_key(account, scopes: &[&str], expiry: Option<SystemTime>) -> Result<ApiKey>` | P1 | the key text (`as_str()`) is shown once; `id()` to revoke it; at most 32 scopes of 1 to 64 bytes without spaces, stored and returned as given; also in a transaction |
 | `validate_api_key(text) -> Result<ApiKeyCheck>`, `revoke_api_key(id) -> Result<bool>` | P1 | `ApiKeyCheck` (non-exhaustive): `Valid { account, id, scopes }`, `Expired`, `Revoked`, `Unknown`, `Malformed`; one read of the account store; a session token is never a key, nor a key a session |
@@ -515,10 +535,18 @@ every session of the account in the same commit.
 
 ### Audit (0.3)
 
-Every security-relevant write (account created, signed in, failed, locked,
-standing changed, revoked) adds an event to the realm's hash-chained audit
-log in the same commit. The chain is keyed (BLAKE3 under a key derived from
-the root key), so checking it takes the key.
+Every security write a commit applies (an account created or erased, a
+session issued, rotated, revoked, or evicted, a sign-out everywhere, a
+password, identifier, role, or standing changed, a decoy planted) adds an
+event to the realm's hash-chained audit log in the same commit. A failed
+sign-in commits nothing, so it is not in the log; failures are counted in
+memory for the lock-out (see `verify_password`). The chain is keyed (BLAKE3
+under a key derived from the root key), so checking it takes the key.
+
+The chain is not encrypted: anyone who reads the directory sees each
+event's kind, time, and account id (not identifiers, passwords, or tokens),
+including when decoys were planted, and an erased account's history stays.
+Sealing it is planned.
 
 With the `audit-export` feature (0.8, P3), `db.auth().audit_export(ids) ->
 Result<AuditExport>` verifies the whole chain and signs the records with ids
@@ -566,7 +594,20 @@ hashes, and seals and opens the auth parts of the log. The application
 process keeps the commit log, the catalog, and the content engine, and holds
 no auth key: it stores the auth parts of each commit as they come sealed. A
 commit across auth and content is still one record of one log, so it stays
-atomic.
+atomic. Split auth takes the key from a file (`Keys::file`, or
+`Keys::in_directory`); since 0.8 it refuses `Keys::env`, because the auth
+process inherits its environment from the application, which would then hold
+the key in its environment for its whole life.
+
+What the split defends against: a bug in the application that discloses its
+memory (a buffer over-read, a leaked core dump) shows no auth key, no
+password hash, and no decrypted auth record. What it does not: the auth
+process runs as the same OS user, so an attacker who runs code in the
+application can read the auth process's memory (ptrace on Linux unless
+restricted, `ReadProcessMemory` on Windows) and can drive every auth operation
+over the channel. Running the auth process as another user, with its key file
+readable by that user only, would add protection against a compromised
+application; nex-db does not do that itself.
 
 | Call | Since | Grade |
 |---|---|---|
@@ -588,7 +629,13 @@ fn main() -> nex_db::Result<()> {
 Every auth call is the same in both modes, with the same results. Each one
 crosses a pipe to the auth process (the child's standard input and output,
 which nothing else can reach): a session check is one round trip, a commit
-that touches auth one round trip per staged operation and two more. In split
+that touches auth one round trip per staged operation and two more. Since
+0.8 a session check allocates nothing in the application once its thread has
+made one, as in embedded mode, and both processes wipe every frame (which
+carries passwords, tokens, and secrets) once it is sent or handled. A request
+waits at most two minutes for its answer, a checkpoint or backup one hour;
+past that the auth process is ended and writes stop, as below. An answer too
+long for one frame (16 MiB) returns `Error::Invalid`. In split
 mode `hash_password` returns a handle to a hash the auth process keeps; it
 works with the database that made it for ten minutes, then gives
 `Error::Invalid { field: "password", .. }`: hash again. A database opens in
@@ -991,7 +1038,8 @@ identifier; nex-db never keeps one to itself. `SecurityEvent`
 identifier no account has), `LockedOut { account }`, `SignInBlocked`,
 `RevokedSessionPresented`, `CanaryRequested` (a canary path was resolved; the
 path is the one the application resolved on that thread), and
-`DecoyPresented` (a decoy token was validated). Observers run on the calling thread, so they hand
+`DecoyPresented` (a decoy token was validated, revoked, rotated, or
+redeemed). Observers run on the calling thread, so they hand
 slow work to another thread. `Recovering` is not seen through this API in
 0.4, since `open` returns once recovery is done; it is for split auth.
 

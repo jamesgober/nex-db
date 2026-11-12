@@ -142,6 +142,18 @@ const OP_CREATE_KEYED_ACCOUNT: u8 = 15;
 const OP_ERASE_ACCOUNT: u8 = 16;
 /// A decoy token's digest (0.7): digest [32], at_ms u64.
 const OP_PLANT_DECOY: u8 = 17;
+/// An account's oldest session or token, removed for a new one (0.8):
+/// digest [32], at_ms u64.
+const OP_EVICT_SESSION: u8 = 18;
+
+/// Most live sessions one account holds; a new one evicts the oldest.
+const MAX_SESSIONS_PER_ACCOUNT: usize = 1_000;
+/// Most live single-use tokens and challenges one account holds; a new one
+/// evicts the oldest.
+const MAX_SINGLE_USE_PER_ACCOUNT: usize = 16;
+/// Most open passkey sign-in challenges (they name no account); a new one
+/// evicts the oldest.
+const MAX_OPEN_CHALLENGES: usize = 10_000;
 /// The epoch of an erased account: its sessions end as `Erased`.
 pub(crate) const ERASED_EPOCH: u32 = u32::MAX;
 /// The data key file, next to the account store.
@@ -162,11 +174,20 @@ const UPDATE_SEVERAL: u8 = 5;
 /// [`MAX_ACCOUNT_ROLES`] it keeps the largest account record inside one
 /// sealed bucket.
 const MAX_IDENTIFIERS: usize = 5;
+/// The policy every password check runs under: at most
+/// [`types::MAX_HASH_COST`], Argon2id only.
+const CHECK_POLICY: kdf::Argon2Policy = kdf::Argon2Policy::new().with_max_cost(
+    types::MAX_HASH_COST.0,
+    types::MAX_HASH_COST.1,
+    types::MAX_HASH_COST.2,
+);
+
 /// Most roles one account holds.
 const MAX_ACCOUNT_ROLES: usize = 16;
 
-/// Accounts whose failures are counted at once; older windows are dropped
-/// first when it fills.
+/// Accounts and unknown identifiers whose failures are counted at once.
+/// When it fills, the oldest windows that hold no lock-out go first, then
+/// the oldest of all: counting never stops for a new one.
 const MAX_COUNTED: usize = 100_000;
 const OP_REVOKE_SESSION: u8 = 3;
 
@@ -195,7 +216,9 @@ const META_APPLIED: &[u8] = b"\0meta/applied";
 const SESSIONS_FILE: &str = "sessions.ckpt";
 
 /// Format of the session checkpoint file.
-const SESSIONS_FORMAT: u16 = 1;
+const SESSIONS_FORMAT: u16 = 2;
+/// The session checkpoint before it held lock-outs (0.1 to 0.7).
+const SESSIONS_FORMAT_1: u16 = 1;
 
 /// Slot kinds in the session checkpoint.
 const SLOT_LIVE: u8 = 1;
@@ -456,8 +479,10 @@ pub(crate) struct AuthEngine {
     audit_sign: Zeroizing<[u8; 32]>,
     /// Account record versions kept for running snapshots.
     versions: Versions,
-    /// Failed sign-ins per account: count and window start.
-    failures: Mutex<HashMap<AccountId, (u32, u64)>>,
+    /// Failed sign-ins and second-factor checks, by [`Throttled`] key: an
+    /// account's id, or the keyed digest of an identifier that names none,
+    /// so a known and an unknown identifier lock out alike.
+    failures: Mutex<HashMap<[u8; 16], Throttle>>,
     conflicts: ConflictTable,
     /// Password hashes in progress, bounded by `max_hashing`.
     hashing: AtomicUsize,
@@ -567,6 +592,20 @@ impl AuthEngine {
             engine
                 .sessions_through
                 .store(checkpoint.through, Ordering::Release);
+            let mut failures = engine
+                .failures
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for (key, until) in checkpoint.lockouts {
+                let _ = failures.insert(
+                    key,
+                    Throttle {
+                        count: 0,
+                        start: 0,
+                        until,
+                    },
+                );
+            }
         }
         Ok(engine)
     }
@@ -616,6 +655,13 @@ impl AuthEngine {
                     });
                 }
             }
+        }
+        // Lock-outs in force, so a restart does not lift one (format 2).
+        let lockouts = self.lockouts(now_ms());
+        w.u32(u32::try_from(lockouts.len()).map_err(|_| Error::invalid("lock-outs", "too many"))?);
+        for (key, until) in &lockouts {
+            w.bytes(key);
+            w.u64(*until);
         }
         let sealed = seal_value(&self.file_key, &sessions_aad(through), &plain)?;
         let mut file = Vec::with_capacity(14 + sealed.len());
@@ -836,7 +882,7 @@ impl AuthEngine {
         batch.delete(totp_key(self.collection, account));
         batch.delete(recovery_key(self.collection, account));
         let start = store_key(self.collection, b'W', account.as_bytes());
-        for (index, _) in self.accounts.scan(crate::core::prefix_range(&start))? {
+        for (index, _) in self.accounts.scan_prefix(&start)? {
             if let Some(digest) = index.get(start.len()..) {
                 batch.delete(store_key(self.collection, b'w', digest));
             }
@@ -845,7 +891,7 @@ impl AuthEngine {
         // API keys have no index by account: every key record is read, which
         // an erasure, a rare call, can afford.
         let start = store_key(self.collection, b'k', b"");
-        for (key, value) in self.accounts.scan(crate::core::prefix_range(&start))? {
+        for (key, value) in self.accounts.scan_prefix(&start)? {
             let record = keys::KeyRecord::decode(&open_value(&self.file_key, &key, &value)?)?;
             if record.account == account {
                 batch.delete(api_key_id_key(self.collection, &record.id));
@@ -857,6 +903,17 @@ impl AuthEngine {
 
     /// Seal `plain`, a private record of `account` stored at `store_key`,
     /// under the account's data key, made (and synced) when it has none.
+    /// Destroy the keys made before `before_ms` for accounts whose
+    /// creating commit never landed and whose creating work is over.
+    fn drop_orphan_keys(&self, before_ms: u64) -> Result<()> {
+        for account in self.keys.settle(before_ms) {
+            if !self.account_exists(account)? {
+                self.keys.destroy(account)?;
+            }
+        }
+        Ok(())
+    }
+
     fn seal_private(&self, account: AccountId, store_key: &[u8], plain: &[u8]) -> Result<Vec<u8>> {
         let key = self.keys.get_or_make(account, now_ms())?;
         seal_with(&key, DATA_KEY_ID, store_key, plain)
@@ -963,6 +1020,13 @@ impl AuthEngine {
                 account(session.account),
             ),
             Op::PlantDecoy { at_ms, .. } => (*at_ms, "session.decoy_planted", "session".to_owned()),
+            Op::EvictSession { digest, at_ms } => {
+                let target = match self.sessions.get(digest) {
+                    Some(Slot::Live(session)) => account(session.account),
+                    _ => "session".to_owned(),
+                };
+                (*at_ms, "session.evicted", target)
+            }
             Op::RevokeSession {
                 digest,
                 reason,
@@ -1090,6 +1154,7 @@ impl AuthEngine {
             Op::EraseAccount { account, .. } => Change::AccountErased { account: *account },
             Op::IssueSession { .. }
             | Op::PlantDecoy { .. }
+            | Op::EvictSession { .. }
             | Op::SetIdentifier { .. }
             | Op::SetPolicy { .. }
             | Op::PutKey { .. }
@@ -1120,31 +1185,72 @@ impl AuthEngine {
         Ok(())
     }
 
-    /// Count a failed sign-in of `account` at `now`. Returns the failures in
-    /// the current window.
-    fn count_failure(&self, account: AccountId, now: u64) -> u32 {
-        let window = self.realm().lockout_window_ms;
+    /// Count a failure for `key` at `now`. On the realm's
+    /// `lockout_failures`-th failure within its window, lock `key` out for
+    /// the realm's lock-out time, and return when the lock-out ends.
+    fn count_failure(&self, key: [u8; 16], now: u64) -> Option<u64> {
+        let realm = self.realm();
         let mut failures = self.failures.lock().unwrap_or_else(PoisonError::into_inner);
-        if failures.len() >= MAX_COUNTED && !failures.contains_key(&account) {
-            failures.retain(|_, (_, start)| now.saturating_sub(*start) < window);
+        if failures.len() >= MAX_COUNTED && !failures.contains_key(&key) {
+            failures.retain(|_, t| t.live(now, realm.lockout_window_ms));
             if failures.len() >= MAX_COUNTED {
-                return 0;
+                // Still full of live windows: drop the oldest that holds no
+                // lock-out (or the oldest of all), never refuse to count.
+                let oldest = failures
+                    .iter()
+                    .min_by_key(|(_, t)| (t.until > now, t.start))
+                    .map(|(k, _)| *k);
+                if let Some(oldest) = oldest {
+                    let _ = failures.remove(&oldest);
+                }
             }
         }
-        let entry = failures.entry(account).or_insert((0, now));
-        if now.saturating_sub(entry.1) >= window {
-            *entry = (0, now);
+        let entry = failures.entry(key).or_insert(Throttle {
+            count: 0,
+            start: now,
+            until: 0,
+        });
+        if now.saturating_sub(entry.start) >= realm.lockout_window_ms {
+            entry.count = 0;
+            entry.start = now;
         }
-        entry.0 += 1;
-        entry.0
+        entry.count += 1;
+        if entry.count >= realm.lockout_failures {
+            entry.count = 0;
+            entry.start = now;
+            entry.until = now.saturating_add(realm.lockout_ms);
+            return Some(entry.until);
+        }
+        None
     }
 
-    fn clear_failures(&self, account: AccountId) {
+    /// When `key`'s lock-out ends, if it is locked out at `now`.
+    fn locked_until(&self, key: [u8; 16], now: u64) -> Option<u64> {
+        self.failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .map(|t| t.until)
+            .filter(|&until| until > now)
+    }
+
+    fn clear_failures(&self, key: [u8; 16]) {
         let _ = self
             .failures
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(&account);
+            .remove(&key);
+    }
+
+    /// The lock-outs in force at `now`, for the session checkpoint.
+    fn lockouts(&self, now: u64) -> Vec<([u8; 16], u64)> {
+        self.failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(_, t)| t.until > now)
+            .map(|(k, t)| (*k, t.until))
+            .collect()
     }
 
     /// Take a password-hashing slot, or fail with [`Error::Busy`].
@@ -1173,10 +1279,7 @@ impl AuthEngine {
             None => Validation::Unknown,
             Some((Slot::Decoy, ..)) => return (Validation::Unknown, true),
             Some((Slot::Revoked(reason), ..)) => Validation::Revoked { reason },
-            Some((Slot::Live(session), ..)) if now >= session.expires_ms => Validation::Expired,
-            Some((Slot::Live(session), seen, _))
-                if session.idle_ms != 0 && now.saturating_sub(seen) >= session.idle_ms =>
-            {
+            Some((Slot::Live(session), seen, _)) if !in_time(&session, seen, now) => {
                 Validation::Expired
             }
             Some((Slot::Live(session), _, place)) => {
@@ -1199,30 +1302,62 @@ impl AuthEngine {
     /// Argon2id check, like a wrong password.
     fn check(&self, identifier: &str, password: &str) -> Result<Checked> {
         check_password(password)?;
-        let found = match normalize_identifier(identifier) {
-            Ok(normalized) => match self.account_for(&self.identifier_digest(&normalized))? {
+        let digest = normalize_identifier(identifier)
+            .ok()
+            .map(|normalized| self.identifier_digest(&normalized));
+        let found = match &digest {
+            Some(digest) => match self.account_for(digest)? {
                 Some(account) => self.load_account(account)?.map(|record| (account, record)),
                 None => None,
             },
-            Err(_) => None,
+            None => None,
+        };
+        // The throttle key: the account, or the identifier that names none,
+        // so both lock out after the same failures and answer alike.
+        let key = match (&found, &digest) {
+            (Some((account, _)), _) => *account.as_bytes(),
+            (None, Some(digest)) => throttle_key(digest),
+            (None, None) => throttle_key(&mac::blake3_keyed(
+                &self.identifier_key,
+                identifier.as_bytes(),
+            )),
         };
         let _slot = self.hashing_slot()?;
         // Built before the lookup result is used, so the first sign-in of a
         // process costs the same extra hash whether the identifier exists or
         // not.
         let dummy = self.dummy_hash()?;
+        let now = now_ms();
+        // Locked out, by failures or by the account's standing: no password
+        // is checked, and every password answers the same, after the same
+        // work as a check. A guess during a lock-out learns nothing.
+        let blocked = self
+            .locked_until(key, now)
+            .map(|until| Some(time_of(until)))
+            .or_else(|| {
+                found
+                    .as_ref()
+                    .and_then(|(_, record)| record.standing.blocked_until(now))
+            });
+        if let Some(until) = blocked {
+            let _ = kdf::argon2_check_with_policy(dummy, password.as_bytes(), &CHECK_POLICY);
+            return Ok(Checked::Blocked(until));
+        }
         match found {
-            Some((account, record)) => match kdf::argon2_check(&record.phc, password.as_bytes()) {
-                Ok(()) => Ok(match record.standing.blocked_until(now_ms()) {
-                    Some(until) => Checked::Blocked(until),
-                    None => Checked::Verified(account),
-                }),
-                Err(crypt_io::Error::AuthenticationFailed) => Ok(Checked::Wrong(Some(account))),
-                Err(_) => Err(Error::corrupt("a stored password hash", 0)),
-            },
+            Some((account, record)) => {
+                match kdf::argon2_check_with_policy(&record.phc, password.as_bytes(), &CHECK_POLICY)
+                {
+                    Ok(()) => Ok(Checked::Verified(account)),
+                    Err(crypt_io::Error::AuthenticationFailed) => Ok(Checked::Wrong {
+                        account: Some(account),
+                        key,
+                    }),
+                    Err(_) => Err(Error::corrupt("a stored password hash", 0)),
+                }
+            }
             None => {
-                let _ = kdf::argon2_check(dummy, password.as_bytes());
-                Ok(Checked::Wrong(None))
+                let _ = kdf::argon2_check_with_policy(dummy, password.as_bytes(), &CHECK_POLICY);
+                Ok(Checked::Wrong { account: None, key })
             }
         }
     }
@@ -1377,14 +1512,6 @@ impl AuthRef<'_> {
         }
     }
 
-    fn realm(self) -> realm::RealmPolicy {
-        match self {
-            AuthRef::Local(engine) => engine.realm(),
-            #[cfg(feature = "split-auth")]
-            AuthRef::Remote(remote) => remote.realm(),
-        }
-    }
-
     /// The validation, and whether the token was a decoy.
     fn validate(self, token: &str) -> Result<(Validation, bool)> {
         match self {
@@ -1410,22 +1537,31 @@ impl AuthRef<'_> {
         }
     }
 
-    fn clear_failures(self, account: AccountId) -> Result<()> {
+    fn clear_failures(self, key: [u8; 16]) -> Result<()> {
         match self {
             AuthRef::Local(engine) => {
-                engine.clear_failures(account);
+                engine.clear_failures(key);
                 Ok(())
             }
             #[cfg(feature = "split-auth")]
-            AuthRef::Remote(remote) => remote.clear_failures(account),
+            AuthRef::Remote(remote) => remote.clear_failures(key),
         }
     }
 
-    fn count_failure(self, account: AccountId, now: u64) -> Result<u32> {
+    fn count_failure(self, key: [u8; 16], now: u64) -> Result<Option<u64>> {
         match self {
-            AuthRef::Local(engine) => Ok(engine.count_failure(account, now)),
+            AuthRef::Local(engine) => Ok(engine.count_failure(key, now)),
             #[cfg(feature = "split-auth")]
-            AuthRef::Remote(remote) => remote.count_failure(account, now),
+            AuthRef::Remote(remote) => remote.count_failure(key, now),
+        }
+    }
+
+    #[cfg(feature = "mfa")]
+    fn locked_until(self, key: [u8; 16], now: u64) -> Result<Option<u64>> {
+        match self {
+            AuthRef::Local(engine) => Ok(engine.locked_until(key, now)),
+            #[cfg(feature = "split-auth")]
+            AuthRef::Remote(remote) => remote.locked_until(key, now),
         }
     }
 
@@ -1525,6 +1661,10 @@ enum Op<'a> {
         session: Session,
     },
     PlantDecoy {
+        digest: [u8; 32],
+        at_ms: u64,
+    },
+    EvictSession {
         digest: [u8; 32],
         at_ms: u64,
     },
@@ -1669,6 +1809,10 @@ fn decode_ops(seq: Seq, body: &[u8]) -> Result<Vec<Op<'_>>> {
                 }
             }
             OP_PLANT_DECOY => Op::PlantDecoy {
+                digest: r.fixed()?,
+                at_ms: r.u64()?,
+            },
+            OP_EVICT_SESSION => Op::EvictSession {
                 digest: r.fixed()?,
                 at_ms: r.u64()?,
             },
@@ -1933,7 +2077,7 @@ impl Engine for AuthEngine {
                     .failures
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .remove(&account);
+                    .remove(account.as_bytes());
             }
             if let Some(policy) = policy {
                 *self.policy.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(policy);
@@ -1955,12 +2099,17 @@ impl Engine for AuthEngine {
                 changes.push(change);
             }
             match op {
+                // A token with no lifetime (a reset for an identifier that
+                // names no account, 0.8) takes no slot: it is committed only
+                // so that the work is the same as for a real one.
+                Op::IssueSession { session, .. } if session.expires_ms <= session.created_ms => {}
                 Op::IssueSession { digest, session } => {
                     let epoch = self.epochs.get(session.account);
                     self.sessions
                         .insert(digest, session, epoch)
                         .map_err(|_| table_full())?;
                 }
+                Op::EvictSession { digest, .. } => self.sessions.evict(digest),
                 Op::PlantDecoy { digest, .. } => {
                     self.sessions
                         .plant_decoy(digest)
@@ -2012,12 +2161,7 @@ impl Engine for AuthEngine {
         self.accounts.flush()?;
         fs::sync_names(&self.dir)?;
         let _ = self.accounts_durable.fetch_max(mark, Ordering::AcqRel);
-        // Keys made for accounts whose creating commit never landed.
-        for account in self.keys.settle(now_ms().saturating_sub(ORPHAN_KEY_MS)) {
-            if !self.account_exists(account)? {
-                self.keys.destroy(account)?;
-            }
-        }
+        self.drop_orphan_keys(now_ms().saturating_sub(ORPHAN_KEY_MS))?;
         self.save_sessions(upto)?;
         Ok(self.durable_through())
     }
@@ -2059,6 +2203,10 @@ enum StagedOp {
         session: Session,
     },
     PlantDecoy {
+        digest: [u8; 32],
+        at_ms: u64,
+    },
+    EvictSession {
         digest: [u8; 32],
         at_ms: u64,
     },
@@ -2144,6 +2292,14 @@ pub(crate) struct AuthStaged<'e> {
     serializable: bool,
     /// Conflict keys of what this work read, when serializable.
     reads: std::sync::Mutex<Vec<Vec<u8>>>,
+}
+
+impl Drop for AuthStaged<'_> {
+    fn drop(&mut self) {
+        for account in &self.accounts {
+            self.engine.keys.release(*account);
+        }
+    }
 }
 
 impl<'e> AuthStaged<'e> {
@@ -2294,6 +2450,11 @@ fn write_ops(ops: &[StagedOp], out: &mut Vec<u8>) -> Result<()> {
             }
             StagedOp::PlantDecoy { digest, at_ms } => {
                 w.u8(OP_PLANT_DECOY);
+                w.bytes(digest);
+                w.u64(*at_ms);
+            }
+            StagedOp::EvictSession { digest, at_ms } => {
+                w.u8(OP_EVICT_SESSION);
                 w.bytes(digest);
                 w.u64(*at_ms);
             }
@@ -2611,10 +2772,46 @@ fn decode_standing(code: u8, until: u64, reason: u32) -> Result<Standing> {
 pub(crate) enum Checked {
     Verified(AccountId),
     /// Wrong password (with the account when the identifier exists), or an
-    /// unknown identifier.
-    Wrong(Option<AccountId>),
-    /// The password matched; the account may not sign in until then.
+    /// unknown identifier; `key` is what its failure counts against.
+    Wrong {
+        account: Option<AccountId>,
+        key: [u8; 16],
+    },
+    /// Locked out, by failures or by the account's standing, until then: no
+    /// password was checked.
     Blocked(Option<SystemTime>),
+}
+
+/// A failure counter and the lock-out it may hold.
+#[derive(Debug, Clone, Copy)]
+struct Throttle {
+    /// Failures in the window that began at `start`.
+    count: u32,
+    start: u64,
+    /// When the lock-out ends; 0 for none.
+    until: u64,
+}
+
+impl Throttle {
+    /// Still meaningful at `now`: a live window or a lock-out in force.
+    fn live(&self, now: u64, window: u64) -> bool {
+        now.saturating_sub(self.start) < window || self.until > now
+    }
+}
+
+/// Whether `session`, last used at `seen`, is still in time at `now`: before
+/// its absolute expiry and within its idle limit. The one rule `validate` and
+/// `rotate` share.
+fn in_time(session: &Session, seen: u64, now: u64) -> bool {
+    now < session.expires_ms && (session.idle_ms == 0 || now.saturating_sub(seen) < session.idle_ms)
+}
+
+/// The throttle key of an identifier that names no account: part of its
+/// keyed digest, never the identifier.
+fn throttle_key(digest: &[u8; 32]) -> [u8; 16] {
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&digest[..16]);
+    key
 }
 
 /// What a session checkpoint holds.
@@ -2623,6 +2820,8 @@ struct Checkpoint {
     tail: Tail,
     epochs: Vec<(AccountId, u32)>,
     slots: Vec<([u8; 32], Slot, u64)>,
+    /// Lock-outs in force when it was written: key and end.
+    lockouts: Vec<([u8; 16], u64)>,
 }
 
 /// Read the session checkpoint at `path`, when there is one. A damaged one
@@ -2633,7 +2832,8 @@ fn read_checkpoint(path: &Path, file_key: &[u8; 32]) -> Result<Option<Checkpoint
         return Ok(None);
     };
     let mut r = Reader::new(&bytes, "the session checkpoint", 0);
-    if r.u16()? != SESSIONS_FORMAT {
+    let format = r.u16()?;
+    if format != SESSIONS_FORMAT && format != SESSIONS_FORMAT_1 {
         return Err(corrupt());
     }
     let through = r.u64()?;
@@ -2682,12 +2882,19 @@ fn read_checkpoint(path: &Path, file_key: &[u8; 32]) -> Result<Option<Checkpoint
         };
         slots.push((digest, slot, seen));
     }
+    let mut lockouts = Vec::new();
+    if format == SESSIONS_FORMAT {
+        for _ in 0..r.u32()? {
+            lockouts.push((r.fixed::<16>()?, r.u64()?));
+        }
+    }
     r.finish()?;
     Ok(Some(Checkpoint {
         through,
         tail,
         epochs,
         slots,
+        lockouts,
     }))
 }
 
@@ -2891,9 +3098,10 @@ impl AuthTx<'_, '_> {
     /// honeypot page, a fake backup, a planted cookie). Presenting it is
     /// answered [`Validation::Unknown`], as for any token never issued, and
     /// raises [`SecurityEvent::DecoyPresented`](crate::SecurityEvent::DecoyPresented)
-    /// on the observer, on the thread that validated it. A decoy is never
-    /// reclaimed; [`revoke`](Self::revoke) retires it, after which it reads
-    /// as any token never issued.
+    /// on the observer, on the thread that presented it (to `validate`, and
+    /// to `revoke`, `rotate`, or `redeem` on [`Auth`]). A decoy is never
+    /// reclaimed; [`retire_decoy`](Self::retire_decoy) removes it, after
+    /// which it reads as any token never issued.
     ///
     /// # Errors
     ///
@@ -3145,19 +3353,14 @@ impl AuthTx<'_, '_> {
         }
     }
 
-    /// Lock the account out until `until`, unless its standing already keeps
-    /// it from signing in.
-    pub(crate) fn lock_out(&mut self, account: AccountId, until: SystemTime) -> Result<()> {
-        match &mut *self.part {
-            AuthPart::Local(staged) => LocalTx { staged }.lock_out(account, until),
-            #[cfg(feature = "split-auth")]
-            AuthPart::Remote(remote) => remote.lock_out(account, until),
-        }
-    }
-
-    /// Start TOTP for `account`: a new secret, replacing any it had. Codes
-    /// are not asked for at sign-in until the account confirms one with
-    /// [`confirm_totp`](Self::confirm_totp).
+    /// Start TOTP for `account`: a new secret. Codes are not asked for at
+    /// sign-in until the account confirms one with
+    /// [`confirm_totp`](Self::confirm_totp). On an account with TOTP on, the
+    /// confirmed secret stays in force (sign-ins still ask for its codes)
+    /// until a code of the new one is confirmed; calling this again
+    /// replaces the unconfirmed one. Before 0.8 the new secret replaced the
+    /// confirmed one at once, so sign-ins needed only the password until it
+    /// was confirmed.
     ///
     /// # Errors
     ///
@@ -3172,8 +3375,9 @@ impl AuthTx<'_, '_> {
         }
     }
 
-    /// Confirm `account`'s TOTP secret with a code from the app: `true`
-    /// turns TOTP on, so sign-ins ask for a code from then on.
+    /// Confirm `account`'s new TOTP secret with a code from the app: `true`
+    /// turns TOTP on (or moves it to the new secret), so sign-ins ask for
+    /// its codes from then on.
     ///
     /// # Errors
     ///
@@ -3430,7 +3634,9 @@ impl AuthTx<'_, '_> {
 
     /// Revoke the session `token` names. Returns `true` when a session was
     /// revoked, `false` when the token names no session or one already
-    /// revoked. A revoked session never validates again.
+    /// revoked. A revoked session never validates again. A decoy answers
+    /// `false`, as a token never issued would, and stays planted;
+    /// [`Auth::revoke`] also raises [`SecurityEvent::DecoyPresented`] for it.
     ///
     /// # Errors
     ///
@@ -3440,6 +3646,20 @@ impl AuthTx<'_, '_> {
             AuthPart::Local(staged) => LocalTx { staged }.revoke(token.as_ref()),
             #[cfg(feature = "split-auth")]
             AuthPart::Remote(remote) => remote.revoke(token.as_ref()),
+        }
+    }
+
+    /// Remove the decoy `token` (from [`plant_decoy`](Self::plant_decoy)), so
+    /// it reads as never issued. Returns `false` when `token` is not a decoy.
+    ///
+    /// # Errors
+    ///
+    /// Only storage errors; a malformed token returns `Ok(false)`.
+    pub fn retire_decoy(&mut self, token: impl AsRef<str>) -> Result<bool> {
+        match &mut *self.part {
+            AuthPart::Local(staged) => LocalTx { staged }.retire_decoy(token.as_ref()),
+            #[cfg(feature = "split-auth")]
+            AuthPart::Remote(remote) => remote.retire_decoy(token.as_ref()),
         }
     }
 }
@@ -3459,7 +3679,11 @@ impl LocalTx<'_, '_> {
         }
         let account = AccountId::generate();
         let _ = self.staged.identifiers.insert(digest);
-        let _ = self.staged.accounts.insert(account);
+        if self.staged.accounts.insert(account) {
+            // Its data key, made below, outlives any checkpoint until this
+            // work is dropped (applied or not).
+            engine.keys.hold(account);
+        }
         self.staged
             .writes
             .push(identifier_key(engine.collection, &digest));
@@ -3537,13 +3761,35 @@ impl LocalTx<'_, '_> {
         self.stage_single_use(purpose, account, ttl)
     }
 
+    /// A single-use token; with a zero `ttl`, one for a request that names
+    /// no account: the same commit, but a token with no lifetime, which
+    /// never redeems and takes no slot.
     fn stage_single_use(
         &mut self,
         purpose: Purpose,
         account: AccountId,
         ttl: Duration,
     ) -> Result<Token> {
-        self.stage_single_use_payload(purpose.payload(), account, ttl)
+        if !ttl.is_zero() {
+            return self.stage_single_use_payload(purpose.payload(), account, ttl);
+        }
+        let engine = self.staged.engine;
+        if engine.sessions.len() + self.staged.issued.len() >= engine.max_sessions {
+            return Err(Error::Busy {
+                what: "the session table",
+            });
+        }
+        let created_ms = now_ms();
+        let session = Session {
+            account: AccountId::from_bytes([0; 16]),
+            created_ms,
+            expires_ms: created_ms,
+            epoch: 0,
+            idle_ms: sessions::SINGLE_USE_IDLE,
+            recheck_ms: 0,
+            payload: Payload::new(&purpose.payload())?,
+        };
+        self.stage_digest(session, |random| engine.single_use_digest(random))
     }
 
     fn stage_challenge(&mut self, account: AccountId) -> Result<Token> {
@@ -3647,12 +3893,72 @@ impl LocalTx<'_, '_> {
         let (token, random) = Token::generate()?;
         let digest = digest_of(&random);
         session.epoch = self.epoch(session.account);
+        self.make_room(&session);
         let _ = self.staged.issued.insert(digest);
         self.staged.writes.push(session_key(&digest));
         self.staged
             .ops
             .push(StagedOp::IssueSession { digest, session });
         Ok(token)
+    }
+
+    /// Evict the oldest live entries of `session`'s account of its kind
+    /// (sessions, or single-use tokens and challenges) while it holds its
+    /// most: one account can no longer fill the table every account shares
+    /// (before 0.8 it could, and so could requests that name no account).
+    fn make_room(&mut self, session: &Session) {
+        if session.expires_ms <= session.created_ms {
+            // Takes no slot.
+            return;
+        }
+        let single_use = session.idle_ms == sessions::SINGLE_USE_IDLE;
+        let cap = if session.account == AccountId::from_bytes([0; 16]) {
+            MAX_OPEN_CHALLENGES
+        } else if single_use {
+            MAX_SINGLE_USE_PER_ACCOUNT
+        } else {
+            MAX_SESSIONS_PER_ACCOUNT
+        };
+        let engine = self.staged.engine;
+        let staged = self
+            .staged
+            .ops
+            .iter()
+            .filter(|op| {
+                matches!(op, StagedOp::IssueSession { session: s, .. }
+                    if s.account == session.account
+                        && (s.idle_ms == sessions::SINGLE_USE_IDLE) == single_use
+                        && s.expires_ms > s.created_ms)
+            })
+            .count();
+        // Most accounts are far under: one lookup, no read of the index.
+        if engine.sessions.indexed(session.account) + staged < cap {
+            return;
+        }
+        let mut held: Vec<([u8; 32], u64)> = engine
+            .sessions
+            .entries_of(session.account, session.created_ms)
+            .into_iter()
+            .filter(|(digest, _, kind)| {
+                *kind == single_use
+                    && !self.staged.ops.iter().any(
+                        |op| matches!(op, StagedOp::EvictSession { digest: d, .. } if d == digest),
+                    )
+            })
+            .map(|(digest, made, _)| (digest, made))
+            .collect();
+        if held.len() + staged < cap {
+            return;
+        }
+        // Stable: entries made in the same millisecond go in index order.
+        held.sort_by_key(|(_, made)| *made);
+        let over = held.len() + staged + 1 - cap;
+        for (digest, _) in held.into_iter().take(over) {
+            self.staged.ops.push(StagedOp::EvictSession {
+                digest,
+                at_ms: session.created_ms,
+            });
+        }
     }
 
     fn epoch(&self, account: AccountId) -> u32 {
@@ -3697,15 +4003,17 @@ impl LocalTx<'_, '_> {
 
     fn rotate(&mut self, token: impl AsRef<str>) -> Result<Token> {
         let engine = self.staged.engine;
+        let now = now_ms();
+        // Exactly what `validate` accepts (absolute expiry, idle limit
+        // against the last use), and the current epoch: a session that would
+        // not validate is never renewed.
         let session = token::parse(token.as_ref())
             .map(|random| engine.token_digest(&random))
             .and_then(|digest| {
-                match self
-                    .staged
-                    .noted(session_key(&digest), engine.sessions.get(&digest))
-                {
-                    Some(Slot::Live(session))
-                        if now_ms() < session.expires_ms
+                self.staged.note(session_key(&digest));
+                match engine.sessions.get_seen(&digest) {
+                    Some((Slot::Live(session), seen, _))
+                        if in_time(&session, seen, now)
                             && session.epoch == self.epoch(session.account) =>
                     {
                         Some((digest, session))
@@ -4055,29 +4363,29 @@ impl LocalTx<'_, '_> {
         })
     }
 
-    fn lock_out(&mut self, account: AccountId, until: SystemTime) -> Result<()> {
-        match self.record(account)? {
-            Some(record) if record.standing.blocked_until(now_ms()).is_none() => {
-                self.set_standing(account, Standing::LockedOut { until }, None)
-            }
-            _ => Ok(()),
-        }
-    }
-
     #[cfg(feature = "mfa")]
     fn add_totp(&mut self, account: AccountId) -> Result<totp::TotpEnrollment> {
         let engine = self.staged.engine;
         if !self.staged.accounts.contains(&account) && !engine.account_exists(account)? {
             return Err(Error::invalid("account", "no such account"));
         }
+        self.staged.note(totp_conflict(&account));
         let random =
             crypt_io::generate_key().map_err(|e| Error::storage("drawing random bytes", e))?;
         let mut secret = Zeroizing::new([0; totp::SECRET_LEN]);
         secret.copy_from_slice(&random[..totp::SECRET_LEN]);
-        let record = totp::TotpRecord {
-            secret: secret.clone(),
-            confirmed: false,
-            last_step: 0,
+        let record = match engine.totp_record(account)? {
+            // TOTP is on: the new secret waits beside the confirmed one.
+            Some(on) if on.confirmed => totp::TotpRecord {
+                pending: Some(secret.clone()),
+                ..on
+            },
+            _ => totp::TotpRecord {
+                secret: secret.clone(),
+                confirmed: false,
+                last_step: 0,
+                pending: None,
+            },
         };
         self.stage_totp(account, Some(&record), TOTP_ADDED)?;
         Ok(totp::TotpEnrollment { secret })
@@ -4097,21 +4405,54 @@ impl LocalTx<'_, '_> {
     fn use_totp(&mut self, account: AccountId, code: &str, confirmed: bool) -> Result<bool> {
         let engine = self.staged.engine;
         self.staged.note(totp_conflict(&account));
+        let now = now_ms();
+        // A second-factor check (not an enrolment) shares the account's
+        // lock-out with its passwords: locked out, no code is checked; a
+        // wrong code counts as a failure, wherever the check comes from.
+        let key = *account.as_bytes();
+        if confirmed && engine.locked_until(key, now).is_some() {
+            return Ok(false);
+        }
         let Some(record) = engine.totp_record(account)? else {
             return Ok(false);
         };
+        if !confirmed && record.confirmed {
+            // Moving TOTP on to a new secret: a code of the pending one.
+            let Some(step) = record.accept_pending(code, now / 1000) else {
+                self.staged.writes.push(totp_conflict(&account));
+                return Ok(false);
+            };
+            let Some(pending) = record.pending.clone() else {
+                return Ok(false);
+            };
+            let next = totp::TotpRecord {
+                secret: pending,
+                confirmed: true,
+                last_step: step,
+                pending: None,
+            };
+            self.stage_totp(account, Some(&next), TOTP_CONFIRMED)?;
+            return Ok(true);
+        }
         if record.confirmed != confirmed {
             return Ok(false);
         }
-        let Some(step) = record.accept(code, now_ms() / 1000) else {
+        let Some(step) = record.accept(code, now / 1000) else {
+            if confirmed {
+                let _ = engine.count_failure(key, now);
+            }
             // Concurrent uses of one code conflict on the record.
             self.staged.writes.push(totp_conflict(&account));
             return Ok(false);
         };
+        if confirmed {
+            engine.clear_failures(key);
+        }
         let next = totp::TotpRecord {
             secret: record.secret.clone(),
             confirmed: true,
             last_step: step,
+            pending: record.pending.clone(),
         };
         let what = if confirmed { TOTP_USED } else { TOTP_CONFIRMED };
         self.stage_totp(account, Some(&next), what)?;
@@ -4568,16 +4909,38 @@ impl LocalTx<'_, '_> {
             return Ok(false);
         };
         let digest = engine.token_digest(&random);
+        // A decoy is no session: it answers as a token never issued would,
+        // and stays planted (only `retire_decoy` removes it).
         let live = matches!(
             {
                 self.staged.note(session_key(&digest));
                 engine.sessions.get(&digest)
             },
-            Some(Slot::Live(_) | Slot::Decoy)
+            Some(Slot::Live(_))
         ) || self.staged.issued.contains(&digest);
         if !live {
             return Ok(false);
         }
+        self.staged.writes.push(session_key(&digest));
+        self.staged.ops.push(StagedOp::RevokeSession {
+            digest,
+            reason: RevokeReason::Revoked,
+            at_ms: now_ms(),
+        });
+        Ok(true)
+    }
+
+    fn retire_decoy(&mut self, token: &str) -> Result<bool> {
+        let engine = self.staged.engine;
+        let Some(random) = token::parse(token) else {
+            return Ok(false);
+        };
+        let digest = engine.token_digest(&random);
+        self.staged.note(session_key(&digest));
+        if !matches!(engine.sessions.get(&digest), Some(Slot::Decoy)) {
+            return Ok(false);
+        }
+        // The apply removes a decoy the revocation names.
         self.staged.writes.push(session_key(&digest));
         self.staged.ops.push(StagedOp::RevokeSession {
             digest,
@@ -4673,7 +5036,9 @@ impl Auth<'_> {
         }
     }
 
-    /// Check a session token. Reads memory only and allocates nothing.
+    /// Check a session token. Reads memory only and allocates nothing (with
+    /// split auth: one round trip to the auth process, and no allocation
+    /// once the calling thread has made one check).
     ///
     /// ```no_run
     /// # fn main() -> nex_db::Result<()> {
@@ -4792,8 +5157,34 @@ impl Auth<'_> {
     /// The errors of [`Database::commit`].
     pub fn revoke(&self, token: impl AsRef<str>) -> Result<bool> {
         let token = token.as_ref();
+        // A decoy sent to sign out (a logout handler that revokes without
+        // validating) raises the alarm and stays planted.
+        if self.presented_decoy(token)? {
+            return Ok(false);
+        }
         self.db
             .commit(|tx| tx.auth_of(self.engine.collection()).revoke(token))
+    }
+
+    /// Retire a decoy in its own commit. See [`AuthTx::retire_decoy`].
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Database::commit`].
+    pub fn retire_decoy(&self, token: impl AsRef<str>) -> Result<bool> {
+        let token = token.as_ref();
+        self.db
+            .commit(|tx| tx.auth_of(self.engine.collection()).retire_decoy(token))
+    }
+
+    /// True, after raising [`SecurityEvent::DecoyPresented`], when `token`
+    /// is a planted decoy. One memory read (one round trip with split auth).
+    fn presented_decoy(&self, token: &str) -> Result<bool> {
+        let (_, decoy) = self.engine().validate(token)?;
+        if decoy {
+            self.db.observers().security(SecurityEvent::DecoyPresented);
+        }
+        Ok(decoy)
     }
 
     /// Make new recovery codes in their own commit. See
@@ -4952,6 +5343,9 @@ impl Auth<'_> {
     /// As [`AuthTx::rotate`], plus the errors of [`Database::commit`].
     pub fn rotate(&self, token: impl AsRef<str>) -> Result<Token> {
         let token = token.as_ref();
+        if self.presented_decoy(token)? {
+            return Err(Error::invalid("token", "names no valid session"));
+        }
         self.db
             .commit(|tx| tx.auth_of(self.engine.collection()).rotate(token))
     }
@@ -5018,26 +5412,23 @@ impl Auth<'_> {
                 .complete_second_factor(challenge, code, spec)
         })?;
         match outcome {
-            Some((account, Some(token))) => {
-                engine.clear_failures(account)?;
-                Ok(SignIn::Success { account, token })
-            }
+            Some((account, Some(token))) => Ok(SignIn::Success { account, token }),
             Some((account, None)) => {
-                let now = now_ms();
-                let realm = engine.realm();
-                if engine.count_failure(account, now)? >= realm.lockout_failures {
-                    let until = time_of(now.saturating_add(realm.lockout_ms));
-                    self.db
-                        .commit(|tx| tx.auth_of(engine.collection()).lock_out(account, until))?;
-                    engine.clear_failures(account)?;
-                    self.db
-                        .observers()
-                        .security(SecurityEvent::LockedOut { account });
-                }
-                self.db.observers().security(SecurityEvent::SignInFailed {
+                // The code was counted where it was checked; a lock-out is
+                // shared with password failures.
+                let observers = self.db.observers();
+                observers.security(SecurityEvent::SignInFailed {
                     account: Some(account),
                 });
-                Ok(SignIn::Failed)
+                match self.engine().locked_until(*account.as_bytes(), now_ms())? {
+                    Some(until) => {
+                        observers.security(SecurityEvent::LockedOut { account });
+                        Ok(SignIn::LockedOut {
+                            until: Some(time_of(until)),
+                        })
+                    }
+                    None => Ok(SignIn::Failed),
+                }
             }
             None => Ok(SignIn::Failed),
         }
@@ -5225,7 +5616,7 @@ impl Auth<'_> {
         let engine = self.engine();
         match engine.check(identifier, password)? {
             Checked::Verified(account) => {
-                engine.clear_failures(account)?;
+                engine.clear_failures(*account.as_bytes())?;
                 if engine.needs_second_factor(account)? {
                     return Ok(PasswordCheck::NeedsSecondFactor { account });
                 }
@@ -5235,28 +5626,17 @@ impl Auth<'_> {
                 self.db.observers().security(SecurityEvent::SignInBlocked);
                 Ok(PasswordCheck::LockedOut { until })
             }
-            Checked::Wrong(Some(account)) => {
+            Checked::Wrong { account, key } => {
                 let observers = self.db.observers();
-                observers.security(SecurityEvent::SignInFailed {
-                    account: Some(account),
-                });
-                let now = now_ms();
-                let realm = engine.realm();
-                if engine.count_failure(account, now)? >= realm.lockout_failures {
-                    let until = time_of(now.saturating_add(realm.lockout_ms));
-                    self.db.commit(|tx| {
-                        tx.auth_of(self.engine.collection())
-                            .lock_out(account, until)
-                    })?;
-                    engine.clear_failures(account)?;
-                    observers.security(SecurityEvent::LockedOut { account });
+                observers.security(SecurityEvent::SignInFailed { account });
+                // Counted in memory, for a known and an unknown identifier
+                // alike: no commit, so the failure that locks out costs no
+                // more than any other, and no session ends.
+                if engine.count_failure(key, now_ms())?.is_some() {
+                    if let Some(account) = account {
+                        observers.security(SecurityEvent::LockedOut { account });
+                    }
                 }
-                Ok(PasswordCheck::Failed)
-            }
-            Checked::Wrong(None) => {
-                self.db
-                    .observers()
-                    .security(SecurityEvent::SignInFailed { account: None });
                 Ok(PasswordCheck::Failed)
             }
         }
@@ -5332,6 +5712,10 @@ impl Auth<'_> {
     /// when none does: for a password reset by email address. The work is
     /// the same either way (a token is committed for no account when none
     /// matches, and never redeems), so answer the request the same way too.
+    /// Since 0.8 that token takes no room in the session table, and an
+    /// account holds at most 16 live single-use tokens (a new one evicts
+    /// the oldest), so requests cannot fill the table. Still rate-limit
+    /// reset requests: each one is a commit, and sends an email.
     ///
     /// # Errors
     ///
@@ -5342,9 +5726,21 @@ impl Auth<'_> {
         purpose: Purpose,
         ttl: Duration,
     ) -> Result<Option<Token>> {
+        // Checked first, so a bad `ttl` answers alike for every identifier.
+        let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
+        if ttl_ms == 0 || ttl_ms > MAX_SINGLE_USE_MS {
+            return Err(Error::invalid("ttl", "must be at most 30 days"));
+        }
         let engine = self.engine();
         let account = engine.account_named(identifier)?;
-        let target = account.unwrap_or(AccountId::from_bytes([0; 16]));
+        // An identifier that names no account commits a token with no
+        // lifetime (same work, no slot taken; before 0.8 it held a slot
+        // for `ttl`, so reset requests for made-up addresses could fill the
+        // session table).
+        let (target, ttl) = match account {
+            Some(account) => (account, ttl),
+            None => (AccountId::from_bytes([0; 16]), Duration::ZERO),
+        };
         let token = self.db.commit(|tx| {
             tx.auth_of(self.engine.collection())
                 .stage_single_use(purpose, target, ttl)
@@ -5360,6 +5756,9 @@ impl Auth<'_> {
     /// As [`AuthTx::redeem`], plus the errors of [`Database::commit`].
     pub fn redeem(&self, token: impl AsRef<str>, purpose: Purpose) -> Result<Option<AccountId>> {
         let token = token.as_ref();
+        if self.presented_decoy(token)? {
+            return Ok(None);
+        }
         self.db
             .commit(|tx| tx.auth_of(self.engine.collection()).redeem(token, purpose))
     }
@@ -5780,6 +6179,78 @@ mod tests {
         assert_eq!(create, update);
         assert_eq!(create, issue);
         assert_eq!(issue, revoke);
+    }
+
+    /// Before 0.8 a table full of live windows counted nothing for a new
+    /// account, so 100,000 accounts with one recent failure each switched
+    /// the lock-out off for every other. Now the oldest window goes and the
+    /// new key is counted.
+    #[test]
+    fn test_counting_goes_on_when_the_table_is_full() {
+        let dir = std::env::temp_dir().join(format!(
+            "nex-db-auth-full-{}-{}",
+            std::process::id(),
+            id_forge::ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(crate::core::keys::KEY_FILE);
+        crate::core::keys::create_file_if_missing(&path).unwrap();
+        let root = crate::core::keys::load_file(&path).unwrap();
+        let engine = AuthEngine::open(&dir.join("accounts"), &root, 1, 1_000).unwrap();
+        let now = now_ms();
+        for i in 0..MAX_COUNTED as u64 {
+            let mut key = [0u8; 16];
+            key[..8].copy_from_slice(&i.to_le_bytes());
+            let _ = engine.count_failure(key, now);
+        }
+        let target = [0xEE; 16];
+        let failures = engine.realm().lockout_failures;
+        let mut locked = None;
+        for _ in 0..failures {
+            locked = engine.count_failure(target, now);
+        }
+        assert!(locked.is_some(), "the new key reached its lock-out");
+        assert!(engine.locked_until(target, now).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Before 0.8 a checkpoint destroyed a data key made over a minute ago
+    /// whose account did not exist yet, even while the commit creating the
+    /// account was on its way (a closure that took just under the snapshot
+    /// limit): the account then landed sealed under a key that was gone.
+    #[test]
+    fn test_a_checkpoint_keeps_the_key_of_an_account_being_created() {
+        let dir = std::env::temp_dir().join(format!(
+            "nex-db-auth-keyrace-{}-{}",
+            std::process::id(),
+            id_forge::ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(crate::core::keys::KEY_FILE);
+        crate::core::keys::create_file_if_missing(&path).unwrap();
+        let root = crate::core::keys::load_file(&path).unwrap();
+        let engine = AuthEngine::open(&dir.join("accounts"), &root, 1, 1_000).unwrap();
+        let hash = engine
+            .hash_password("correct horse battery staple")
+            .unwrap();
+        let mut staged = AuthStaged::new(&engine);
+        let account = LocalTx {
+            staged: &mut staged,
+        }
+        .create_account("ann@example.com", &hash)
+        .unwrap();
+        // A checkpoint long after the key was made, the commit not applied.
+        engine.drop_orphan_keys(u64::MAX).unwrap();
+        assert!(
+            engine.keys.get(account).unwrap().is_some(),
+            "the key of an account being created was destroyed"
+        );
+        // The work ends without landing: the next checkpoint drops it.
+        drop(staged);
+        engine.drop_orphan_keys(u64::MAX).unwrap();
+        assert!(engine.keys.get(account).unwrap().is_none());
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

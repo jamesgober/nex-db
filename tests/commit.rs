@@ -432,7 +432,7 @@ fn test_rotate_replaces_the_token_and_keeps_the_expiry() {
 }
 
 #[test]
-fn test_ban_ends_sessions_and_blocks_sign_in_only_with_the_right_password() {
+fn test_ban_ends_sessions_and_blocks_sign_in_for_any_password() {
     let dir = TempDir::new("ban");
     let db = Database::open(&dir.0).unwrap();
     let password = db.auth().hash_password("right pw").unwrap();
@@ -459,12 +459,13 @@ fn test_ban_ends_sessions_and_blocks_sign_in_only_with_the_right_password() {
             .unwrap(),
         SignIn::LockedOut { until: None }
     ));
-    // A wrong password says nothing about the ban.
+    // While blocked no password is checked: a wrong one answers the same,
+    // so the answer never confirms a guess.
     assert_eq!(
         db.auth()
             .verify_password("ann@example.com", "wrong")
             .unwrap(),
-        PasswordCheck::Failed
+        PasswordCheck::LockedOut { until: None }
     );
     drop(db);
 
@@ -490,7 +491,7 @@ fn test_ban_ends_sessions_and_blocks_sign_in_only_with_the_right_password() {
 }
 
 #[test]
-fn test_ten_failures_lock_the_account_out() {
+fn test_ten_failures_lock_sign_in_out_for_any_password() {
     let dir = TempDir::new("lockout");
     let db = Database::open(&dir.0).unwrap();
     let password = db.auth().hash_password("right pw").unwrap();
@@ -499,7 +500,7 @@ fn test_ten_failures_lock_the_account_out() {
         .create_account("ann@example.com", &password)
         .unwrap();
     let token = db.auth().issue_session(ann, SessionSpec::web()).unwrap();
-    for _ in 0..9 {
+    for _ in 0..10 {
         assert_eq!(
             db.auth()
                 .verify_password("ann@example.com", "wrong")
@@ -507,29 +508,36 @@ fn test_ten_failures_lock_the_account_out() {
             PasswordCheck::Failed
         );
     }
-    // Nine failures: still open.
+    // Locked out: every password answers the same (the right one learns
+    // nothing more than a guess), and no password is checked.
+    for guess in ["wrong", "right pw", "another guess"] {
+        assert!(matches!(
+            db.auth().verify_password("ann@example.com", guess).unwrap(),
+            PasswordCheck::LockedOut { until: Some(_) }
+        ));
+    }
+    // A lock-out by failures blocks new sign-ins only: someone who never had
+    // the password cannot sign the owner out of their devices, and the
+    // account's standing is unchanged.
     assert!(matches!(
         db.auth().validate(&token).unwrap(),
         Validation::Valid(_)
     ));
     assert_eq!(db.auth().standing(ann).unwrap(), Some(Standing::Active));
-    assert_eq!(
-        db.auth()
-            .verify_password("ann@example.com", "wrong")
-            .unwrap(),
-        PasswordCheck::Failed
-    );
-    assert!(matches!(
-        db.auth().standing(ann).unwrap(),
-        Some(Standing::LockedOut { .. })
-    ));
-    assert!(!matches!(
-        db.auth().validate(&token).unwrap(),
-        Validation::Valid(_)
-    ));
+
+    // An identifier that names no account locks out after the same failures
+    // and answers the same: the lock-out does not tell which accounts exist.
+    for _ in 0..10 {
+        assert_eq!(
+            db.auth()
+                .verify_password("nobody@example.com", "wrong")
+                .unwrap(),
+            PasswordCheck::Failed
+        );
+    }
     assert!(matches!(
         db.auth()
-            .verify_password("ann@example.com", "right pw")
+            .verify_password("nobody@example.com", "wrong")
             .unwrap(),
         PasswordCheck::LockedOut { until: Some(_) }
     ));
@@ -721,16 +729,21 @@ fn test_many_sessions_across_table_levels_validate_after_reopen() {
     let dir = TempDir::new("many-sessions");
     let db = Database::open(&dir.0).unwrap();
     let password = db.auth().hash_password(PASSWORD).unwrap();
-    let ann = db
-        .auth()
-        .create_account("ann@example.com", &password)
-        .unwrap();
-    // More than the table's first levels hold, so it grows.
-    let tokens: Vec<_> = (0..20)
-        .flat_map(|_| {
+    // Twenty accounts of 1,000 sessions each (an account's most): more than
+    // the table's first levels hold, so it grows.
+    let accounts: Vec<_> = (0..20)
+        .map(|i| {
+            db.auth()
+                .create_account(&format!("user{i}@example.com"), &password)
+                .unwrap()
+        })
+        .collect();
+    let tokens: Vec<_> = accounts
+        .iter()
+        .flat_map(|&account| {
             db.commit(|tx| {
                 (0..1_000)
-                    .map(|_| tx.auth().issue_session(ann, SessionSpec::web()))
+                    .map(|_| tx.auth().issue_session(account, SessionSpec::web()))
                     .collect::<nex_db::Result<Vec<_>>>()
             })
             .unwrap()
@@ -750,7 +763,11 @@ fn test_many_sessions_across_table_levels_validate_after_reopen() {
         }
     };
     check(&db);
-    assert_eq!(db.auth().revoke_all(ann).unwrap(), 20_000 - 207);
+    let ended: u64 = accounts
+        .iter()
+        .map(|&account| u64::from(db.auth().revoke_all(account).unwrap()))
+        .sum();
+    assert_eq!(ended, 20_000 - 207);
     drop(db);
     let db = Database::open(&dir.0).unwrap();
     for token in &tokens {

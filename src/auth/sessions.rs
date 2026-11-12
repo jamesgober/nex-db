@@ -418,6 +418,47 @@ impl SessionTable {
         reclaimed
     }
 
+    /// How many places the per-account index holds for `account`: at least
+    /// its live entries of either kind. One map lookup.
+    pub(crate) fn indexed(&self, account: AccountId) -> usize {
+        self.writer().accounts.get(&account).map_or(0, Vec::len)
+    }
+
+    /// The live entries of `account` at `now_ms` (sessions and single-use
+    /// tokens, before their expiry): each with its digest, when it was made,
+    /// and whether it is a single-use token. From the per-account index.
+    pub(crate) fn entries_of(&self, account: AccountId, now_ms: u64) -> Vec<([u8; 32], u64, bool)> {
+        let w = self.writer();
+        let Some(places) = w.accounts.get(&account) else {
+            return Vec::new();
+        };
+        places
+            .iter()
+            .filter_map(|place| {
+                let (digest, found) = self.table.read_at(At::from_u64(*place))?;
+                match decode(&found.words, found.ext.as_ref())? {
+                    Slot::Live(s) if s.account == account && now_ms < s.expires_ms => {
+                        Some((digest, s.created_ms, s.idle_ms == SINGLE_USE_IDLE))
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// Remove the live entry `digest` outright, so its token reads as never
+    /// issued: an account's oldest, evicted for a new one. A tombstone or a
+    /// decoy stays.
+    pub(crate) fn evict(&self, digest: [u8; 32]) {
+        let mut w = self.writer();
+        if let Some(found) = self.table.get(&digest) {
+            if kind(&found.words) == KIND_LIVE {
+                w.unindex(account_of(&found.words), found.at);
+                let _ = self.table.remove(found.at);
+            }
+        }
+    }
+
     /// Live sessions of `account` that are still valid at `now_ms` under
     /// `epoch`, from the per-account index.
     pub(crate) fn live_for(&self, account: AccountId, epoch: u32, now_ms: u64) -> u32 {

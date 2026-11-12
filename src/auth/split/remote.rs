@@ -92,10 +92,6 @@ impl RemoteAuth {
         self.collection
     }
 
-    pub(crate) fn realm(&self) -> RealmPolicy {
-        *self.realm.read().unwrap_or_else(PoisonError::into_inner)
-    }
-
     /// One round trip: the realm, what `args` writes; the result `read`
     /// decodes.
     fn call<T>(
@@ -140,26 +136,40 @@ impl RemoteAuth {
         )
     }
 
-    pub(crate) fn clear_failures(&self, account: AccountId) -> Result<()> {
+    pub(crate) fn clear_failures(&self, key: [u8; 16]) -> Result<()> {
         self.call(
             op::CLEAR_FAILURES,
             |w| {
-                wire::put_account(w, account);
+                w.bytes(&key);
                 Ok(())
             },
             |_| Ok(()),
         )
     }
 
-    pub(crate) fn count_failure(&self, account: AccountId, now: u64) -> Result<u32> {
+    /// When the lock-out this failure started ends (0 on the wire for none).
+    pub(crate) fn count_failure(&self, key: [u8; 16], now: u64) -> Result<Option<u64>> {
         self.call(
             op::COUNT_FAILURE,
             |w| {
-                wire::put_account(w, account);
+                w.bytes(&key);
                 w.u64(now);
                 Ok(())
             },
-            |r| r.u32(),
+            |r| Ok(Some(r.u64()?).filter(|&until| until != 0)),
+        )
+    }
+
+    #[cfg(feature = "mfa")]
+    pub(crate) fn locked_until(&self, key: [u8; 16], now: u64) -> Result<Option<u64>> {
+        self.call(
+            op::LOCKED_UNTIL,
+            |w| {
+                w.bytes(&key);
+                w.u64(now);
+                Ok(())
+            },
+            |r| Ok(Some(r.u64()?).filter(|&until| until != 0)),
         )
     }
 
@@ -619,18 +629,6 @@ impl<'db> RemoteStaged<'db> {
         )
     }
 
-    pub(crate) fn lock_out(&mut self, account: AccountId, until: SystemTime) -> Result<()> {
-        self.tx(
-            op::LOCK_OUT,
-            |w| {
-                wire::put_account(w, account);
-                wire::put_time(w, until);
-                Ok(())
-            },
-            |_| Ok(()),
-        )
-    }
-
     pub(crate) fn new_recovery_codes(&mut self, account: AccountId) -> Result<RecoveryCodes> {
         self.account_op(op::NEW_RECOVERY_CODES, account, wire::get_codes)
     }
@@ -695,6 +693,10 @@ impl<'db> RemoteStaged<'db> {
 
     pub(crate) fn revoke(&mut self, token: &str) -> Result<bool> {
         self.tx(op::REVOKE, |w| put_str(w, token), get_bool)
+    }
+
+    pub(crate) fn retire_decoy(&mut self, token: &str) -> Result<bool> {
+        self.tx(op::RETIRE_DECOY, |w| put_str(w, token), get_bool)
     }
 }
 

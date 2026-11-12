@@ -131,10 +131,15 @@ fn test_realms_hold_their_own_accounts_sessions_and_policy() {
     // Everything survives a reopen.
     let db = Database::open(&dir.0).unwrap();
     let staff = db.auth_realm("staff").unwrap();
-    // The staff lock-out ended that session, and that survives too.
+    // The staff lock-out blocks sign-ins only: the session it found stays,
+    // and the lock-out itself survives the reopen.
     assert!(matches!(
         staff.validate(&staff_token).unwrap(),
-        Validation::Revoked { .. }
+        Validation::Valid(_)
+    ));
+    assert!(matches!(
+        staff.verify_password("ann@example.com", PASSWORD).unwrap(),
+        PasswordCheck::LockedOut { .. }
     ));
     assert!(matches!(
         db.auth().validate(&user_token).unwrap(),

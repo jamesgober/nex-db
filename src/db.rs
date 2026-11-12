@@ -348,7 +348,8 @@ impl Builder {
     /// session fails with [`Error::Busy`] until expired ones are reclaimed.
     /// Memory follows the sessions held, not this limit, so a high limit
     /// costs nothing until it is used; the limit keeps a flood of sign-ins
-    /// from taking all of it.
+    /// from taking all of it. One account holds at most 1,000 live sessions
+    /// and 16 live single-use tokens; a new one evicts its oldest.
     pub fn max_sessions(mut self, n: usize) -> Self {
         self.max_sessions = n.clamp(1, u32::MAX as usize);
         self
@@ -971,9 +972,11 @@ impl Database {
     ///
     /// `f` stages typed operations on the [`Transaction`]; nothing is written
     /// until it returns `Ok`. Then the commit is checked against concurrent
-    /// commits (snapshot isolation: it conflicts when a key it writes was
+    /// commits (first committer wins: it conflicts when a key it writes was
     /// committed after it started), written to the log as one record, synced,
-    /// and applied to each engine. When `commit` returns `Ok`, the commit
+    /// and applied to each engine. Reads inside `f` see the latest committed
+    /// state, not one snapshot; when a write is derived from them, use
+    /// [`commit_serializable`](Self::commit_serializable). When `commit` returns `Ok`, the commit
     /// survives a crash. When `f` returns an error, nothing is written and the
     /// error is returned.
     ///

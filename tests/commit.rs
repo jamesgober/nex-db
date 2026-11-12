@@ -729,16 +729,21 @@ fn test_many_sessions_across_table_levels_validate_after_reopen() {
     let dir = TempDir::new("many-sessions");
     let db = Database::open(&dir.0).unwrap();
     let password = db.auth().hash_password(PASSWORD).unwrap();
-    let ann = db
-        .auth()
-        .create_account("ann@example.com", &password)
-        .unwrap();
-    // More than the table's first levels hold, so it grows.
-    let tokens: Vec<_> = (0..20)
-        .flat_map(|_| {
+    // Twenty accounts of 1,000 sessions each (an account's most): more than
+    // the table's first levels hold, so it grows.
+    let accounts: Vec<_> = (0..20)
+        .map(|i| {
+            db.auth()
+                .create_account(&format!("user{i}@example.com"), &password)
+                .unwrap()
+        })
+        .collect();
+    let tokens: Vec<_> = accounts
+        .iter()
+        .flat_map(|&account| {
             db.commit(|tx| {
                 (0..1_000)
-                    .map(|_| tx.auth().issue_session(ann, SessionSpec::web()))
+                    .map(|_| tx.auth().issue_session(account, SessionSpec::web()))
                     .collect::<nex_db::Result<Vec<_>>>()
             })
             .unwrap()
@@ -758,7 +763,11 @@ fn test_many_sessions_across_table_levels_validate_after_reopen() {
         }
     };
     check(&db);
-    assert_eq!(db.auth().revoke_all(ann).unwrap(), 20_000 - 207);
+    let ended: u64 = accounts
+        .iter()
+        .map(|&account| u64::from(db.auth().revoke_all(account).unwrap()))
+        .sum();
+    assert_eq!(ended, 20_000 - 207);
     drop(db);
     let db = Database::open(&dir.0).unwrap();
     for token in &tokens {

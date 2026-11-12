@@ -418,6 +418,12 @@ impl SessionTable {
         reclaimed
     }
 
+    /// How many places the per-account index holds for `account`: at least
+    /// its live entries of either kind. One map lookup.
+    pub(crate) fn indexed(&self, account: AccountId) -> usize {
+        self.writer().accounts.get(&account).map_or(0, Vec::len)
+    }
+
     /// The live entries of `account` at `now_ms` (sessions and single-use
     /// tokens, before their expiry): each with its digest, when it was made,
     /// and whether it is a single-use token. From the per-account index.

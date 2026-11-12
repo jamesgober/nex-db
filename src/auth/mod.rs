@@ -3931,6 +3931,10 @@ impl LocalTx<'_, '_> {
                         && s.expires_ms > s.created_ms)
             })
             .count();
+        // Most accounts are far under: one lookup, no read of the index.
+        if engine.sessions.indexed(session.account) + staged < cap {
+            return;
+        }
         let mut held: Vec<([u8; 32], u64)> = engine
             .sessions
             .entries_of(session.account, session.created_ms)

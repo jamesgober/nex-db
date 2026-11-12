@@ -307,10 +307,15 @@ Rules:
 
 - Nothing is written until the closure returns `Ok`. An `Err` from the closure
   is returned unchanged and nothing is written.
-- Isolation is snapshot isolation: a commit conflicts when a key it writes was
-  committed by someone else after it started. On a conflict the closure runs
-  again, up to four times in all, then `commit` returns `Error::Conflict`. The
-  closure must therefore have no side effects outside `tx`.
+- Reads inside the closure see the latest committed state, not one fixed
+  snapshot: two reads can straddle another commit. Writes are first-committer
+  wins: a commit conflicts when a key it writes was committed by someone else
+  after it started. On a conflict the closure runs again, up to four times in
+  all, then `commit` returns `Error::Conflict`. The closure must therefore have
+  no side effects outside `tx`. When a write is derived from what the closure
+  read (a total, a counter, an index page), use `commit_serializable`, which
+  also conflicts when a key the closure read was committed after it started.
+  (Before 0.8 this said "snapshot isolation", which the reads did not give.)
 - Do slow work (hashing a password) before `commit`, not inside it.
 - Return what the commit made (an `AccountId`, a `Token`, a `EntityId`) from the
   closure. A value kept from an attempt that was retried never becomes valid.

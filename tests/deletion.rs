@@ -72,3 +72,47 @@ fn test_a_delete_removes_revisions_written_in_the_same_commit() {
         );
     }
 }
+
+/// Reads inside `commit` see the latest state, so two of them can straddle
+/// another commit (the docs said "snapshot isolation" before 0.8).
+/// `commit_serializable` is the call for a write derived from reads: the
+/// straddled commit makes it run again, so it never lands on a mix.
+#[test]
+fn test_commit_serializable_never_lands_on_a_mix_of_two_states() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let t = TempDir::new("serializable");
+    let db = Database::open(&t.0).unwrap();
+    let x = db.content().put(Entity::new("n").field("v", 1i64)).unwrap();
+    let y = db.content().put(Entity::new("n").field("v", 1i64)).unwrap();
+    let total = db.content().put(Entity::new("n").field("v", 2i64)).unwrap();
+    let runs = AtomicU32::new(0);
+    let value = |e: Option<nex_db::Entry>| {
+        e.and_then(|e| e.field("v").and_then(|v| v.as_int()))
+            .unwrap()
+    };
+    db.commit_serializable(|tx| {
+        let first = value(tx.content().draft(x)?);
+        if runs.fetch_add(1, Ordering::SeqCst) == 0 {
+            // Another commit changes both between the closure's two reads.
+            std::thread::scope(|s| {
+                let _ = s.spawn(|| {
+                    db.commit(|tx| {
+                        tx.content().save_draft(x, Patch::new().set("v", 2i64))?;
+                        tx.content().save_draft(y, Patch::new().set("v", 2i64))
+                    })
+                    .unwrap();
+                });
+            });
+        }
+        let second = value(tx.content().draft(y)?);
+        tx.content()
+            .save_draft(total, Patch::new().set("v", first + second))
+    })
+    .unwrap();
+    assert!(
+        runs.load(Ordering::SeqCst) >= 2,
+        "the straddled attempt ran again"
+    );
+    let total = value(db.content().draft(total).unwrap());
+    assert_eq!(total, 4, "the total matches one state, not a mix of two");
+}

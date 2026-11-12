@@ -971,9 +971,11 @@ impl Database {
     ///
     /// `f` stages typed operations on the [`Transaction`]; nothing is written
     /// until it returns `Ok`. Then the commit is checked against concurrent
-    /// commits (snapshot isolation: it conflicts when a key it writes was
+    /// commits (first committer wins: it conflicts when a key it writes was
     /// committed after it started), written to the log as one record, synced,
-    /// and applied to each engine. When `commit` returns `Ok`, the commit
+    /// and applied to each engine. Reads inside `f` see the latest committed
+    /// state, not one snapshot; when a write is derived from them, use
+    /// [`commit_serializable`](Self::commit_serializable). When `commit` returns `Ok`, the commit
     /// survives a crash. When `f` returns an error, nothing is written and the
     /// error is returned.
     ///

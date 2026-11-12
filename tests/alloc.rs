@@ -55,10 +55,18 @@ fn split() {
             .auth()
             .issue_session(account, SessionSpec::web())
             .unwrap();
-        let validate = allocations(|| {
-            let v = db.auth().validate(token.as_str()).unwrap();
-            assert!(matches!(v, Validation::Valid(_)));
-        });
+        // The count is of the whole process, and 1,000 round trips give the
+        // watchdog and the scheduler time to run: the fewest of three
+        // windows (an allocation per check shows in every one).
+        let validate = (0..3)
+            .map(|_| {
+                allocations(|| {
+                    let v = db.auth().validate(token.as_str()).unwrap();
+                    assert!(matches!(v, Validation::Valid(_)));
+                })
+            })
+            .min()
+            .unwrap_or(u64::MAX);
         println!("allocations per {ROUNDS} split reads: validate {validate}");
         assert_eq!(validate, 0, "a split validate allocates");
     }

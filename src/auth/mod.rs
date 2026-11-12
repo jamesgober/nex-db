@@ -1240,10 +1240,7 @@ impl AuthEngine {
             None => Validation::Unknown,
             Some((Slot::Decoy, ..)) => return (Validation::Unknown, true),
             Some((Slot::Revoked(reason), ..)) => Validation::Revoked { reason },
-            Some((Slot::Live(session), ..)) if now >= session.expires_ms => Validation::Expired,
-            Some((Slot::Live(session), seen, _))
-                if session.idle_ms != 0 && now.saturating_sub(seen) >= session.idle_ms =>
-            {
+            Some((Slot::Live(session), seen, _)) if !in_time(&session, seen, now) => {
                 Validation::Expired
             }
             Some((Slot::Live(session), _, place)) => {
@@ -2735,6 +2732,13 @@ impl Throttle {
     }
 }
 
+/// Whether `session`, last used at `seen`, is still in time at `now`: before
+/// its absolute expiry and within its idle limit. The one rule `validate` and
+/// `rotate` share.
+fn in_time(session: &Session, seen: u64, now: u64) -> bool {
+    now < session.expires_ms && (session.idle_ms == 0 || now.saturating_sub(seen) < session.idle_ms)
+}
+
 /// The throttle key of an identifier that names no account: part of its
 /// keyed digest, never the identifier.
 fn throttle_key(digest: &[u8; 32]) -> [u8; 16] {
@@ -3840,15 +3844,17 @@ impl LocalTx<'_, '_> {
 
     fn rotate(&mut self, token: impl AsRef<str>) -> Result<Token> {
         let engine = self.staged.engine;
+        let now = now_ms();
+        // Exactly what `validate` accepts (absolute expiry, idle limit
+        // against the last use), and the current epoch: a session that would
+        // not validate is never renewed.
         let session = token::parse(token.as_ref())
             .map(|random| engine.token_digest(&random))
             .and_then(|digest| {
-                match self
-                    .staged
-                    .noted(session_key(&digest), engine.sessions.get(&digest))
-                {
-                    Some(Slot::Live(session))
-                        if now_ms() < session.expires_ms
+                self.staged.note(session_key(&digest));
+                match engine.sessions.get_seen(&digest) {
+                    Some((Slot::Live(session), seen, _))
+                        if in_time(&session, seen, now)
                             && session.epoch == self.epoch(session.account) =>
                     {
                         Some((digest, session))

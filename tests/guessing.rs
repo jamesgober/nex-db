@@ -202,3 +202,20 @@ fn test_a_decoy_raises_the_alarm_wherever_it_is_presented() {
     );
     assert!(!db.auth().retire_decoy(&decoy).unwrap());
 }
+
+/// Before 0.8 `rotate` checked only the absolute expiry, so a session past
+/// its idle limit (which `validate` already answered `Expired` for) could be
+/// renewed through a token-refresh endpoint.
+#[test]
+fn test_rotate_refuses_a_session_past_its_idle_limit() {
+    let t = TempDir::new("idle");
+    let db = Database::open(&t.0).unwrap();
+    let ann = db.auth().sign_up("ann@example.com", PASSWORD).unwrap();
+    let spec = SessionSpec::web().idle(std::time::Duration::from_millis(800));
+    let token = db.auth().issue_session(ann, spec).unwrap();
+    // In time: rotating works.
+    let token = db.auth().rotate(&token).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1300));
+    assert_eq!(db.auth().validate(&token).unwrap(), Validation::Expired);
+    assert!(db.auth().rotate(&token).is_err());
+}

@@ -730,6 +730,9 @@ impl Engine for ContentEngine {
         let mut space = None;
         let mut types = None;
         let mut deleted = Vec::new();
+        // Revisions this commit writes, by entity: a delete later in the same
+        // commit removes them too (they are not in the store yet).
+        let mut written: HashMap<EntityId, Vec<Vec<u8>>> = HashMap::new();
         for op in &ops {
             match op {
                 Op::Create(record) => {
@@ -774,7 +777,9 @@ impl Engine for ContentEngine {
                     heads.push((head, false));
                 }
                 Op::PutRevision(rid, n, value) => {
-                    batch.put(revision_key(self.collection, *rid, *n), *value);
+                    let key = revision_key(self.collection, *rid, *n);
+                    batch.put(key.clone(), *value);
+                    written.entry(*rid).or_default().push(key);
                 }
                 Op::PutRoute(site, path, value) => {
                     let entry = decode_route(value, seq)?;
@@ -803,6 +808,9 @@ impl Engine for ContentEngine {
                     batch.delete(key);
                     let start = revision_prefix(self.collection, *rid);
                     for (rev, _) in self.store.scan(crate::core::prefix_range(&start))? {
+                        batch.delete(rev);
+                    }
+                    for rev in written.remove(rid).unwrap_or_default() {
                         batch.delete(rev);
                     }
                     changes.push(Change::EntityChanged {
@@ -2049,6 +2057,12 @@ impl ContentTx<'_, '_> {
             let _ = self.staged.links.insert((target, rid), false);
         }
         self.staged.heads.retain(|h| h.rid != rid);
+        // Revisions this work recorded for the entity go with it: never
+        // written, rather than written and left behind.
+        self.staged
+            .ops
+            .retain(|op| !matches!(op, StagedOp::Revision(r, ..) if *r == rid));
+        self.staged.revisions.retain(|(r, _), _| *r != rid);
         let _ = self.staged.deleted.insert(rid);
         self.staged.ops.push(StagedOp::Delete(rid));
         self.staged

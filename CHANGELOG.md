@@ -32,6 +32,8 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 ### Fixed
 
+- **`rotate` renewed a session past its idle limit**, which `validate` already answered `Expired` for. Both now use one rule: the absolute expiry and the idle limit against the last use.
+- **A delete in the commit that also wrote a revision left that revision in the store** for good (listed, and in every backup). The delete now removes revisions written earlier in the same commit, also when an older log is replayed.
 - **A lock-out did not slow guessing, and its answer named the password.** During a lock-out every guess was still checked, a wrong one answered `Failed`, and only the right one answered `LockedOut`. Now no password is checked while sign-in is locked out, and every password answers `LockedOut` after the same work.
 - **`check_totp` counted no failures**, so an application using `verify_password` and `check_totp` allowed unlimited code guessing. Second-factor checks now count toward the account's lock-out, and while it holds they answer `false` for every code.
 - **Ten wrong passwords signed the owner out of every device.** The lock-out after repeated failures no longer changes the account's standing: it blocks new sign-ins only, commits nothing (so the tenth failure of a real account no longer takes longer than any other), and ends no session. It counts failures for identifiers that name no account too, so a lock-out does not tell which accounts exist. It is kept in the session checkpoint (format 2) and survives a clean restart.

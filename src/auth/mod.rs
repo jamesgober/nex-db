@@ -4849,7 +4849,9 @@ impl Auth<'_> {
         }
     }
 
-    /// Check a session token. Reads memory only and allocates nothing.
+    /// Check a session token. Reads memory only and allocates nothing (with
+    /// split auth: one round trip to the auth process, and no allocation
+    /// once the calling thread has made one check).
     ///
     /// ```no_run
     /// # fn main() -> nex_db::Result<()> {

@@ -9,8 +9,9 @@
 //! never holds up a session check.
 
 use std::{
+    cell::RefCell,
     collections::{HashMap, VecDeque},
-    io::Write,
+    io::{Read, Write},
     path::PathBuf,
     sync::{Arc, Condvar, Mutex, OnceLock, PoisonError},
     time::{Duration, Instant},
@@ -21,7 +22,7 @@ use crypt_io::Zeroizing;
 use super::{
     channel::HELLO_REPLY,
     op,
-    wire::{self, ERR, OK, REQUEST_HEAD, get_bool, get_str},
+    wire::{self, ERR, FRAME_BUFFER, FrameReader, MAX_FRAME, OK, REQUEST_HEAD, get_bool, get_str},
 };
 use crate::{
     auth::{
@@ -165,12 +166,19 @@ impl<'h> State<'h> {
     /// an unknown state.
     fn serve(&self, id: u64, op: u16, payload: &[u8]) {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut body = Vec::with_capacity(64);
+            let mut body = kept(|kept| std::mem::take(&mut kept.body)).unwrap_or_default();
+            if body.capacity() < FRAME_BUFFER {
+                body.reserve_exact(FRAME_BUFFER);
+            }
             let status = self.handle(op, payload, &mut body);
             (status, body)
         }));
         match outcome {
-            Ok((status, body)) => self.reply(id, status, &body),
+            Ok((status, mut body)) => {
+                self.reply(id, status, &body);
+                wire::wipe_frame(&mut body);
+                let _ = kept(move |kept| kept.body = body);
+            }
             Err(_) => std::process::abort(),
         }
     }
@@ -643,7 +651,7 @@ fn expired() -> Error {
 }
 
 /// A request for the pool: id, op, payload.
-type Job = (u64, u16, Vec<u8>);
+type Job = (u64, u16, Zeroizing<Vec<u8>>);
 
 /// Work for the pool: requests in arrival order, and whether input ended.
 #[derive(Default)]
@@ -697,16 +705,20 @@ fn inline(op: u16) -> bool {
 /// the input ends.
 pub(crate) fn serve() -> Result<()> {
     let io = |e: std::io::Error| Error::storage("reading the auth channel", e);
-    let mut input = std::io::stdin().lock();
+    let mut input = FrameReader::new(raw_stdin());
     let out = Mutex::new(raw_stdout());
-    let Some(frame) = wire::read_frame(&mut input, REQUEST_HEAD).map_err(io)? else {
+    let hello = input.next(REQUEST_HEAD, |frame| {
+        let (id, op, payload) = parse(frame)?;
+        if op != op::HELLO {
+            return Err(Error::corrupt("the hello", 0));
+        }
+        Ok((id, Host::open(payload)))
+    });
+    let Some(hello) = hello.map_err(io)? else {
         return Ok(());
     };
-    let (id, op, payload) = parse(&frame)?;
-    if op != op::HELLO {
-        return Err(Error::corrupt("the hello", 0));
-    }
-    let host = match Host::open(payload) {
+    let (id, host) = hello?;
+    let host = match host {
         Ok(host) => host,
         Err(err) => {
             let mut body = Vec::new();
@@ -734,19 +746,72 @@ pub(crate) fn serve() -> Result<()> {
         }
         // Input that ends, fails, or does not parse ends the process: the
         // application sees its channel close.
-        while let Ok(Some(frame)) = wire::read_frame(&mut input, REQUEST_HEAD) {
-            let Ok((id, op, payload)) = parse(&frame) else {
-                break;
+        let handle = |frame: &[u8]| {
+            let Ok((id, op, payload)) = parse(frame) else {
+                return false;
             };
             if inline(op) {
                 state.serve(id, op, payload);
             } else {
-                queue.push((id, op, payload.to_vec()));
+                queue.push((id, op, Zeroizing::new(payload.to_vec())));
             }
-        }
+            true
+        };
+        while let Ok(Some(true)) = input.next(REQUEST_HEAD, handle) {}
         queue.close();
     });
     Ok(())
+}
+
+/// Standard input without the buffer `Stdin` adds, which could not be
+/// wiped: requests carry passwords. Falls back to `Stdin`, whose buffer the
+/// frame reader's large reads pass by.
+fn raw_stdin() -> Box<dyn Read + Send> {
+    #[cfg(windows)]
+    let copied = {
+        use std::os::windows::io::AsHandle;
+        std::io::stdin()
+            .as_handle()
+            .try_clone_to_owned()
+            .map(std::fs::File::from)
+    };
+    #[cfg(unix)]
+    let copied = {
+        use std::os::fd::AsFd;
+        std::io::stdin()
+            .as_fd()
+            .try_clone_to_owned()
+            .map(std::fs::File::from)
+    };
+    #[cfg(not(any(windows, unix)))]
+    let copied: std::io::Result<std::fs::File> = Err(std::io::ErrorKind::Unsupported.into());
+    match copied {
+        Ok(file) => Box::new(file),
+        Err(_) => Box::new(std::io::stdin()),
+    }
+}
+
+/// What a thread of the auth process keeps between requests: the reply
+/// body's buffer and the reply frame's. Each is empty and wiped while kept.
+struct Kept {
+    body: Vec<u8>,
+    frame: Vec<u8>,
+}
+
+thread_local! {
+    static KEPT: RefCell<Kept> = const {
+        RefCell::new(Kept {
+            body: Vec::new(),
+            frame: Vec::new(),
+        })
+    };
+}
+
+/// Run `f` on this thread's [`Kept`]; `None` while the thread ends.
+fn kept<T>(f: impl FnOnce(&mut Kept) -> T) -> Option<T> {
+    KEPT.try_with(|kept| kept.try_borrow_mut().ok().map(|mut kept| f(&mut kept)))
+        .ok()
+        .flatten()
 }
 
 /// Standard output without the line buffer `Stdout` adds, so each reply
@@ -787,12 +852,28 @@ fn parse(frame: &[u8]) -> Result<(u64, u16, &[u8])> {
 }
 
 /// Write one response. A failed write means the application is gone; its
-/// input ends next, and the process with it.
+/// input ends next, and the process with it. A reply too long for a frame
+/// is answered with an error (before 0.8 it was not sent, and the request
+/// waited out its limit, which ended the auth process).
 fn write_reply(out: &Mutex<Box<dyn Write + Send>>, id: u64, status: u8, body: &[u8]) {
     if id == 0 {
         return;
     }
-    let Ok(frame) = wire::frame(
+    let mut frame = kept(|kept| std::mem::take(&mut kept.frame)).unwrap_or_default();
+    let mut too_long = Vec::new();
+    let (status, body) = if wire::RESPONSE_HEAD + body.len() > MAX_FRAME {
+        wire::put_error(
+            &mut Writer::new(&mut too_long),
+            &Error::invalid("the auth process's answer", "larger than 16 MiB"),
+        );
+        (ERR, &too_long[..])
+    } else {
+        (status, body)
+    };
+    // Sized up front, so writing the frame never copies it by growing.
+    frame.reserve_exact(4 + wire::RESPONSE_HEAD + body.len());
+    let built = wire::frame_into(
+        &mut frame,
         |w| {
             w.u64(id);
             w.u8(status);
@@ -801,15 +882,66 @@ fn write_reply(out: &Mutex<Box<dyn Write + Send>>, id: u64, status: u8, body: &[
             w.bytes(body);
             Ok(())
         },
-    ) else {
-        return;
-    };
-    let mut out = out.lock().unwrap_or_else(PoisonError::into_inner);
-    let _ = out.write_all(&frame).and_then(|()| out.flush());
+    );
+    if built.is_ok() {
+        let mut out = out.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = out.write_all(&frame).and_then(|()| out.flush());
+    }
+    wire::wipe_frame(&mut frame);
+    let _ = kept(move |kept| kept.frame = frame);
 }
 
 /// The request frame parser, for fuzzing and tests.
 #[cfg(any(fuzzing, test))]
 pub(crate) fn parse_frame(frame: &[u8]) -> Result<(u64, u16, &[u8])> {
     parse(frame)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Before 0.8 a reply too long for a frame was not sent at all, so the
+    /// request waited out its limit and the auth process was ended. Now
+    /// the request gets an error at once.
+    #[test]
+    fn test_a_reply_too_long_for_a_frame_is_answered_with_an_error() {
+        let sink = Sink::default();
+        let out: Mutex<Box<dyn Write + Send>> = Mutex::new(Box::new(sink.clone()));
+        write_reply(&out, 7, OK, &vec![1u8; MAX_FRAME]);
+        let sent = sink.0.lock().unwrap().clone();
+        let frame = FrameReader::new(&sent[..])
+            .next(wire::RESPONSE_HEAD, <[u8]>::to_vec)
+            .unwrap()
+            .expect("a reply was sent");
+        let mut r = Reader::new(&frame, wire::REPLY, 0);
+        assert_eq!(r.u64().unwrap(), 7);
+        assert_eq!(r.u8().unwrap(), ERR);
+        assert!(matches!(wire::get_error(&mut r), Error::Invalid { .. }));
+        // One that fits goes out whole.
+        sink.0.lock().unwrap().clear();
+        write_reply(&out, 8, OK, b"fits");
+        let sent = sink.0.lock().unwrap().clone();
+        let frame = FrameReader::new(&sent[..])
+            .next(wire::RESPONSE_HEAD, <[u8]>::to_vec)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&frame[wire::RESPONSE_HEAD..], b"fits");
+    }
 }

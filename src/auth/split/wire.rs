@@ -46,37 +46,137 @@ pub(crate) const RESPONSE_HEAD: usize = 9;
 /// What a reply's reader reports when it is malformed.
 pub(crate) const REPLY: &str = "a message from the auth process";
 
-/// Read one frame (the bytes after its length). `Ok(None)` when the stream
-/// ends before a frame starts.
-pub(crate) fn read_frame(input: &mut impl Read, head: usize) -> io::Result<Option<Vec<u8>>> {
-    let mut len = [0u8; 4];
-    let mut got = 0;
-    while got < len.len() {
-        match input.read(&mut len[got..]) {
-            Ok(0) if got == 0 => return Ok(None),
-            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
-            Ok(n) => got += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    let len = u32::from_le_bytes(len) as usize;
-    if len < head || len > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame length"));
-    }
-    let mut frame = vec![0u8; len];
-    input.read_exact(&mut frame)?;
-    Ok(Some(frame))
+/// The read buffer's size: most frames, many at once.
+const READ_BUFFER: usize = 64 * 1024;
+/// The least room a read is given. A `BufReader` (standard input's, when
+/// its handle cannot be copied) passes a read this large straight through,
+/// so no frame bytes are left in a buffer this reader cannot wipe.
+const MIN_READ: usize = 16 * 1024;
+/// What a frame buffer starts with: every request and every reply that
+/// carries a secret fits, so none is copied by growing.
+pub(crate) const FRAME_BUFFER: usize = 4096;
+
+/// Reads frames off a pipe into one buffer it reuses, and wipes each
+/// frame's bytes once it has been handled: a password, token, or secret
+/// stays in this buffer only while its frame is handled. A frame longer
+/// than the buffer grows it as its bytes arrive (never on the strength of
+/// its length alone), and the buffer goes back to its size afterwards.
+pub(crate) struct FrameReader<R: Read> {
+    input: R,
+    buf: Vec<u8>,
+    /// The unhandled bytes are `buf[start..end]`; every other byte is zero.
+    start: usize,
+    end: usize,
 }
 
-/// A frame: `len`, then `head` (id and op, or id and status), then what `f`
-/// writes.
-pub(crate) fn frame(
+impl<R: Read> FrameReader<R> {
+    pub(crate) fn new(input: R) -> Self {
+        FrameReader {
+            input,
+            buf: vec![0; READ_BUFFER],
+            start: 0,
+            end: 0,
+        }
+    }
+
+    /// Hand the next frame (the bytes after its length) to `f`, then wipe
+    /// it. `Ok(None)` when the stream ends before a frame starts.
+    pub(crate) fn next<T>(
+        &mut self,
+        head: usize,
+        f: impl FnOnce(&[u8]) -> T,
+    ) -> io::Result<Option<T>> {
+        if !self.fill(4)? {
+            return if self.start == self.end {
+                Ok(None)
+            } else {
+                Err(io::ErrorKind::UnexpectedEof.into())
+            };
+        }
+        let mut len = [0u8; 4];
+        len.copy_from_slice(&self.buf[self.start..self.start + 4]);
+        let len = u32::from_le_bytes(len) as usize;
+        if len < head || len > MAX_FRAME {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "frame length"));
+        }
+        if !self.fill(4 + len)? {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        let at = self.start + 4;
+        let out = f(&self.buf[at..at + len]);
+        crypt_io::wipe(&mut self.buf[self.start..at + len]);
+        self.start = at + len;
+        if self.start == self.end {
+            self.start = 0;
+            self.end = 0;
+            if self.buf.len() > READ_BUFFER {
+                // Every byte is zero: back to the usual size.
+                self.buf = vec![0; READ_BUFFER];
+            }
+        }
+        Ok(Some(out))
+    }
+
+    /// Read until `n` bytes from `start` are here. `false` when the stream
+    /// ends first.
+    fn fill(&mut self, n: usize) -> io::Result<bool> {
+        while self.end - self.start < n {
+            self.room();
+            match self.input.read(&mut self.buf[self.end..]) {
+                Ok(0) => return Ok(false),
+                Ok(k) => self.end += k,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
+
+    /// Make room to read: the unhandled bytes move to the front when the
+    /// space after them is short, and the buffer doubles when that is not
+    /// enough. Moved-from and dropped bytes are wiped.
+    fn room(&mut self) {
+        if self.buf.len() - self.end >= MIN_READ {
+            return;
+        }
+        if self.start > 0 {
+            let held = self.end - self.start;
+            self.buf.copy_within(self.start..self.end, 0);
+            // The old bytes the move did not overwrite.
+            crypt_io::wipe(&mut self.buf[held.max(self.start)..self.end]);
+            self.start = 0;
+            self.end = held;
+            if self.buf.len() - self.end >= MIN_READ {
+                return;
+            }
+        }
+        let size = (self.buf.len() * 2).max(self.end + MIN_READ);
+        let mut grown = vec![0; size];
+        grown[..self.end].copy_from_slice(&self.buf[..self.end]);
+        crypt_io::wipe(&mut self.buf[..self.end]);
+        self.buf = grown;
+    }
+}
+
+impl<R: Read> Drop for FrameReader<R> {
+    fn drop(&mut self) {
+        crypt_io::wipe(&mut self.buf[self.start..self.end]);
+    }
+}
+
+/// Write a frame into `out` (emptied first): `len`, then `head` (id and op,
+/// or id and status), then what `f` writes. `out` is a buffer the caller
+/// reuses and wipes with [`wipe_frame`] once the frame is sent.
+pub(crate) fn frame_into(
+    out: &mut Vec<u8>,
     head: impl FnOnce(&mut Writer<'_>),
     f: impl FnOnce(&mut Writer<'_>) -> Result<()>,
-) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(64);
-    let mut w = Writer::new(&mut out);
+) -> Result<()> {
+    wipe_frame(out);
+    if out.capacity() < FRAME_BUFFER {
+        out.reserve_exact(FRAME_BUFFER);
+    }
+    let mut w = Writer::new(out);
     w.u32(0);
     head(&mut w);
     f(&mut w)?;
@@ -86,7 +186,17 @@ pub(crate) fn frame(
     }
     let len = u32::try_from(len).map_err(|_| Error::invalid("commit", "larger than 16 MiB"))?;
     out[..4].copy_from_slice(&len.to_le_bytes());
-    Ok(out)
+    Ok(())
+}
+
+/// Wipe a frame buffer's bytes and empty it, keeping its allocation (one
+/// that grew past [`READ_BUFFER`] is let go, after the wipe).
+pub(crate) fn wipe_frame(out: &mut Vec<u8>) {
+    crypt_io::wipe(out);
+    out.clear();
+    if out.capacity() > READ_BUFFER {
+        *out = Vec::new();
+    }
 }
 
 // Strings and bytes: a u32 length, so no input is cut short by the wire.
@@ -925,8 +1035,10 @@ fn read_error(r: &mut Reader<'_>) -> Result<Error> {
 /// expected; a panic, a hang, or an allocation the input asked for is a bug.
 #[cfg(any(fuzzing, test))]
 pub(crate) fn fuzz(data: &[u8]) {
-    let _ = read_frame(&mut &data[..], REQUEST_HEAD);
-    let _ = read_frame(&mut &data[..], RESPONSE_HEAD);
+    for head in [REQUEST_HEAD, RESPONSE_HEAD] {
+        let mut frames = FrameReader::new(data);
+        while let Ok(Some(_)) = frames.next(head, <[u8]>::len) {}
+    }
     // Every reader the application uses on a reply, from the start.
     let reader = || Reader::new(data, "fuzz", 0);
     let _ = get_bool(&mut reader());
@@ -1015,16 +1127,99 @@ mod tests {
         assert!(matches!(err, Error::Storage { .. }));
     }
 
+    fn first(bytes: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        FrameReader::new(bytes).next(REQUEST_HEAD, <[u8]>::to_vec)
+    }
+
     #[test]
     fn test_frame_length_bounds_are_checked() {
-        let mut short = &[3u8, 0, 0, 0, 1, 2, 3][..];
-        assert!(read_frame(&mut short, REQUEST_HEAD).is_err());
-        let mut huge = &u32::MAX.to_le_bytes()[..];
-        assert!(read_frame(&mut huge, REQUEST_HEAD).is_err());
-        let mut empty = &[][..];
-        assert!(read_frame(&mut empty, REQUEST_HEAD).unwrap().is_none());
-        let mut cut = &[20u8, 0][..];
-        assert!(read_frame(&mut cut, REQUEST_HEAD).is_err());
+        assert!(first(&[3u8, 0, 0, 0, 1, 2, 3]).is_err());
+        assert!(first(&u32::MAX.to_le_bytes()).is_err());
+        assert!(first(&[]).unwrap().is_none());
+        assert!(first(&[20u8, 0]).is_err());
+        let mut whole = 12u32.to_le_bytes().to_vec();
+        whole.extend_from_slice(&[7; 12]);
+        assert!(first(&whole[..15]).is_err(), "a frame cut short");
+        assert_eq!(first(&whole).unwrap().unwrap(), [7; 12]);
+    }
+
+    /// A reader that hands out at most `step` bytes a call, and lets the
+    /// test look at the frame reader's buffer.
+    struct Trickle<'a> {
+        data: &'a [u8],
+        step: usize,
+    }
+
+    impl Read for Trickle<'_> {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            let n = self.step.min(out.len()).min(self.data.len());
+            out[..n].copy_from_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            Ok(n)
+        }
+    }
+
+    /// Before 0.8 each frame was read into a new `Vec` and freed unwiped,
+    /// and a `BufReader` kept the bytes of the last 64 KiB. Now every
+    /// byte of a handled frame is zero in the reader's one buffer, frames
+    /// of every size and split anywhere arrive whole, and a long frame's
+    /// buffer goes back to its usual size.
+    #[test]
+    fn test_frames_are_wiped_once_handled() {
+        let mut stream = Vec::new();
+        let mut sent = Vec::new();
+        for (i, size) in [12usize, 5000, 70_000, 12, 300_000, 40]
+            .into_iter()
+            .enumerate()
+        {
+            let body: Vec<u8> = (0..size).map(|k| ((k + i) % 251) as u8 | 1).collect();
+            stream.extend_from_slice(&u32::try_from(size).unwrap().to_le_bytes());
+            stream.extend_from_slice(&body);
+            sent.push(body);
+        }
+        for step in [1usize, 7, 4096, 1 << 20] {
+            let mut frames = FrameReader::new(Trickle {
+                data: &stream,
+                step,
+            });
+            for body in &sent {
+                let got = frames.next(REQUEST_HEAD, <[u8]>::to_vec).unwrap().unwrap();
+                assert_eq!(&got, body, "step {step}");
+                assert!(
+                    frames.buf[..frames.start].iter().all(|&b| b == 0)
+                        && frames.buf[frames.end..].iter().all(|&b| b == 0),
+                    "step {step}: a handled byte was left"
+                );
+            }
+            assert!(frames.next(REQUEST_HEAD, <[u8]>::len).unwrap().is_none());
+            assert_eq!(frames.buf.len(), READ_BUFFER, "step {step}");
+            assert!(frames.buf.iter().all(|&b| b == 0));
+        }
+    }
+
+    #[test]
+    fn test_frame_into_reuses_its_buffer_and_wipes_it() {
+        let mut out = Vec::new();
+        frame_into(
+            &mut out,
+            |w| {
+                w.u64(9);
+                w.u16(1);
+            },
+            |w| put_str(w, "correct horse battery staple, long enough to matter"),
+        )
+        .unwrap();
+        let capacity = out.capacity();
+        let at = out.as_ptr();
+        assert!(capacity >= FRAME_BUFFER);
+        assert_eq!(first(&out).unwrap().unwrap().len(), out.len() - 4);
+        wipe_frame(&mut out);
+        assert!(out.is_empty());
+        assert_eq!(
+            (out.capacity(), out.as_ptr()),
+            (capacity, at),
+            "kept for the next frame"
+        );
     }
 
     #[test]

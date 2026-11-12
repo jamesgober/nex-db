@@ -32,6 +32,9 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 ### Fixed
 
+- **Split auth left passwords, tokens, and secrets in freed memory** of both processes: every request and reply frame was built in a buffer that grew and was freed unwiped, and the read buffers kept the last 64 KiB of frames. Each process now reads frames straight off the pipe into one buffer that wipes each frame once handled, and builds frames in per-thread buffers sized up front and wiped after each send.
+- **A split session check made 4 allocations in the application** (its rustdoc says it allocates none). The request frame, the slot it waits in, and the reply buffer are now kept per thread: none once a thread has made one check. `tests/alloc.rs` counts it.
+- **A split checkpoint or backup had the same two-minute limit as any request**, so one on a large store or a slow disk ended the auth process and stopped writes. They now have an hour. **An answer too long for a frame was never sent**, so its request waited out the limit with the same result; it now returns `Error::Invalid` at once.
 - **Split auth with `Keys::env` left the root key in the application process**: the auth process inherits its environment from the application. Split auth now refuses `Keys::env`; use a key file. `docs/API.md` also says what the split defends against (memory disclosure in the application) and what it does not (code execution as the same OS user).
 - `docs/API.md` said reads inside `db.commit` are snapshot isolation; they see the latest committed state. It now says so, and points to `commit_serializable` for writes derived from reads.
 - **`rotate` renewed a session past its idle limit**, which `validate` already answered `Expired` for. Both now use one rule: the absolute expiry and the idle limit against the last use.

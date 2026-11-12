@@ -15,10 +15,18 @@
 //! sends a frame that does not parse, the channel is dead: every waiting
 //! request and every later one fails with [`Error::Storage`], and
 //! [`Channel::failure`] reports it to the core, which stops writes.
+//!
+//! A request allocates nothing once its thread has made one: the request
+//! frame's buffer, the slot it waits in, and the reply's buffer are kept
+//! per thread and reused. Every frame buffer is wiped once its frame is
+//! sent or its reply dropped, and replies are read straight off the pipe
+//! into a buffer that wipes each frame once handled, so passwords, tokens,
+//! and secrets do not linger in this process's memory.
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
-    io::{BufReader, Write},
+    io::Write,
     path::Path,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{
@@ -29,7 +37,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::wire::{self, ERR, OK, REPLY, RESPONSE_HEAD};
+use super::wire::{self, ERR, FRAME_BUFFER, FrameReader, OK, REPLY, RESPONSE_HEAD};
 use crate::{
     core::codec::{Reader, Writer},
     error::{Error, Result},
@@ -46,9 +54,27 @@ const EXIT_WAIT: Duration = Duration::from_secs(30);
 /// not answer in time is ended, so the channel fails closed (every auth call
 /// errors and writes stop) instead of leaving callers waiting.
 const REQUEST_WAIT: Duration = Duration::from_secs(120);
-/// Buffer for reading replies: a frame and its length usually arrive in one
-/// read.
-const READ_BUFFER: usize = 64 * 1024;
+/// The limit for a checkpoint or a backup, which write or copy a whole auth
+/// store: long enough for a large one on a slow disk, short enough that an
+/// auth process that hangs is still ended.
+const LONG_WAIT: Duration = Duration::from_secs(60 * 60);
+
+/// How long a request with `op` may wait, and what its error says past it.
+/// Before 0.8 a checkpoint or backup had two minutes like any request, and
+/// past them the auth process was ended and writes stopped.
+fn limit(op: u16) -> (Duration, &'static str) {
+    if matches!(op, super::op::CHECKPOINT | super::op::BACKUP) {
+        (
+            LONG_WAIT,
+            "it did not finish a checkpoint or backup in an hour, and was ended",
+        )
+    } else {
+        (
+            REQUEST_WAIT,
+            "it did not answer in two minutes, and was ended",
+        )
+    }
+}
 /// How often the watchdog checks the auth process and the waiting requests.
 /// An auth process that ends while no request is waiting stops writes
 /// within this time; one that ends during a request fails it at once.
@@ -62,9 +88,50 @@ fn gone() -> Error {
 }
 
 /// A response: its status and its frame, the payload after the header.
+/// The frame's buffer is wiped when the reply is dropped, and kept for
+/// this thread's next request.
 pub(crate) struct Reply {
     pub(crate) status: u8,
     frame: Vec<u8>,
+}
+
+impl Drop for Reply {
+    fn drop(&mut self) {
+        wire::wipe_frame(&mut self.frame);
+        let frame = std::mem::take(&mut self.frame);
+        let _ = spare(move |spare| {
+            if spare.reply.capacity() == 0 {
+                spare.reply = frame;
+            }
+        });
+    }
+}
+
+/// What a thread keeps between its requests: the request frame's buffer,
+/// the slot it waits in, and the reply's buffer. Each is empty and wiped
+/// while kept.
+struct Spare {
+    frame: Vec<u8>,
+    slot: Option<Arc<Slot>>,
+    reply: Vec<u8>,
+}
+
+thread_local! {
+    static SPARE: RefCell<Spare> = const {
+        RefCell::new(Spare {
+            frame: Vec::new(),
+            slot: None,
+            reply: Vec::new(),
+        })
+    };
+}
+
+/// Run `f` on this thread's [`Spare`]; `None` while the thread ends.
+fn spare<T>(f: impl FnOnce(&mut Spare) -> T) -> Option<T> {
+    SPARE
+        .try_with(|spare| spare.try_borrow_mut().ok().map(|mut spare| f(&mut spare)))
+        .ok()
+        .flatten()
 }
 
 impl Reply {
@@ -87,9 +154,12 @@ impl Reply {
 
 /// What a waiting request is woken for: its reply, once read, or its turn
 /// to take the read side.
-#[derive(Default)]
 struct Wait {
-    reply: Option<std::result::Result<Reply, ()>>,
+    /// The reply's status once read, with its frame in `frame`; `Err`
+    /// when the channel ended first.
+    reply: Option<std::result::Result<u8, ()>>,
+    /// The buffer the reply's frame is copied into.
+    frame: Vec<u8>,
     lead: bool,
 }
 
@@ -103,11 +173,43 @@ struct Slot {
 }
 
 impl Slot {
-    fn new(limit: Duration) -> Slot {
-        Slot {
-            wait: Mutex::new(Wait::default()),
+    /// A slot for a request that may wait `limit`: this thread's kept one,
+    /// or a new one.
+    fn take(limit: Duration) -> Arc<Slot> {
+        let deadline = Instant::now() + limit;
+        let buffer = || {
+            spare(|spare| std::mem::take(&mut spare.reply))
+                .filter(|reply| reply.capacity() > 0)
+                .unwrap_or_else(|| Vec::with_capacity(FRAME_BUFFER))
+        };
+        if let Some(mut slot) = spare(|spare| spare.slot.take()).flatten() {
+            if let Some(kept) = Arc::get_mut(&mut slot) {
+                kept.deadline = deadline;
+                let wait = kept.wait.get_mut().unwrap_or_else(PoisonError::into_inner);
+                wait.reply = None;
+                wait.lead = false;
+                if wait.frame.capacity() == 0 {
+                    wait.frame = buffer();
+                }
+                return slot;
+            }
+        }
+        Arc::new(Slot {
+            wait: Mutex::new(Wait {
+                reply: None,
+                frame: buffer(),
+                lead: false,
+            }),
             ready: Condvar::new(),
-            deadline: Instant::now() + limit,
+            deadline,
+        })
+    }
+
+    /// Keep `slot` for this thread's next request, when nothing else holds
+    /// it (none can take it again: it left the pending map).
+    fn keep(slot: Arc<Slot>) {
+        if Arc::strong_count(&slot) == 1 {
+            let _ = spare(move |spare| spare.slot = Some(slot));
         }
     }
 
@@ -115,8 +217,28 @@ impl Slot {
         self.wait.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn fill(&self, reply: std::result::Result<Reply, ()>) {
-        self.lock().reply = Some(reply);
+    /// The reply, once there is one.
+    fn reply(wait: &mut Wait) -> Option<std::result::Result<Reply, ()>> {
+        let status = wait.reply.take()?;
+        Some(status.map(|status| Reply {
+            status,
+            frame: std::mem::take(&mut wait.frame),
+        }))
+    }
+
+    /// Hand the request its reply (status and frame), or `Err` when the
+    /// channel ended.
+    fn fill(&self, reply: std::result::Result<(u8, &[u8]), ()>) {
+        {
+            let mut guard = self.lock();
+            let wait = &mut *guard;
+            wait.reply = Some(reply.map(|(status, frame)| {
+                // The buffer is empty and wiped: growing it leaves nothing.
+                wait.frame.clear();
+                wait.frame.extend_from_slice(frame);
+                status
+            }));
+        }
         self.ready.notify_one();
     }
 
@@ -131,7 +253,7 @@ struct Shared {
     pending: Mutex<HashMap<u64, Arc<Slot>>>,
     dead: AtomicBool,
     /// The read side of the pipe: the request that holds it reads.
-    output: Mutex<BufReader<ChildStdout>>,
+    output: Mutex<FrameReader<ChildStdout>>,
     child: Mutex<Option<Child>>,
     /// Set when the channel closes, to end the watchdog.
     closing: AtomicBool,
@@ -166,30 +288,32 @@ impl Shared {
         self.fail();
     }
 
-    /// Read replies until the one for `id` arrives, handing each other
-    /// reply to its request. The stream ending, failing, or holding a frame
-    /// that does not parse or that no request is waiting for ends the
-    /// channel.
-    fn read_until(&self, output: &mut BufReader<ChildStdout>, id: u64) -> Option<Reply> {
-        while let Ok(Some(frame)) = wire::read_frame(output, RESPONSE_HEAD) {
-            let mut r = Reader::new(&frame, REPLY, 0);
-            let (Ok(got), Ok(status)) = (r.u64(), r.u8()) else {
-                break;
-            };
-            if status != OK && status != ERR {
-                break;
+    /// Read replies until the one for `id` arrives, handing each reply to
+    /// its request's slot; `false` when the channel ended first. The stream
+    /// ending, failing, or holding a frame that does not parse or that no
+    /// request is waiting for ends the channel.
+    fn read_until(&self, output: &mut FrameReader<ChildStdout>, id: u64) -> bool {
+        loop {
+            let step = output.next(RESPONSE_HEAD, |frame| {
+                let mut r = Reader::new(frame, REPLY, 0);
+                let (Ok(got), Ok(status)) = (r.u64(), r.u8()) else {
+                    return None;
+                };
+                if status != OK && status != ERR {
+                    return None;
+                }
+                let slot = self.pending().remove(&got)?;
+                slot.fill(Ok((status, frame)));
+                Some(got == id)
+            });
+            match step {
+                Ok(Some(Some(true))) => return true,
+                Ok(Some(Some(false))) => {}
+                _ => break,
             }
-            let Some(slot) = self.pending().remove(&got) else {
-                break;
-            };
-            let reply = Reply { status, frame };
-            if got == id {
-                return Some(reply);
-            }
-            slot.fill(Ok(reply));
         }
         self.fail();
-        None
+        false
     }
 
     /// Give the read side's turn to one waiting request, if any. Called by
@@ -277,7 +401,7 @@ impl Channel {
         let shared = Arc::new(Shared {
             pending: Mutex::new(HashMap::new()),
             dead: AtomicBool::new(false),
-            output: Mutex::new(BufReader::with_capacity(READ_BUFFER, output)),
+            output: Mutex::new(FrameReader::new(output)),
             child: Mutex::new(Some(child)),
             closing: AtomicBool::new(false),
         });
@@ -338,12 +462,8 @@ impl Channel {
         op: u16,
         f: impl FnOnce(&mut Writer<'_>) -> Result<()>,
     ) -> Result<Reply> {
-        self.exchange(
-            op,
-            f,
-            REQUEST_WAIT,
-            "it did not answer in two minutes, and was ended",
-        )
+        let (limit, late) = limit(op);
+        self.exchange(op, f, limit, late)
     }
 
     fn exchange(
@@ -354,22 +474,30 @@ impl Channel {
         late: &'static str,
     ) -> Result<Reply> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        let frame = wire::frame(
+        let mut frame = spare(|spare| std::mem::take(&mut spare.frame)).unwrap_or_default();
+        let sent = wire::frame_into(
+            &mut frame,
             |w| {
                 w.u64(id);
                 w.u16(op);
             },
             f,
-        )?;
-        let slot = Arc::new(Slot::new(limit));
-        {
-            let mut pending = self.shared.pending();
-            if self.shared.dead.load(Ordering::Acquire) {
-                return Err(gone());
+        )
+        .and_then(|()| {
+            let slot = Slot::take(limit);
+            {
+                let mut pending = self.shared.pending();
+                if self.shared.dead.load(Ordering::Acquire) {
+                    return Err(gone());
+                }
+                let _ = pending.insert(id, Arc::clone(&slot));
             }
-            let _ = pending.insert(id, Arc::clone(&slot));
-        }
-        self.write(&frame);
+            self.write(&frame);
+            Ok(slot)
+        });
+        wire::wipe_frame(&mut frame);
+        let _ = spare(move |spare| spare.frame = frame);
+        let slot = sent?;
         loop {
             let output = match self.shared.output.try_lock() {
                 Ok(output) => Some(output),
@@ -379,20 +507,22 @@ impl Channel {
             if let Some(mut output) = output {
                 // The read side is free. The request that held it may have
                 // read this reply already; if not, read until it comes.
-                let ready = slot.lock().reply.take();
-                let reply = match ready {
-                    Some(reply) => reply.ok(),
-                    None => self.shared.read_until(&mut output, id),
-                };
+                let mut ready = Slot::reply(&mut slot.lock());
+                if ready.is_none() && self.shared.read_until(&mut output, id) {
+                    ready = Slot::reply(&mut slot.lock());
+                }
                 drop(output);
                 self.shared.pass_lead();
-                return reply.ok_or_else(gone);
+                Slot::keep(slot);
+                return ready.and_then(std::result::Result::ok).ok_or_else(gone);
             }
             // Another request reads: wait for the reply, or for the turn to
             // read.
             let mut wait = slot.lock();
             loop {
-                if let Some(reply) = wait.reply.take() {
+                if let Some(reply) = Slot::reply(&mut wait) {
+                    drop(wait);
+                    Slot::keep(slot);
                     return reply.map_err(|()| gone());
                 }
                 if wait.lead {
@@ -420,16 +550,21 @@ impl Channel {
         if self.shared.dead.load(Ordering::Acquire) {
             return;
         }
-        match wire::frame(
+        let mut frame = spare(|spare| std::mem::take(&mut spare.frame)).unwrap_or_default();
+        let built = wire::frame_into(
+            &mut frame,
             |w| {
                 w.u64(0);
                 w.u16(op);
             },
             f,
-        ) {
-            Ok(frame) => self.write(&frame),
+        );
+        match built {
+            Ok(()) => self.write(&frame),
             Err(_) => self.shared.fail(),
         }
+        wire::wipe_frame(&mut frame);
+        let _ = spare(move |spare| spare.frame = frame);
     }
 
     fn write(&self, frame: &[u8]) {
@@ -490,5 +625,19 @@ impl Drop for Channel {
             watchdog.thread().unpark();
             let _ = watchdog.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_checkpoints_and_backups_have_their_own_limit() {
+        use super::super::op;
+        assert_eq!(limit(op::VALIDATE).0, REQUEST_WAIT);
+        assert_eq!(limit(op::CHECKPOINT).0, LONG_WAIT);
+        assert_eq!(limit(op::BACKUP).0, LONG_WAIT);
+        assert!(LONG_WAIT > REQUEST_WAIT * 10);
     }
 }

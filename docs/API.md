@@ -621,7 +621,13 @@ fn main() -> nex_db::Result<()> {
 Every auth call is the same in both modes, with the same results. Each one
 crosses a pipe to the auth process (the child's standard input and output,
 which nothing else can reach): a session check is one round trip, a commit
-that touches auth one round trip per staged operation and two more. In split
+that touches auth one round trip per staged operation and two more. Since
+0.8 a session check allocates nothing in the application once its thread has
+made one, as in embedded mode, and both processes wipe every frame (which
+carries passwords, tokens, and secrets) once it is sent or handled. A request
+waits at most two minutes for its answer, a checkpoint or backup one hour;
+past that the auth process is ended and writes stop, as below. An answer too
+long for one frame (16 MiB) returns `Error::Invalid`. In split
 mode `hash_password` returns a handle to a hash the auth process keeps; it
 works with the database that made it for ten minutes, then gives
 `Error::Invalid { field: "password", .. }`: hash again. A database opens in

@@ -142,6 +142,18 @@ const OP_CREATE_KEYED_ACCOUNT: u8 = 15;
 const OP_ERASE_ACCOUNT: u8 = 16;
 /// A decoy token's digest (0.7): digest [32], at_ms u64.
 const OP_PLANT_DECOY: u8 = 17;
+/// An account's oldest session or token, removed for a new one (0.8):
+/// digest [32], at_ms u64.
+const OP_EVICT_SESSION: u8 = 18;
+
+/// Most live sessions one account holds; a new one evicts the oldest.
+const MAX_SESSIONS_PER_ACCOUNT: usize = 1_000;
+/// Most live single-use tokens and challenges one account holds; a new one
+/// evicts the oldest.
+const MAX_SINGLE_USE_PER_ACCOUNT: usize = 16;
+/// Most open passkey sign-in challenges (they name no account); a new one
+/// evicts the oldest.
+const MAX_OPEN_CHALLENGES: usize = 10_000;
 /// The epoch of an erased account: its sessions end as `Erased`.
 pub(crate) const ERASED_EPOCH: u32 = u32::MAX;
 /// The data key file, next to the account store.
@@ -162,6 +174,14 @@ const UPDATE_SEVERAL: u8 = 5;
 /// [`MAX_ACCOUNT_ROLES`] it keeps the largest account record inside one
 /// sealed bucket.
 const MAX_IDENTIFIERS: usize = 5;
+/// The policy every password check runs under: at most
+/// [`types::MAX_HASH_COST`], Argon2id only.
+const CHECK_POLICY: kdf::Argon2Policy = kdf::Argon2Policy::new().with_max_cost(
+    types::MAX_HASH_COST.0,
+    types::MAX_HASH_COST.1,
+    types::MAX_HASH_COST.2,
+);
+
 /// Most roles one account holds.
 const MAX_ACCOUNT_ROLES: usize = 16;
 
@@ -883,6 +903,17 @@ impl AuthEngine {
 
     /// Seal `plain`, a private record of `account` stored at `store_key`,
     /// under the account's data key, made (and synced) when it has none.
+    /// Destroy the keys made before `before_ms` for accounts whose
+    /// creating commit never landed and whose creating work is over.
+    fn drop_orphan_keys(&self, before_ms: u64) -> Result<()> {
+        for account in self.keys.settle(before_ms) {
+            if !self.account_exists(account)? {
+                self.keys.destroy(account)?;
+            }
+        }
+        Ok(())
+    }
+
     fn seal_private(&self, account: AccountId, store_key: &[u8], plain: &[u8]) -> Result<Vec<u8>> {
         let key = self.keys.get_or_make(account, now_ms())?;
         seal_with(&key, DATA_KEY_ID, store_key, plain)
@@ -989,6 +1020,13 @@ impl AuthEngine {
                 account(session.account),
             ),
             Op::PlantDecoy { at_ms, .. } => (*at_ms, "session.decoy_planted", "session".to_owned()),
+            Op::EvictSession { digest, at_ms } => {
+                let target = match self.sessions.get(digest) {
+                    Some(Slot::Live(session)) => account(session.account),
+                    _ => "session".to_owned(),
+                };
+                (*at_ms, "session.evicted", target)
+            }
             Op::RevokeSession {
                 digest,
                 reason,
@@ -1116,6 +1154,7 @@ impl AuthEngine {
             Op::EraseAccount { account, .. } => Change::AccountErased { account: *account },
             Op::IssueSession { .. }
             | Op::PlantDecoy { .. }
+            | Op::EvictSession { .. }
             | Op::SetIdentifier { .. }
             | Op::SetPolicy { .. }
             | Op::PutKey { .. }
@@ -1301,20 +1340,23 @@ impl AuthEngine {
                     .and_then(|(_, record)| record.standing.blocked_until(now))
             });
         if let Some(until) = blocked {
-            let _ = kdf::argon2_check(dummy, password.as_bytes());
+            let _ = kdf::argon2_check_with_policy(dummy, password.as_bytes(), &CHECK_POLICY);
             return Ok(Checked::Blocked(until));
         }
         match found {
-            Some((account, record)) => match kdf::argon2_check(&record.phc, password.as_bytes()) {
-                Ok(()) => Ok(Checked::Verified(account)),
-                Err(crypt_io::Error::AuthenticationFailed) => Ok(Checked::Wrong {
-                    account: Some(account),
-                    key,
-                }),
-                Err(_) => Err(Error::corrupt("a stored password hash", 0)),
-            },
+            Some((account, record)) => {
+                match kdf::argon2_check_with_policy(&record.phc, password.as_bytes(), &CHECK_POLICY)
+                {
+                    Ok(()) => Ok(Checked::Verified(account)),
+                    Err(crypt_io::Error::AuthenticationFailed) => Ok(Checked::Wrong {
+                        account: Some(account),
+                        key,
+                    }),
+                    Err(_) => Err(Error::corrupt("a stored password hash", 0)),
+                }
+            }
             None => {
-                let _ = kdf::argon2_check(dummy, password.as_bytes());
+                let _ = kdf::argon2_check_with_policy(dummy, password.as_bytes(), &CHECK_POLICY);
                 Ok(Checked::Wrong { account: None, key })
             }
         }
@@ -1622,6 +1664,10 @@ enum Op<'a> {
         digest: [u8; 32],
         at_ms: u64,
     },
+    EvictSession {
+        digest: [u8; 32],
+        at_ms: u64,
+    },
     RevokeSession {
         digest: [u8; 32],
         reason: RevokeReason,
@@ -1763,6 +1809,10 @@ fn decode_ops(seq: Seq, body: &[u8]) -> Result<Vec<Op<'_>>> {
                 }
             }
             OP_PLANT_DECOY => Op::PlantDecoy {
+                digest: r.fixed()?,
+                at_ms: r.u64()?,
+            },
+            OP_EVICT_SESSION => Op::EvictSession {
                 digest: r.fixed()?,
                 at_ms: r.u64()?,
             },
@@ -2049,12 +2099,17 @@ impl Engine for AuthEngine {
                 changes.push(change);
             }
             match op {
+                // A token with no lifetime (a reset for an identifier that
+                // names no account, 0.8) takes no slot: it is committed only
+                // so that the work is the same as for a real one.
+                Op::IssueSession { session, .. } if session.expires_ms <= session.created_ms => {}
                 Op::IssueSession { digest, session } => {
                     let epoch = self.epochs.get(session.account);
                     self.sessions
                         .insert(digest, session, epoch)
                         .map_err(|_| table_full())?;
                 }
+                Op::EvictSession { digest, .. } => self.sessions.evict(digest),
                 Op::PlantDecoy { digest, .. } => {
                     self.sessions
                         .plant_decoy(digest)
@@ -2106,12 +2161,7 @@ impl Engine for AuthEngine {
         self.accounts.flush()?;
         fs::sync_names(&self.dir)?;
         let _ = self.accounts_durable.fetch_max(mark, Ordering::AcqRel);
-        // Keys made for accounts whose creating commit never landed.
-        for account in self.keys.settle(now_ms().saturating_sub(ORPHAN_KEY_MS)) {
-            if !self.account_exists(account)? {
-                self.keys.destroy(account)?;
-            }
-        }
+        self.drop_orphan_keys(now_ms().saturating_sub(ORPHAN_KEY_MS))?;
         self.save_sessions(upto)?;
         Ok(self.durable_through())
     }
@@ -2153,6 +2203,10 @@ enum StagedOp {
         session: Session,
     },
     PlantDecoy {
+        digest: [u8; 32],
+        at_ms: u64,
+    },
+    EvictSession {
         digest: [u8; 32],
         at_ms: u64,
     },
@@ -2238,6 +2292,14 @@ pub(crate) struct AuthStaged<'e> {
     serializable: bool,
     /// Conflict keys of what this work read, when serializable.
     reads: std::sync::Mutex<Vec<Vec<u8>>>,
+}
+
+impl Drop for AuthStaged<'_> {
+    fn drop(&mut self) {
+        for account in &self.accounts {
+            self.engine.keys.release(*account);
+        }
+    }
 }
 
 impl<'e> AuthStaged<'e> {
@@ -2388,6 +2450,11 @@ fn write_ops(ops: &[StagedOp], out: &mut Vec<u8>) -> Result<()> {
             }
             StagedOp::PlantDecoy { digest, at_ms } => {
                 w.u8(OP_PLANT_DECOY);
+                w.bytes(digest);
+                w.u64(*at_ms);
+            }
+            StagedOp::EvictSession { digest, at_ms } => {
+                w.u8(OP_EVICT_SESSION);
                 w.bytes(digest);
                 w.u64(*at_ms);
             }
@@ -3286,9 +3353,14 @@ impl AuthTx<'_, '_> {
         }
     }
 
-    /// Start TOTP for `account`: a new secret, replacing any it had. Codes
-    /// are not asked for at sign-in until the account confirms one with
-    /// [`confirm_totp`](Self::confirm_totp).
+    /// Start TOTP for `account`: a new secret. Codes are not asked for at
+    /// sign-in until the account confirms one with
+    /// [`confirm_totp`](Self::confirm_totp). On an account with TOTP on, the
+    /// confirmed secret stays in force (sign-ins still ask for its codes)
+    /// until a code of the new one is confirmed; calling this again
+    /// replaces the unconfirmed one. Before 0.8 the new secret replaced the
+    /// confirmed one at once, so sign-ins needed only the password until it
+    /// was confirmed.
     ///
     /// # Errors
     ///
@@ -3303,8 +3375,9 @@ impl AuthTx<'_, '_> {
         }
     }
 
-    /// Confirm `account`'s TOTP secret with a code from the app: `true`
-    /// turns TOTP on, so sign-ins ask for a code from then on.
+    /// Confirm `account`'s new TOTP secret with a code from the app: `true`
+    /// turns TOTP on (or moves it to the new secret), so sign-ins ask for
+    /// its codes from then on.
     ///
     /// # Errors
     ///
@@ -3606,7 +3679,11 @@ impl LocalTx<'_, '_> {
         }
         let account = AccountId::generate();
         let _ = self.staged.identifiers.insert(digest);
-        let _ = self.staged.accounts.insert(account);
+        if self.staged.accounts.insert(account) {
+            // Its data key, made below, outlives any checkpoint until this
+            // work is dropped (applied or not).
+            engine.keys.hold(account);
+        }
         self.staged
             .writes
             .push(identifier_key(engine.collection, &digest));
@@ -3684,13 +3761,35 @@ impl LocalTx<'_, '_> {
         self.stage_single_use(purpose, account, ttl)
     }
 
+    /// A single-use token; with a zero `ttl`, one for a request that names
+    /// no account: the same commit, but a token with no lifetime, which
+    /// never redeems and takes no slot.
     fn stage_single_use(
         &mut self,
         purpose: Purpose,
         account: AccountId,
         ttl: Duration,
     ) -> Result<Token> {
-        self.stage_single_use_payload(purpose.payload(), account, ttl)
+        if !ttl.is_zero() {
+            return self.stage_single_use_payload(purpose.payload(), account, ttl);
+        }
+        let engine = self.staged.engine;
+        if engine.sessions.len() + self.staged.issued.len() >= engine.max_sessions {
+            return Err(Error::Busy {
+                what: "the session table",
+            });
+        }
+        let created_ms = now_ms();
+        let session = Session {
+            account: AccountId::from_bytes([0; 16]),
+            created_ms,
+            expires_ms: created_ms,
+            epoch: 0,
+            idle_ms: sessions::SINGLE_USE_IDLE,
+            recheck_ms: 0,
+            payload: Payload::new(&purpose.payload())?,
+        };
+        self.stage_digest(session, |random| engine.single_use_digest(random))
     }
 
     fn stage_challenge(&mut self, account: AccountId) -> Result<Token> {
@@ -3794,12 +3893,68 @@ impl LocalTx<'_, '_> {
         let (token, random) = Token::generate()?;
         let digest = digest_of(&random);
         session.epoch = self.epoch(session.account);
+        self.make_room(&session);
         let _ = self.staged.issued.insert(digest);
         self.staged.writes.push(session_key(&digest));
         self.staged
             .ops
             .push(StagedOp::IssueSession { digest, session });
         Ok(token)
+    }
+
+    /// Evict the oldest live entries of `session`'s account of its kind
+    /// (sessions, or single-use tokens and challenges) while it holds its
+    /// most: one account can no longer fill the table every account shares
+    /// (before 0.8 it could, and so could requests that name no account).
+    fn make_room(&mut self, session: &Session) {
+        if session.expires_ms <= session.created_ms {
+            // Takes no slot.
+            return;
+        }
+        let single_use = session.idle_ms == sessions::SINGLE_USE_IDLE;
+        let cap = if session.account == AccountId::from_bytes([0; 16]) {
+            MAX_OPEN_CHALLENGES
+        } else if single_use {
+            MAX_SINGLE_USE_PER_ACCOUNT
+        } else {
+            MAX_SESSIONS_PER_ACCOUNT
+        };
+        let engine = self.staged.engine;
+        let staged = self
+            .staged
+            .ops
+            .iter()
+            .filter(|op| {
+                matches!(op, StagedOp::IssueSession { session: s, .. }
+                    if s.account == session.account
+                        && (s.idle_ms == sessions::SINGLE_USE_IDLE) == single_use
+                        && s.expires_ms > s.created_ms)
+            })
+            .count();
+        let mut held: Vec<([u8; 32], u64)> = engine
+            .sessions
+            .entries_of(session.account, session.created_ms)
+            .into_iter()
+            .filter(|(digest, _, kind)| {
+                *kind == single_use
+                    && !self.staged.ops.iter().any(
+                        |op| matches!(op, StagedOp::EvictSession { digest: d, .. } if d == digest),
+                    )
+            })
+            .map(|(digest, made, _)| (digest, made))
+            .collect();
+        if held.len() + staged < cap {
+            return;
+        }
+        // Stable: entries made in the same millisecond go in index order.
+        held.sort_by_key(|(_, made)| *made);
+        let over = held.len() + staged + 1 - cap;
+        for (digest, _) in held.into_iter().take(over) {
+            self.staged.ops.push(StagedOp::EvictSession {
+                digest,
+                at_ms: session.created_ms,
+            });
+        }
     }
 
     fn epoch(&self, account: AccountId) -> u32 {
@@ -4210,14 +4365,23 @@ impl LocalTx<'_, '_> {
         if !self.staged.accounts.contains(&account) && !engine.account_exists(account)? {
             return Err(Error::invalid("account", "no such account"));
         }
+        self.staged.note(totp_conflict(&account));
         let random =
             crypt_io::generate_key().map_err(|e| Error::storage("drawing random bytes", e))?;
         let mut secret = Zeroizing::new([0; totp::SECRET_LEN]);
         secret.copy_from_slice(&random[..totp::SECRET_LEN]);
-        let record = totp::TotpRecord {
-            secret: secret.clone(),
-            confirmed: false,
-            last_step: 0,
+        let record = match engine.totp_record(account)? {
+            // TOTP is on: the new secret waits beside the confirmed one.
+            Some(on) if on.confirmed => totp::TotpRecord {
+                pending: Some(secret.clone()),
+                ..on
+            },
+            _ => totp::TotpRecord {
+                secret: secret.clone(),
+                confirmed: false,
+                last_step: 0,
+                pending: None,
+            },
         };
         self.stage_totp(account, Some(&record), TOTP_ADDED)?;
         Ok(totp::TotpEnrollment { secret })
@@ -4248,6 +4412,24 @@ impl LocalTx<'_, '_> {
         let Some(record) = engine.totp_record(account)? else {
             return Ok(false);
         };
+        if !confirmed && record.confirmed {
+            // Moving TOTP on to a new secret: a code of the pending one.
+            let Some(step) = record.accept_pending(code, now / 1000) else {
+                self.staged.writes.push(totp_conflict(&account));
+                return Ok(false);
+            };
+            let Some(pending) = record.pending.clone() else {
+                return Ok(false);
+            };
+            let next = totp::TotpRecord {
+                secret: pending,
+                confirmed: true,
+                last_step: step,
+                pending: None,
+            };
+            self.stage_totp(account, Some(&next), TOTP_CONFIRMED)?;
+            return Ok(true);
+        }
         if record.confirmed != confirmed {
             return Ok(false);
         }
@@ -4266,6 +4448,7 @@ impl LocalTx<'_, '_> {
             secret: record.secret.clone(),
             confirmed: true,
             last_step: step,
+            pending: record.pending.clone(),
         };
         let what = if confirmed { TOTP_USED } else { TOTP_CONFIRMED };
         self.stage_totp(account, Some(&next), what)?;
@@ -5525,6 +5708,10 @@ impl Auth<'_> {
     /// when none does: for a password reset by email address. The work is
     /// the same either way (a token is committed for no account when none
     /// matches, and never redeems), so answer the request the same way too.
+    /// Since 0.8 that token takes no room in the session table, and an
+    /// account holds at most 16 live single-use tokens (a new one evicts
+    /// the oldest), so requests cannot fill the table. Still rate-limit
+    /// reset requests: each one is a commit, and sends an email.
     ///
     /// # Errors
     ///
@@ -5535,9 +5722,21 @@ impl Auth<'_> {
         purpose: Purpose,
         ttl: Duration,
     ) -> Result<Option<Token>> {
+        // Checked first, so a bad `ttl` answers alike for every identifier.
+        let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
+        if ttl_ms == 0 || ttl_ms > MAX_SINGLE_USE_MS {
+            return Err(Error::invalid("ttl", "must be at most 30 days"));
+        }
         let engine = self.engine();
         let account = engine.account_named(identifier)?;
-        let target = account.unwrap_or(AccountId::from_bytes([0; 16]));
+        // An identifier that names no account commits a token with no
+        // lifetime (same work, no slot taken; before 0.8 it held a slot
+        // for `ttl`, so reset requests for made-up addresses could fill the
+        // session table).
+        let (target, ttl) = match account {
+            Some(account) => (account, ttl),
+            None => (AccountId::from_bytes([0; 16]), Duration::ZERO),
+        };
         let token = self.db.commit(|tx| {
             tx.auth_of(self.engine.collection())
                 .stage_single_use(purpose, target, ttl)
@@ -6008,6 +6207,45 @@ mod tests {
         }
         assert!(locked.is_some(), "the new key reached its lock-out");
         assert!(engine.locked_until(target, now).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Before 0.8 a checkpoint destroyed a data key made over a minute ago
+    /// whose account did not exist yet, even while the commit creating the
+    /// account was on its way (a closure that took just under the snapshot
+    /// limit): the account then landed sealed under a key that was gone.
+    #[test]
+    fn test_a_checkpoint_keeps_the_key_of_an_account_being_created() {
+        let dir = std::env::temp_dir().join(format!(
+            "nex-db-auth-keyrace-{}-{}",
+            std::process::id(),
+            id_forge::ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(crate::core::keys::KEY_FILE);
+        crate::core::keys::create_file_if_missing(&path).unwrap();
+        let root = crate::core::keys::load_file(&path).unwrap();
+        let engine = AuthEngine::open(&dir.join("accounts"), &root, 1, 1_000).unwrap();
+        let hash = engine
+            .hash_password("correct horse battery staple")
+            .unwrap();
+        let mut staged = AuthStaged::new(&engine);
+        let account = LocalTx {
+            staged: &mut staged,
+        }
+        .create_account("ann@example.com", &hash)
+        .unwrap();
+        // A checkpoint long after the key was made, the commit not applied.
+        engine.drop_orphan_keys(u64::MAX).unwrap();
+        assert!(
+            engine.keys.get(account).unwrap().is_some(),
+            "the key of an account being created was destroyed"
+        );
+        // The work ends without landing: the next checkpoint drops it.
+        drop(staged);
+        engine.drop_orphan_keys(u64::MAX).unwrap();
+        assert!(engine.keys.get(account).unwrap().is_none());
+        drop(engine);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -3,8 +3,9 @@
 //! crypt-io's `otp` module.
 //!
 //! The account store keeps one sealed record per account: the secret,
-//! whether the account confirmed it, and the last step a code was accepted
-//! for, so a code works once.
+//! whether the account confirmed it, the last step a code was accepted for
+//! (so a code works once), and a new secret awaiting confirmation while the
+//! confirmed one stays in force.
 
 #[cfg(feature = "mfa")]
 use std::fmt;
@@ -21,8 +22,13 @@ pub(crate) const DIGITS: u32 = 6;
 /// Steps of clock drift accepted either way.
 #[cfg(feature = "mfa")]
 pub(crate) const WINDOW: u32 = 1;
-/// Format of the stored record.
-const FORMAT: u8 = 1;
+/// Format of the stored record: 2 since 0.8 (a pending secret beside the
+/// confirmed one); 1 still reads.
+const FORMAT: u8 = 2;
+/// The 0.4.1 to 0.7 format: no pending secret.
+const FORMAT_1: u8 = 1;
+/// Bytes of a format 1 record.
+const LEN_1: usize = 2 + 8 + SECRET_LEN;
 
 #[cfg(feature = "mfa")]
 /// A new TOTP secret, as [`add_totp`](crate::AuthTx::add_totp) returns it:
@@ -107,24 +113,42 @@ pub(crate) struct TotpRecord {
     pub(crate) confirmed: bool,
     /// The step of the last code accepted; 0 before the first.
     pub(crate) last_step: u64,
+    /// A new secret from `add_totp` on an account with TOTP on: the
+    /// confirmed `secret` stays in force until a code of this one confirms
+    /// it (before 0.8 `add_totp` replaced it, turning the factor off).
+    pub(crate) pending: Option<Zeroizing<[u8; SECRET_LEN]>>,
 }
 
 impl TotpRecord {
     #[cfg(feature = "mfa")]
     pub(crate) fn encode(&self) -> Zeroizing<Vec<u8>> {
-        let mut out = Zeroizing::new(Vec::with_capacity(2 + 8 + SECRET_LEN));
+        let mut out = Zeroizing::new(Vec::with_capacity(LEN_1 + 1 + SECRET_LEN));
         out.push(FORMAT);
         out.push(u8::from(self.confirmed));
         out.extend_from_slice(&self.last_step.to_le_bytes());
         out.extend_from_slice(&self.secret[..]);
+        match &self.pending {
+            Some(pending) => {
+                out.push(1);
+                out.extend_from_slice(&pending[..]);
+            }
+            None => out.push(0),
+        }
         out
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<TotpRecord> {
         let corrupt = || Error::corrupt("a TOTP record", 0);
-        if bytes.len() != 2 + 8 + SECRET_LEN || bytes[0] != FORMAT {
-            return Err(corrupt());
-        }
+        let pending = match (bytes.first(), bytes.len(), bytes.get(LEN_1)) {
+            (Some(&FORMAT_1), LEN_1, _) => None,
+            (Some(&FORMAT), n, Some(0)) if n == LEN_1 + 1 => None,
+            (Some(&FORMAT), n, Some(1)) if n == LEN_1 + 1 + SECRET_LEN => {
+                let mut pending = Zeroizing::new([0; SECRET_LEN]);
+                pending.copy_from_slice(&bytes[LEN_1 + 1..]);
+                Some(pending)
+            }
+            _ => return Err(corrupt()),
+        };
         let confirmed = match bytes[1] {
             0 => false,
             1 => true,
@@ -133,11 +157,12 @@ impl TotpRecord {
         let mut step = [0; 8];
         step.copy_from_slice(&bytes[2..10]);
         let mut secret = Zeroizing::new([0; SECRET_LEN]);
-        secret.copy_from_slice(&bytes[10..]);
+        secret.copy_from_slice(&bytes[10..LEN_1]);
         Ok(TotpRecord {
             secret,
             confirmed,
             last_step: u64::from_le_bytes(step),
+            pending,
         })
     }
 
@@ -148,6 +173,13 @@ impl TotpRecord {
         let step =
             crypt_io::otp::totp_check(&self.secret[..], code, unix_seconds, DIGITS, WINDOW).ok()?;
         (step > self.last_step).then_some(step)
+    }
+
+    #[cfg(feature = "mfa")]
+    /// The step `code` matches for the pending secret at `unix_seconds`.
+    pub(crate) fn accept_pending(&self, code: &str, unix_seconds: u64) -> Option<u64> {
+        let pending = self.pending.as_ref()?;
+        crypt_io::otp::totp_check(&pending[..], code, unix_seconds, DIGITS, WINDOW).ok()
     }
 }
 
@@ -178,9 +210,30 @@ mod tests {
             secret: Zeroizing::new(*b"12345678901234567890"),
             confirmed: true,
             last_step: 0,
+            pending: None,
         };
         let back = TotpRecord::decode(&record.encode()).unwrap();
         assert!(back.confirmed);
+        // Format 1, as 0.4.1 to 0.7 wrote it, still reads.
+        let mut old = record.encode()[..LEN_1].to_vec();
+        old[0] = FORMAT_1;
+        let old = TotpRecord::decode(&old).unwrap();
+        assert!(old.confirmed && old.pending.is_none());
+        assert_eq!(old.secret[..], record.secret[..]);
+        // A pending secret round-trips; lengths and flags are checked.
+        let with = TotpRecord {
+            pending: Some(Zeroizing::new([9; SECRET_LEN])),
+            ..TotpRecord::decode(&record.encode()).unwrap()
+        };
+        let bytes = with.encode();
+        assert_eq!(
+            TotpRecord::decode(&bytes).unwrap().pending.unwrap()[..],
+            [9; SECRET_LEN]
+        );
+        assert!(TotpRecord::decode(&bytes[..bytes.len() - 1]).is_err());
+        let mut flag = bytes.to_vec();
+        flag[LEN_1] = 2;
+        assert!(TotpRecord::decode(&flag).is_err());
         // RFC 6238 appendix B, SHA-1, at 59 s: 94287082 (eight digits); the
         // six-digit code is its last six.
         let step = back.accept("287082", 59).unwrap();

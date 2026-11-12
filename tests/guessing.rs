@@ -146,6 +146,53 @@ fn test_check_totp_counts_failures_and_shares_the_lock_out() {
     ));
 }
 
+/// Before 0.8 `add_totp` on an account with TOTP on replaced the confirmed
+/// secret at once, so sign-ins needed only the password until (or unless)
+/// the new one was confirmed. Now the confirmed one stays in force until
+/// then.
+#[cfg(feature = "mfa")]
+#[test]
+fn test_a_new_totp_secret_leaves_the_confirmed_one_in_force() {
+    let t = TempDir::new("retotp");
+    let db = Database::open(&t.0).unwrap();
+    let ann = db.auth().sign_up("ann@example.com", PASSWORD).unwrap();
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    let code =
+        |secret: &[u8], at: u64| format!("{:06}", crypt_io::otp::totp(secret, at, 6).unwrap());
+    let first = base32_decode(&db.auth().add_totp(ann).unwrap().secret());
+    assert!(db.auth().confirm_totp(ann, &code(&first, now())).unwrap());
+    let second = base32_decode(&db.auth().add_totp(ann).unwrap().secret());
+    assert!(matches!(
+        db.auth()
+            .verify_password("ann@example.com", PASSWORD)
+            .unwrap(),
+        PasswordCheck::NeedsSecondFactor { .. }
+    ));
+    // The confirmed app's codes still work (a step on: a code works once).
+    assert!(
+        db.auth()
+            .check_totp(ann, &code(&first, now() + 30))
+            .unwrap()
+    );
+    // Confirming the new secret moves TOTP to it: the new app's codes
+    // work, the old app's no longer do.
+    assert!(db.auth().confirm_totp(ann, &code(&second, now())).unwrap());
+    let old = code(&first, now() + 30);
+    if (0..=2).all(|k| old != code(&second, now() + 30 * k)) {
+        assert!(!db.auth().check_totp(ann, &old).unwrap());
+    }
+    assert!(
+        db.auth()
+            .check_totp(ann, &code(&second, now() + 30))
+            .unwrap()
+    );
+}
+
 #[cfg(feature = "mfa")]
 fn base32_decode(text: &str) -> Vec<u8> {
     let mut out = Vec::new();
@@ -218,4 +265,91 @@ fn test_rotate_refuses_a_session_past_its_idle_limit() {
     std::thread::sleep(std::time::Duration::from_millis(1300));
     assert_eq!(db.auth().validate(&token).unwrap(), Validation::Expired);
     assert!(db.auth().rotate(&token).is_err());
+}
+
+/// Before 0.8 a reset request for an address that names no account held a
+/// slot of the one session table for its lifetime: 200 such requests
+/// against a table of 200, and nobody could sign in. Now they take none.
+#[test]
+fn test_reset_requests_for_unknown_addresses_take_no_room() {
+    let t = TempDir::new("resets");
+    let db = Database::builder(&t.0).max_sessions(200).open().unwrap();
+    let _ = db.auth().sign_up("ann@example.com", PASSWORD).unwrap();
+    for i in 0..300 {
+        let token = db
+            .auth()
+            .single_use_token_for(
+                &format!("nobody{i}@example.com"),
+                nex_db::Purpose::ResetPassword,
+                std::time::Duration::from_secs(3600),
+            )
+            .unwrap();
+        assert!(token.is_none());
+    }
+    assert!(matches!(
+        db.auth()
+            .sign_in("ann@example.com", PASSWORD, SessionSpec::web())
+            .unwrap(),
+        SignIn::Success { .. }
+    ));
+}
+
+/// Before 0.8 one account could hold every slot of the shared table. Now
+/// it holds at most 16 live single-use tokens and 1,000 sessions; a new one
+/// evicts its oldest, which then reads as never issued.
+#[test]
+fn test_an_account_holds_a_bounded_share_of_the_session_table() {
+    let t = TempDir::new("share");
+    let db = Database::open(&t.0).unwrap();
+    let ann = db.auth().sign_up("ann@example.com", PASSWORD).unwrap();
+    let hour = std::time::Duration::from_secs(3600);
+    let resets: Vec<_> = (0..20)
+        .map(|_| {
+            db.auth()
+                .single_use_token_for("ann@example.com", nex_db::Purpose::ResetPassword, hour)
+                .unwrap()
+                .unwrap()
+        })
+        .collect();
+    let redeemed = resets
+        .iter()
+        .filter(|token| {
+            db.auth()
+                .redeem(token, nex_db::Purpose::ResetPassword)
+                .unwrap()
+                .is_some()
+        })
+        .count();
+    assert_eq!(redeemed, 16, "the newest 16 redeem");
+    assert_eq!(
+        db.auth()
+            .redeem(&resets[0], nex_db::Purpose::ResetPassword)
+            .unwrap(),
+        None
+    );
+    // Sessions: a thousand, then one more evicts the first.
+    let first = db.auth().issue_session(ann, SessionSpec::web()).unwrap();
+    db.commit(|tx| {
+        for _ in 0..999 {
+            let _ = tx.auth().issue_session(ann, SessionSpec::web())?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert!(matches!(
+        db.auth().validate(&first).unwrap(),
+        Validation::Valid(_)
+    ));
+    let newest = db.auth().issue_session(ann, SessionSpec::web()).unwrap();
+    assert_eq!(db.auth().validate(&first).unwrap(), Validation::Unknown);
+    assert!(matches!(
+        db.auth().validate(&newest).unwrap(),
+        Validation::Valid(_)
+    ));
+    assert_eq!(db.auth().sessions(ann).unwrap().len(), 1_000);
+    // Replay agrees: the eviction is in the log.
+    drop(db);
+    let db = Database::open(&t.0).unwrap();
+    assert_eq!(db.auth().validate(&first).unwrap(), Validation::Unknown);
+    assert_eq!(db.auth().sessions(ann).unwrap().len(), 1_000);
 }

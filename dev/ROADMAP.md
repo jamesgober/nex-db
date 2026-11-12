@@ -123,6 +123,7 @@
 - [x] Read replica following the log (FR-15): `ship`, `open_replica`, `receive`; a deterministic simulation of a primary and a replica (`PLAN.md` D-126).
 - [x] Verifiable audit export: `audit_export`, signed with Ed25519, feature `audit-export` (`PLAN.md` D-127).
 - Split auth: the check over the channel nearer its target.
+- Review fixes: guessing defences (D-129), split frames (D-130), session room and key holds (D-131). **Blocked:** sealing the audit chain (review F-11) needs deterministic sealing (a replay must append the same bytes, or exports of the same records would differ), which crypt-io does not offer: an AEAD with a caller-given nonce (the nonce derived from the record id) or an SIV mode, added to crypt-io in its own release first. Until then the docs say the chain is plaintext.
 - Moved from 0.7: sealed mode, per-operation budgets for admin listings, online re-keying, secure deletion at compaction, the preview index, device-bound sessions, the P2 items.
 - **Exit:** two weeks in production on James's site with no data issue.
 

@@ -348,7 +348,8 @@ impl Builder {
     /// session fails with [`Error::Busy`] until expired ones are reclaimed.
     /// Memory follows the sessions held, not this limit, so a high limit
     /// costs nothing until it is used; the limit keeps a flood of sign-ins
-    /// from taking all of it.
+    /// from taking all of it. One account holds at most 1,000 live sessions
+    /// and 16 live single-use tokens; a new one evicts its oldest.
     pub fn max_sessions(mut self, n: usize) -> Self {
         self.max_sessions = n.clamp(1, u32::MAX as usize);
         self

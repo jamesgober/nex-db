@@ -204,7 +204,7 @@ From 0.3 the builder configures what `open` takes by default:
 | `.auth(AuthMode::embedded())`, `AuthMode::separate_process()`, `AuthMode::separate_process_program(path)` (feature `split-auth`) | 0.5 | embedded |
 | `.max_snapshot_age(Duration)` | planned (fixed at the default until then) | 60 s |
 | `.checkpoint_every(bytes)`: log written between checkpoints, which bound the log and the time an open takes | 0.3 | 64 MiB |
-| `.max_sessions(n)`: sessions and revocations held at once; past it `issue_session` fails with `Busy` | 0.3 | 1,000,000 |
+| `.max_sessions(n)`: sessions and revocations held at once; past it `issue_session` fails with `Busy`; since 0.8 one account holds at most 1,000 live sessions and 16 live single-use tokens (a new one evicts its oldest) | 0.3 | 1,000,000 |
 | `.commit_queue(n)`, `.hashing_slots(n)` | planned (fixed at the defaults until then) | 4,096; one per CPU |
 | `.idempotency_window(Duration)` | planned, with `commit_with` | 24 hours |
 | `.cache(bytes)` | planned (until then 4,096 entities per space) | 256 MiB |
@@ -512,7 +512,7 @@ every session of the account in the same commit.
 
 | Operation | Grade | Notes |
 |---|---|---|
-| `add_totp(account) -> Result<TotpEnrollment>`, `confirm_totp(account, code) -> Result<bool>`, `remove_totp(account) -> Result<bool>` (0.4.1, feature `mfa`; also in a transaction) | P1 | a 160-bit secret, sealed; `TotpEnrollment::secret()` (base32) and `uri(issuer, label)` (`otpauth://`, SHA1, six digits, 30 s) shown once; TOTP is on once a code is confirmed |
+| `add_totp(account) -> Result<TotpEnrollment>`, `confirm_totp(account, code) -> Result<bool>`, `remove_totp(account) -> Result<bool>` (0.4.1, feature `mfa`; also in a transaction) | P1 | a 160-bit secret, sealed; `TotpEnrollment::secret()` (base32) and `uri(issuer, label)` (`otpauth://`, SHA1, six digits, 30 s) shown once; TOTP is on once a code is confirmed; since 0.8 `add_totp` on an account with TOTP on keeps the confirmed secret in force until a code of the new one is confirmed |
 | `verify_totp(challenge, code, spec) -> Result<SignIn>` (0.4.1, feature `mfa`) | P1 | completes `SignIn::NeedsSecondFactor`: the challenge is a single-use token that lasts five minutes; a wrong code counts toward lock-out and leaves the challenge for another try; a code works once (one step of drift either way) |
 | `check_totp(account, code) -> Result<bool>` (0.4.1, feature `mfa`; also in a transaction) | P1 | after `PasswordCheck::NeedsSecondFactor`, for an application that issues its own sessions; since 0.8 a wrong code counts toward the account's lock-out, and while it is locked out every code answers `false` |
 | `new_recovery_codes(account) -> Result<RecoveryCodes>` (tx) | P1 | ten codes, `xxxxx-xxxxx` (Crockford base32, 50 bits each); replaces any earlier codes; shown once (`codes()`); stored as keyed digests |
@@ -521,7 +521,7 @@ every session of the account in the same commit.
 | `passkey_sign_in() -> Result<PasskeyChallenge>`, `verify_passkey(&RelyingParty, &PasskeyAssertion, spec) -> Result<SignIn>` (0.4.1, feature `mfa`) | P2 | a sign-in of its own (no password, no TOTP); the same checks, the signature, and a rising signature counter (an authenticator that keeps it at zero is allowed); `PasskeyAssertion::new(credential_id, client_data_json, authenticator_data, signature)`; challenges work once, within five minutes |
 | `passkeys(account) -> Result<Vec<PasskeyInfo>>`, `remove_passkey(account, PasskeyId) -> Result<bool>` (0.4.1, feature `mfa`) | P2 | `PasskeyInfo`: `id()`, `created_at()`, `last_used_at()` |
 | `single_use_token(purpose, account, ttl) -> Result<Token>` | P1 | email verification, magic link, preview; `Purpose` (non-exhaustive): `VerifyEmail`, `ResetPassword`, `SignInLink`, `Preview`, `Custom(u16)`; `ttl` at most 30 days; never validates as a session; also in a transaction |
-| `single_use_token_for(identifier, purpose, ttl) -> Result<Option<Token>>` | P1 | password reset by email address; the same work whether the identifier exists or not, so answer the same either way |
+| `single_use_token_for(identifier, purpose, ttl) -> Result<Option<Token>>` | P1 | password reset by email address; the same work whether the identifier exists or not, so answer the same either way; since 0.8 a request for an unknown identifier takes no room in the session table; rate-limit the requests (each is a commit and an email) |
 | `redeem(token, purpose) -> Result<Option<AccountId>>` | P1 | works once, for the purpose it was issued for; two redeems at once give the account to one; also in a transaction |
 | `create_api_key(account, scopes: &[&str], expiry: Option<SystemTime>) -> Result<ApiKey>` | P1 | the key text (`as_str()`) is shown once; `id()` to revoke it; at most 32 scopes of 1 to 64 bytes without spaces, stored and returned as given; also in a transaction |
 | `validate_api_key(text) -> Result<ApiKeyCheck>`, `revoke_api_key(id) -> Result<bool>` | P1 | `ApiKeyCheck` (non-exhaustive): `Valid { account, id, scopes }`, `Expired`, `Revoked`, `Unknown`, `Malformed`; one read of the account store; a session token is never a key, nor a key a session |
@@ -535,10 +535,18 @@ every session of the account in the same commit.
 
 ### Audit (0.3)
 
-Every security-relevant write (account created, signed in, failed, locked,
-standing changed, revoked) adds an event to the realm's hash-chained audit
-log in the same commit. The chain is keyed (BLAKE3 under a key derived from
-the root key), so checking it takes the key.
+Every security write a commit applies (an account created or erased, a
+session issued, rotated, revoked, or evicted, a sign-out everywhere, a
+password, identifier, role, or standing changed, a decoy planted) adds an
+event to the realm's hash-chained audit log in the same commit. A failed
+sign-in commits nothing, so it is not in the log; failures are counted in
+memory for the lock-out (see `verify_password`). The chain is keyed (BLAKE3
+under a key derived from the root key), so checking it takes the key.
+
+The chain is not encrypted: anyone who reads the directory sees each
+event's kind, time, and account id (not identifiers, passwords, or tokens),
+including when decoys were planted, and an erased account's history stays.
+Sealing it is planned.
 
 With the `audit-export` feature (0.8, P3), `db.auth().audit_export(ids) ->
 Result<AuditExport>` verifies the whole chain and signs the records with ids

@@ -595,13 +595,50 @@ impl HashedPassword {
     /// [`Error::Invalid`] for a handle to a hash an auth process holds.
     pub(crate) fn phc(&self) -> Result<&str> {
         match &self.0 {
-            Hashed::Phc(phc) => Ok(phc),
+            Hashed::Phc(phc) => check_cost(phc).map(|()| phc.as_str()),
             #[cfg(feature = "split-auth")]
             Hashed::Remote(_) => Err(Error::invalid(
                 "password",
                 "hashed by the auth process of another database",
             )),
         }
+    }
+}
+
+/// Most memory (KiB), passes, and lanes a password hash may cost to check:
+/// over three times the defaults (19 MiB, 2, 1), and far below what
+/// crypt-io allows (1 GiB), so a hash sent or planted with a huge cost
+/// cannot make one sign-in take seconds and a gigabyte (0.8).
+pub(crate) const MAX_HASH_COST: (u32, u32, u32) = (64 * 1024, 8, 4);
+
+/// `Ok` for an Argon2id PHC string within [`MAX_HASH_COST`].
+pub(crate) fn check_cost(phc: &str) -> Result<()> {
+    let refused = || Error::invalid("password", "not an Argon2id hash within the cost limit");
+    let mut parts = phc.split('$');
+    if parts.next() != Some("") || parts.next() != Some("argon2id") {
+        return Err(refused());
+    }
+    let params = match parts.next() {
+        Some(version) if version.starts_with("v=") => parts.next(),
+        other => other,
+    }
+    .ok_or_else(refused)?;
+    let (mut m, mut t, mut p) = (None, None, None);
+    for pair in params.split(',') {
+        let (key, value) = pair.split_once('=').ok_or_else(refused)?;
+        let value: u32 = value.parse().map_err(|_| refused())?;
+        let slot = match key {
+            "m" => &mut m,
+            "t" => &mut t,
+            "p" => &mut p,
+            _ => continue,
+        };
+        *slot = Some(value);
+    }
+    let (max_m, max_t, max_p) = MAX_HASH_COST;
+    match (m, t, p) {
+        (Some(m), Some(t), Some(p)) if m <= max_m && t <= max_t && p <= max_p => Ok(()),
+        _ => Err(refused()),
     }
 }
 
@@ -649,6 +686,36 @@ mod tests {
         assert_eq!(Validation::Valid(session).session(), Some(session));
         assert_eq!(Validation::Unknown.session(), None);
         assert_eq!(session.expires_at(), UNIX_EPOCH + Duration::from_millis(2));
+    }
+
+    /// Before 0.8 a hash of any cost crypt-io allows (1 GiB, 64 passes)
+    /// was stored and checked at every sign-in.
+    #[test]
+    fn test_a_hash_over_the_cost_limit_is_refused() {
+        let phc = |params: &str| {
+            HashedPassword(Hashed::Phc(format!(
+                "$argon2id$v=19${params}$c2FsdHNhbHQ$aGFzaGhhc2hoYXNo"
+            )))
+        };
+        assert!(phc("m=19456,t=2,p=1").phc().is_ok());
+        assert!(phc("m=65536,t=8,p=4").phc().is_ok());
+        for over in [
+            "m=1048576,t=2,p=1",
+            "m=19456,t=64,p=1",
+            "m=19456,t=2,p=16",
+            "m=19456,t=2",
+        ] {
+            assert!(phc(over).phc().is_err(), "{over}");
+        }
+        let other = HashedPassword(Hashed::Phc(
+            "$argon2i$v=19$m=8,t=1,p=1$c2FsdA$aGFzaA".to_owned(),
+        ));
+        assert!(other.phc().is_err());
+        let made = crypt_io::kdf::argon2_hash(b"a password").unwrap();
+        assert!(
+            HashedPassword(Hashed::Phc(made)).phc().is_ok(),
+            "crypt-io's defaults pass"
+        );
     }
 
     #[test]

@@ -71,6 +71,9 @@ struct Inner {
     /// Keys made by this process, and when, until a checkpoint finds their
     /// accounts (or drops the keys of commits that never landed).
     pending: HashMap<AccountId, u64>,
+    /// Accounts whose creating work is still staged or committing, with
+    /// how many such works: their keys are never settled meanwhile.
+    holds: HashMap<AccountId, u32>,
 }
 
 fn io(what: &'static str) -> impl Fn(std::io::Error) -> Error {
@@ -142,6 +145,7 @@ impl DataKeys {
                 count,
                 cache: HashMap::new(),
                 pending: HashMap::new(),
+                holds: HashMap::new(),
             }),
         })
     }
@@ -277,15 +281,35 @@ impl DataKeys {
         Ok(())
     }
 
-    /// The accounts whose keys this process made before `before_ms`, no
-    /// longer tracked: the caller drops the keys of those that do not
-    /// exist (their creating commit never landed).
+    /// Work that creates `account` is staged: its key is not settled until
+    /// [`release`](Self::release).
+    pub(crate) fn hold(&self, account: AccountId) {
+        *self.lock().holds.entry(account).or_insert(0) += 1;
+    }
+
+    /// The work that held `account` applied or was dropped.
+    pub(crate) fn release(&self, account: AccountId) {
+        let mut inner = self.lock();
+        if let Some(n) = inner.holds.get_mut(&account) {
+            *n -= 1;
+            if *n == 0 {
+                let _ = inner.holds.remove(&account);
+            }
+        }
+    }
+
+    /// The accounts whose keys this process made before `before_ms` and
+    /// whose creating work is over, no longer tracked: the caller drops the
+    /// keys of those that do not exist (their creating commit never
+    /// landed). Before 0.8 a key's age alone decided, so a commit that
+    /// passed its snapshot check just under the limit could lose the key
+    /// of the account it was creating to a checkpoint before it applied.
     pub(crate) fn settle(&self, before_ms: u64) -> Vec<AccountId> {
         let mut inner = self.lock();
         let old: Vec<AccountId> = inner
             .pending
             .iter()
-            .filter(|(_, made)| **made < before_ms)
+            .filter(|(a, made)| **made < before_ms && !inner.holds.contains_key(a))
             .map(|(a, _)| *a)
             .collect();
         for account in &old {

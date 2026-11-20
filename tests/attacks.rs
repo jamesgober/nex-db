@@ -373,3 +373,84 @@ fn test_a_decoy_answers_unknown_and_raises_an_event() {
         "a retired decoy stays gone"
     );
 }
+
+/// Attack: an application issues a session straight to an account an
+/// administrator has suspended, banned, or erased (a forgotten check in its
+/// own sign-in path). `issue_session` reads the standing itself and refuses,
+/// including a suspension staged earlier in the same transaction.
+#[test]
+fn test_no_session_for_an_account_that_may_not_sign_in() {
+    use nex_db::{Error, Standing};
+    let t = TempDir::new("standing");
+    let db = Database::open(&t.0).unwrap();
+    let ann = db
+        .auth()
+        .sign_up("ann@example.com", "a long password")
+        .unwrap();
+    let refused = |r: nex_db::Result<nex_db::Token>| {
+        matches!(
+            r,
+            Err(Error::Invalid {
+                field: "account",
+                reason: "may not sign in"
+            })
+        )
+    };
+    let later = std::time::SystemTime::now() + Duration::from_secs(3600);
+    for standing in [
+        Standing::Suspended {
+            until: None,
+            reason: 1,
+        },
+        Standing::Suspended {
+            until: Some(later),
+            reason: 1,
+        },
+        Standing::Banned { reason: 2 },
+        Standing::LockedOut { until: later },
+    ] {
+        db.auth().set_standing(ann, standing, None).unwrap();
+        assert!(
+            refused(db.auth().issue_session(ann, SessionSpec::web())),
+            "{standing:?}"
+        );
+    }
+    // Lifted: sessions again.
+    db.auth().set_standing(ann, Standing::Active, None).unwrap();
+    assert!(db.auth().issue_session(ann, SessionSpec::web()).is_ok());
+    // A suspension earlier in the same transaction counts.
+    let r: nex_db::Result<nex_db::Token> = db.commit(|tx| {
+        tx.auth().set_standing(
+            ann,
+            Standing::Suspended {
+                until: None,
+                reason: 3,
+            },
+            None,
+        )?;
+        tx.auth().issue_session(ann, SessionSpec::web())
+    });
+    assert!(refused(r));
+    // An expired suspension no longer blocks.
+    let past = std::time::SystemTime::now() - Duration::from_secs(1);
+    db.auth()
+        .set_standing(
+            ann,
+            Standing::Suspended {
+                until: Some(past),
+                reason: 4,
+            },
+            None,
+        )
+        .unwrap();
+    assert!(db.auth().issue_session(ann, SessionSpec::web()).is_ok());
+    // Erased: no such account.
+    db.auth().erase_account(ann).unwrap();
+    assert!(matches!(
+        db.auth().issue_session(ann, SessionSpec::web()),
+        Err(Error::Invalid {
+            reason: "no such account",
+            ..
+        })
+    ));
+}

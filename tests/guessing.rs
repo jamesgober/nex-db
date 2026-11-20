@@ -112,7 +112,7 @@ fn test_a_lock_out_commits_nothing_and_ends_no_session() {
 /// Before 0.8 `check_totp` counted no failure: 200 wrong codes, then the
 /// right one was accepted. Now ten wrong codes lock the account out, the
 /// lock-out is shared with its passwords, and no code is checked meanwhile.
-#[cfg(feature = "mfa")]
+#[cfg(feature = "totp")]
 #[test]
 fn test_check_totp_counts_failures_and_shares_the_lock_out() {
     let t = TempDir::new("totp");
@@ -146,13 +146,15 @@ fn test_check_totp_counts_failures_and_shares_the_lock_out() {
     ));
 }
 
-/// Before 0.8 `add_totp` on an account with TOTP on replaced the confirmed
-/// secret at once, so sign-ins needed only the password until (or unless)
-/// the new one was confirmed. Now the confirmed one stays in force until
-/// then.
-#[cfg(feature = "mfa")]
+/// Attack: with a stolen session (or a bug in the application's settings
+/// page), call `add_totp` on an account with TOTP on to move it to a secret
+/// the attacker holds. Before 0.8 the new secret replaced the confirmed one
+/// at once; in 0.8 it waited beside it until confirmed. Now `add_totp` is
+/// refused while TOTP is on, and confirming moves nothing: a new secret
+/// needs an explicit `remove_totp` first.
+#[cfg(feature = "totp")]
 #[test]
-fn test_a_new_totp_secret_leaves_the_confirmed_one_in_force() {
+fn test_totp_cannot_be_moved_to_a_new_secret_while_on() {
     let t = TempDir::new("retotp");
     let db = Database::open(&t.0).unwrap();
     let ann = db.auth().sign_up("ann@example.com", PASSWORD).unwrap();
@@ -164,23 +166,44 @@ fn test_a_new_totp_secret_leaves_the_confirmed_one_in_force() {
     };
     let code =
         |secret: &[u8], at: u64| format!("{:06}", crypt_io::otp::totp(secret, at, 6).unwrap());
+    // Before it is confirmed, adding again replaces the unconfirmed secret.
+    let _ = db.auth().add_totp(ann).unwrap();
     let first = base32_decode(&db.auth().add_totp(ann).unwrap().secret());
     assert!(db.auth().confirm_totp(ann, &code(&first, now())).unwrap());
-    let second = base32_decode(&db.auth().add_totp(ann).unwrap().secret());
+    // On: refused, in its own commit and inside a transaction.
+    assert!(matches!(
+        db.auth().add_totp(ann),
+        Err(nex_db::Error::Invalid {
+            field: "totp",
+            reason: "already on"
+        })
+    ));
+    let r: nex_db::Result<()> = db.commit(|tx| tx.auth().add_totp(ann).map(|_| ()));
+    assert!(matches!(
+        r,
+        Err(nex_db::Error::Invalid { field: "totp", .. })
+    ));
+    // Confirming again confirms nothing, and the confirmed secret is still
+    // the one sign-ins ask for.
+    assert!(
+        !db.auth()
+            .confirm_totp(ann, &code(&first, now() + 30))
+            .unwrap()
+    );
     assert!(matches!(
         db.auth()
             .verify_password("ann@example.com", PASSWORD)
             .unwrap(),
         PasswordCheck::NeedsSecondFactor { .. }
     ));
-    // The confirmed app's codes still work (a step on: a code works once).
     assert!(
         db.auth()
             .check_totp(ann, &code(&first, now() + 30))
             .unwrap()
     );
-    // Confirming the new secret moves TOTP to it: the new app's codes
-    // work, the old app's no longer do.
+    // Off, then on again with a new secret.
+    assert!(db.auth().remove_totp(ann).unwrap());
+    let second = base32_decode(&db.auth().add_totp(ann).unwrap().secret());
     assert!(db.auth().confirm_totp(ann, &code(&second, now())).unwrap());
     let old = code(&first, now() + 30);
     if (0..=2).all(|k| old != code(&second, now() + 30 * k)) {
@@ -193,7 +216,7 @@ fn test_a_new_totp_secret_leaves_the_confirmed_one_in_force() {
     );
 }
 
-#[cfg(feature = "mfa")]
+#[cfg(feature = "totp")]
 fn base32_decode(text: &str) -> Vec<u8> {
     let mut out = Vec::new();
     let (mut buffer, mut bits) = (0u32, 0);

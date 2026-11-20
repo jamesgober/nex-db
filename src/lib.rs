@@ -140,14 +140,22 @@ mod wheel;
 #[cfg(feature = "audit-export")]
 #[cfg_attr(docsrs, doc(cfg(feature = "audit-export")))]
 pub use crate::auth::export::{AuditEvent, AuditExport};
+#[cfg(feature = "passkey")]
+#[cfg_attr(docsrs, doc(cfg(feature = "passkey")))]
+pub use crate::auth::passkey::{
+    PasskeyAssertion, PasskeyChallenge, PasskeyId, PasskeyInfo, PasskeyRegistration, RelyingParty,
+};
 #[cfg(feature = "split-auth")]
 #[cfg_attr(docsrs, doc(cfg(feature = "split-auth")))]
 pub use crate::auth::split::serve_auth_process;
+#[cfg(feature = "totp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "totp")))]
+pub use crate::auth::totp::TotpEnrollment;
 #[cfg(feature = "auth")]
 #[cfg_attr(docsrs, doc(cfg(feature = "auth")))]
 pub use crate::auth::{
     Auth, AuthRead, AuthTx,
-    keys::{ApiKey, ApiKeyCheck, ApiKeyId},
+    keys::{ApiKey, ApiKeyCheck, ApiKeyId, ApiKeyInfo},
     mode::AuthMode,
     realm::RealmPolicy,
     recovery::RecoveryCodes,
@@ -157,15 +165,6 @@ pub use crate::auth::{
         HashedPassword, PasswordCheck, Purpose, RevokeReason, Session, SessionId, SessionInfo,
         SessionSpec, SignIn, Standing, Validation,
     },
-};
-#[cfg(feature = "mfa")]
-#[cfg_attr(docsrs, doc(cfg(feature = "mfa")))]
-pub use crate::auth::{
-    passkey::{
-        PasskeyAssertion, PasskeyChallenge, PasskeyId, PasskeyInfo, PasskeyRegistration,
-        RelyingParty,
-    },
-    totp::TotpEnrollment,
 };
 #[cfg(feature = "content")]
 #[cfg_attr(docsrs, doc(cfg(feature = "content")))]

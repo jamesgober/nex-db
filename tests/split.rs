@@ -144,6 +144,17 @@ fn test_sessions_revoke_and_standing() {
     let one = token_of(sign_in(&db, "ann@example.com"));
     let two = token_of(sign_in(&db, "ann@example.com"));
     assert_eq!(db.auth().sessions(ann).unwrap().len(), 2);
+    // A validated session names its listed entry.
+    let id = |t: &nex_db::Token| db.auth().validate(t).unwrap().session().unwrap().id();
+    let listed: Vec<_> = db
+        .auth()
+        .sessions(ann)
+        .unwrap()
+        .iter()
+        .map(|s| s.id())
+        .collect();
+    assert_ne!(id(&one), id(&two));
+    assert!(listed.contains(&id(&one)) && listed.contains(&id(&two)));
     assert!(db.auth().revoke(&one).unwrap());
     assert!(!db.auth().revoke(&one).unwrap());
     assert_eq!(
@@ -189,6 +200,14 @@ fn test_sessions_revoke_and_standing() {
             .unwrap(),
         PasswordCheck::LockedOut { until: None }
     );
+    // Nor is a session issued to it directly.
+    assert!(matches!(
+        db.auth().issue_session(ann, nex_db::SessionSpec::web()),
+        Err(nex_db::Error::Invalid {
+            reason: "may not sign in",
+            ..
+        })
+    ));
     db.auth().set_standing(ann, Standing::Active, None).unwrap();
     assert!(matches!(
         db.auth().verify_password("ann@example.com", PASSWORD).unwrap(),
@@ -343,11 +362,17 @@ fn test_api_keys_recovery_codes_and_roles() {
         }
         other => panic!("{other:?}"),
     }
+    let listed = db.auth().api_keys(ann).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id(), key.id());
+    assert_eq!(listed[0].scopes(), ["posts:read", "posts:write"]);
+    assert!(listed[0].revoked_at().is_none());
     assert!(db.auth().revoke_api_key(key.id()).unwrap());
     assert_eq!(
         db.auth().validate_api_key(key.as_str()).unwrap(),
         ApiKeyCheck::Revoked
     );
+    assert!(db.auth().api_keys(ann).unwrap()[0].revoked_at().is_some());
     assert_eq!(
         db.auth().validate_api_key("short").unwrap(),
         ApiKeyCheck::Malformed
@@ -725,7 +750,7 @@ fn test_threads_share_the_channel() {
     });
 }
 
-#[cfg(feature = "mfa")]
+#[cfg(all(feature = "totp", feature = "passkey"))]
 fn base32_decode(text: &str) -> Vec<u8> {
     let mut out = Vec::new();
     let (mut buffer, mut bits) = (0u32, 0);
@@ -800,7 +825,7 @@ fn test_an_idle_auth_process_that_ends_stops_writes() {
     ));
 }
 
-#[cfg(feature = "mfa")]
+#[cfg(all(feature = "totp", feature = "passkey"))]
 fn test_totp_and_passkey_challenges() {
     let t = TempDir::new("mfa");
     let db = split(&t.at("db"));
@@ -952,7 +977,7 @@ const TESTS: &[Test] = &[
         "a_decoy_raises_its_event_in_the_application",
         test_a_decoy_raises_its_event_in_the_application,
     ),
-    #[cfg(feature = "mfa")]
+    #[cfg(all(feature = "totp", feature = "passkey"))]
     (
         "totp_and_passkey_challenges",
         test_totp_and_passkey_challenges,

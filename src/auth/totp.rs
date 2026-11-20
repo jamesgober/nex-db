@@ -7,7 +7,7 @@
 //! (so a code works once), and a new secret awaiting confirmation while the
 //! confirmed one stays in force.
 
-#[cfg(feature = "mfa")]
+#[cfg(feature = "totp")]
 use std::fmt;
 
 use crypt_io::Zeroizing;
@@ -17,10 +17,10 @@ use crate::error::{Error, Result};
 /// Secret length, in bytes (160 bits, as RFC 4226 recommends).
 pub(crate) const SECRET_LEN: usize = 20;
 /// Digits per code.
-#[cfg(feature = "mfa")]
+#[cfg(feature = "totp")]
 pub(crate) const DIGITS: u32 = 6;
 /// Steps of clock drift accepted either way.
-#[cfg(feature = "mfa")]
+#[cfg(feature = "totp")]
 pub(crate) const WINDOW: u32 = 1;
 /// Format of the stored record: 2 since 0.8 (a pending secret beside the
 /// confirmed one); 1 still reads.
@@ -30,7 +30,7 @@ const FORMAT_1: u8 = 1;
 /// Bytes of a format 1 record.
 const LEN_1: usize = 2 + 8 + SECRET_LEN;
 
-#[cfg(feature = "mfa")]
+#[cfg(feature = "totp")]
 /// A new TOTP secret, as [`add_totp`](crate::AuthTx::add_totp) returns it:
 /// show it once, as a QR code of [`uri`](Self::uri) or as
 /// [`secret`](Self::secret) text, then have the user confirm a code
@@ -40,7 +40,7 @@ pub struct TotpEnrollment {
     pub(crate) secret: Zeroizing<[u8; SECRET_LEN]>,
 }
 
-#[cfg(feature = "mfa")]
+#[cfg(feature = "totp")]
 impl TotpEnrollment {
     /// The secret in base32 (RFC 4648, no padding), for typing into an app.
     #[must_use]
@@ -64,14 +64,14 @@ impl TotpEnrollment {
     }
 }
 
-#[cfg(feature = "mfa")]
+#[cfg(feature = "totp")]
 impl fmt::Debug for TotpEnrollment {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TotpEnrollment").finish_non_exhaustive()
     }
 }
 
-#[cfg(feature = "mfa")]
+#[cfg(feature = "totp")]
 /// RFC 4648 base32 without padding.
 fn base32(bytes: &[u8]) -> Zeroizing<String> {
     const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
@@ -92,7 +92,7 @@ fn base32(bytes: &[u8]) -> Zeroizing<String> {
     out
 }
 
-#[cfg(feature = "mfa")]
+#[cfg(feature = "totp")]
 /// Percent-encode everything but unreserved characters (RFC 3986).
 fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -107,7 +107,7 @@ fn escape(text: &str) -> String {
 }
 
 /// A stored TOTP record.
-#[cfg_attr(not(feature = "mfa"), allow(dead_code))]
+#[cfg_attr(not(feature = "totp"), allow(dead_code))]
 pub(crate) struct TotpRecord {
     pub(crate) secret: Zeroizing<[u8; SECRET_LEN]>,
     pub(crate) confirmed: bool,
@@ -120,7 +120,7 @@ pub(crate) struct TotpRecord {
 }
 
 impl TotpRecord {
-    #[cfg(feature = "mfa")]
+    #[cfg(feature = "totp")]
     pub(crate) fn encode(&self) -> Zeroizing<Vec<u8>> {
         let mut out = Zeroizing::new(Vec::with_capacity(LEN_1 + 1 + SECRET_LEN));
         out.push(FORMAT);
@@ -166,7 +166,7 @@ impl TotpRecord {
         })
     }
 
-    #[cfg(feature = "mfa")]
+    #[cfg(feature = "totp")]
     /// The step `code` matches at `unix_seconds`, if it is later than the
     /// last one accepted: a code works once.
     pub(crate) fn accept(&self, code: &str, unix_seconds: u64) -> Option<u64> {
@@ -174,16 +174,9 @@ impl TotpRecord {
             crypt_io::otp::totp_check(&self.secret[..], code, unix_seconds, DIGITS, WINDOW).ok()?;
         (step > self.last_step).then_some(step)
     }
-
-    #[cfg(feature = "mfa")]
-    /// The step `code` matches for the pending secret at `unix_seconds`.
-    pub(crate) fn accept_pending(&self, code: &str, unix_seconds: u64) -> Option<u64> {
-        let pending = self.pending.as_ref()?;
-        crypt_io::otp::totp_check(&pending[..], code, unix_seconds, DIGITS, WINDOW).ok()
-    }
 }
 
-#[cfg(all(test, feature = "mfa"))]
+#[cfg(all(test, feature = "totp"))]
 mod tests {
     use super::*;
 

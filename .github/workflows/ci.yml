@@ -49,6 +49,11 @@ jobs:
         run: cargo test --all-features
       - name: Test (no default features)
         run: cargo test --no-default-features
+      # TOTP without passkeys: pure Rust, no AWS-LC.
+      - name: Clippy (TOTP only)
+        run: cargo clippy --all-targets --no-default-features --features split-auth,totp,content -- -D warnings
+      - name: Test (TOTP only)
+        run: cargo test --no-default-features --features split-auth,totp,content
       - name: Build examples
         run: cargo build --examples
       # Sign up, sign in, validate; the second run stops without closing the
@@ -70,6 +75,45 @@ jobs:
         run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
+
+  # The static build: TOTP on musl with no C compiler at all, so nothing in
+  # the tree compiles C (AWS-LC comes only with `passkey` or `audit-export`).
+  musl:
+    name: musl (TOTP, no C compiler / ${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [stable, "1.85"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      # blake3's build script looks for a C compiler for its assembly and
+      # uses its Rust intrinsics without one, which the next step forces.
+      - name: No AWS-LC in the tree
+        shell: bash
+        run: |
+          tree=$(cargo tree -e normal,build --no-default-features --features split-auth,totp,content             --target x86_64-unknown-linux-musl --prefix none)
+          if echo "$tree" | grep -E '^(aws-lc|cmake )'; then
+            echo "the TOTP tree builds a C library"
+            exit 1
+          fi
+      - name: Build and test for musl with no C compiler
+        run: cargo test --no-default-features --features split-auth,totp,content --target x86_64-unknown-linux-musl
+        # Every C compiler names a file that does not exist, so any C build
+        # fails; rust-lld links the musl binaries.
+        env:
+          CC: /nonexistent/cc
+          HOST_CC: /nonexistent/cc
+          TARGET_CC: /nonexistent/cc
+          CXX: /nonexistent/cc
+          CC_x86_64_unknown_linux_musl: /nonexistent/cc
+          CC_x86_64_unknown_linux_gnu: /nonexistent/cc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
 
   loom:
     name: Loom models

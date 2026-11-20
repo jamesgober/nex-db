@@ -53,9 +53,9 @@ nex-db is not published. Depend on it from its repository:
 
 ```toml
 [dependencies]
-nex-db = { git = "https://github.com/jamesgober/nex-db", tag = "v0.8.1" }
+nex-db = { git = "https://github.com/jamesgober/nex-db", tag = "v0.9.0" }
 # or pick engines:
-# nex-db = { git = "...", tag = "v0.8.1", default-features = false, features = ["auth"] }
+# nex-db = { git = "...", tag = "v0.9.0", default-features = false, features = ["auth"] }
 ```
 
 | Feature | Default | Adds |
@@ -64,8 +64,10 @@ nex-db = { git = "https://github.com/jamesgober/nex-db", tag = "v0.8.1" }
 | `content` | yes | the content engine: entities, routes |
 | `split-auth` (0.5) | no | the auth engine in its own process (see [Split auth](#split-auth-05)) |
 | `metrics` (0.4) | no | an observer that reports into metrics-lib |
-| `mfa` (0.4.1) | no | TOTP and passkeys, through crypt-io's AWS-LC backend: needs a C compiler; on Windows x86-64 no NASM |
-| `audit-export` (0.8) | no | signed audit exports (`Auth::audit_export`), through crypt-io's Ed25519 on the same backend as `mfa` |
+| `totp` (0.9) | no | TOTP second factors, in pure Rust: no C compiler, so it builds for musl |
+| `passkey` (0.9) | no | passkeys, through crypt-io's AWS-LC backend: needs a C compiler; on Windows x86-64 no NASM |
+| `mfa` (0.4.1) | no | `totp` and `passkey` |
+| `audit-export` (0.8) | no | signed audit exports (`Auth::audit_export`), through crypt-io's Ed25519 on the same backend as `passkey` |
 
 The core (commit log, catalog, recovery) is always built. A database that uses
 an engine the build leaves out refuses to open with `Error::Invalid`.
@@ -391,8 +393,9 @@ Every outcome except `Valid` means the caller is a guest. The reason is there
 so an application can score suspicious traffic.
 
 `Session` gives `account()`, `created_at()`, `expires_at()`, from 0.3
-`idle_limit()`, `recheck_at()`, and `payload() -> &[u8]`, and from 0.4
-`device()`. The payload is up to
+`idle_limit()`, `recheck_at()`, and `payload() -> &[u8]`, and from 0.9 `id()`:
+the `SessionInfo::id()` that `sessions(account)` lists for it, to mark "this
+device" or to sign out the others. The payload is up to
 256 bytes the application stored with the session (permissions, attributes),
 opaque to nex-db.
 
@@ -407,7 +410,7 @@ opaque to nex-db.
 | Operation | Since | Grade | Notes |
 |---|---|---|---|
 | `validate(token) -> Result<Validation>` | 0.1 | P0 | read only |
-| `issue_session(account, spec) -> Result<Token>` | 0.1 | P0 | durable |
+| `issue_session(account, spec) -> Result<Token>` | 0.1 | P0 | durable; since 0.9 refused (`Invalid`, `reason = "may not sign in"`) for an account whose standing blocks sign-in now (locked out, suspended, banned), a standing changed earlier in the same transaction included |
 | `revoke(token) -> Result<bool>` | 0.1 | P0 | takes effect ahead of ordinary commits; `false` when the token names no session or one already revoked; on a decoy (0.8), `false`, `SecurityEvent::DecoyPresented`, and the decoy stays planted |
 | `retire_decoy(token) -> Result<bool>` | 0.8 | defence | removes a planted decoy; `false` when the token is not one; also in a transaction |
 | `rotate(token) -> Result<Token>` | 0.3 | P0 | the old token becomes `Revoked { Rotated }` |
@@ -498,7 +501,7 @@ matched and the account has TOTP on; it is not signed in until
 account is locked out `check_totp` answers `false` for every code).
 
 An account with TOTP on never signs in on its password alone, in any build:
-one without the `mfa` feature answers `NeedsSecondFactor` too, and cannot
+one without the `totp` feature answers `NeedsSecondFactor` too, and cannot
 complete it.
 
 `Standing` (non-exhaustive): `Active`, `PendingVerification`,
@@ -512,18 +515,19 @@ every session of the account in the same commit.
 
 | Operation | Grade | Notes |
 |---|---|---|
-| `add_totp(account) -> Result<TotpEnrollment>`, `confirm_totp(account, code) -> Result<bool>`, `remove_totp(account) -> Result<bool>` (0.4.1, feature `mfa`; also in a transaction) | P1 | a 160-bit secret, sealed; `TotpEnrollment::secret()` (base32) and `uri(issuer, label)` (`otpauth://`, SHA1, six digits, 30 s) shown once; TOTP is on once a code is confirmed; since 0.8 `add_totp` on an account with TOTP on keeps the confirmed secret in force until a code of the new one is confirmed |
-| `verify_totp(challenge, code, spec) -> Result<SignIn>` (0.4.1, feature `mfa`) | P1 | completes `SignIn::NeedsSecondFactor`: the challenge is a single-use token that lasts five minutes; a wrong code counts toward lock-out and leaves the challenge for another try; a code works once (one step of drift either way) |
-| `check_totp(account, code) -> Result<bool>` (0.4.1, feature `mfa`; also in a transaction) | P1 | after `PasswordCheck::NeedsSecondFactor`, for an application that issues its own sessions; since 0.8 a wrong code counts toward the account's lock-out, and while it is locked out every code answers `false` |
+| `add_totp(account) -> Result<TotpEnrollment>`, `confirm_totp(account, code) -> Result<bool>`, `remove_totp(account) -> Result<bool>` (0.4.1, feature `totp`; also in a transaction) | P1 | a 160-bit secret, sealed; `TotpEnrollment::secret()` (base32) and `uri(issuer, label)` (`otpauth://`, SHA1, six digits, 30 s) shown once; TOTP is on once a code is confirmed; before then `add_totp` again replaces the unconfirmed secret; since 0.9 `add_totp` on an account with TOTP on is refused (`Invalid`, `field = "totp"`): turn it off with `remove_totp` first, and `confirm_totp` then returns `false` |
+| `verify_totp(challenge, code, spec) -> Result<SignIn>` (0.4.1, feature `totp`) | P1 | completes `SignIn::NeedsSecondFactor`: the challenge is a single-use token that lasts five minutes; a wrong code counts toward lock-out and leaves the challenge for another try; a code works once (one step of drift either way) |
+| `check_totp(account, code) -> Result<bool>` (0.4.1, feature `totp`; also in a transaction) | P1 | after `PasswordCheck::NeedsSecondFactor`, for an application that issues its own sessions; since 0.8 a wrong code counts toward the account's lock-out, and while it is locked out every code answers `false` |
 | `new_recovery_codes(account) -> Result<RecoveryCodes>` (tx) | P1 | ten codes, `xxxxx-xxxxx` (Crockford base32, 50 bits each); replaces any earlier codes; shown once (`codes()`); stored as keyed digests |
 | `use_recovery_code(account, code) -> Result<bool>` (tx) | P1 | `true` once per code; dashes, spaces, and case ignored; two uses at once give `true` to one |
-| `passkey_registration(account) -> Result<PasskeyChallenge>`, `add_passkey(account, &RelyingParty, &PasskeyRegistration) -> Result<PasskeyId>` (0.4.1, feature `mfa`; also in a transaction) | P2 | the challenge's bytes go to `navigator.credentials.create` (`as_bytes()`, `to_base64url()`), the account's id as the user id; checks the client data (type, challenge, origin, not cross-origin), the RP ID hash, user presence (and verification with `RelyingParty::require_user_verification`), and that the key is `ES256`, `EdDSA`, or `RS256`; attestation is not checked; `PasskeyRegistration::new(client_data_json, authenticator_data)` |
-| `passkey_sign_in() -> Result<PasskeyChallenge>`, `verify_passkey(&RelyingParty, &PasskeyAssertion, spec) -> Result<SignIn>` (0.4.1, feature `mfa`) | P2 | a sign-in of its own (no password, no TOTP); the same checks, the signature, and a rising signature counter (an authenticator that keeps it at zero is allowed); `PasskeyAssertion::new(credential_id, client_data_json, authenticator_data, signature)`; challenges work once, within five minutes |
-| `passkeys(account) -> Result<Vec<PasskeyInfo>>`, `remove_passkey(account, PasskeyId) -> Result<bool>` (0.4.1, feature `mfa`) | P2 | `PasskeyInfo`: `id()`, `created_at()`, `last_used_at()` |
+| `passkey_registration(account) -> Result<PasskeyChallenge>`, `add_passkey(account, &RelyingParty, &PasskeyRegistration) -> Result<PasskeyId>` (0.4.1, feature `passkey`; also in a transaction) | P2 | the challenge's bytes go to `navigator.credentials.create` (`as_bytes()`, `to_base64url()`), the account's id as the user id; checks the client data (type, challenge, origin, not cross-origin), the RP ID hash, user presence (and verification with `RelyingParty::require_user_verification`), and that the key is `ES256`, `EdDSA`, or `RS256`; attestation is not checked; `PasskeyRegistration::new(client_data_json, authenticator_data)` |
+| `passkey_sign_in() -> Result<PasskeyChallenge>`, `verify_passkey(&RelyingParty, &PasskeyAssertion, spec) -> Result<SignIn>` (0.4.1, feature `passkey`) | P2 | a sign-in of its own (no password, no TOTP); the same checks, the signature, and a rising signature counter (an authenticator that keeps it at zero is allowed); `PasskeyAssertion::new(credential_id, client_data_json, authenticator_data, signature)`; challenges work once, within five minutes |
+| `passkeys(account) -> Result<Vec<PasskeyInfo>>`, `remove_passkey(account, PasskeyId) -> Result<bool>` (0.4.1, feature `passkey`) | P2 | `PasskeyInfo`: `id()`, `created_at()`, `last_used_at()` |
 | `single_use_token(purpose, account, ttl) -> Result<Token>` | P1 | email verification, magic link, preview; `Purpose` (non-exhaustive): `VerifyEmail`, `ResetPassword`, `SignInLink`, `Preview`, `Custom(u16)`; `ttl` at most 30 days; never validates as a session; also in a transaction |
 | `single_use_token_for(identifier, purpose, ttl) -> Result<Option<Token>>` | P1 | password reset by email address; the same work whether the identifier exists or not, so answer the same either way; since 0.8 a request for an unknown identifier takes no room in the session table; rate-limit the requests (each is a commit and an email) |
 | `redeem(token, purpose) -> Result<Option<AccountId>>` | P1 | works once, for the purpose it was issued for; two redeems at once give the account to one; also in a transaction |
 | `create_api_key(account, scopes: &[&str], expiry: Option<SystemTime>) -> Result<ApiKey>` | P1 | the key text (`as_str()`) is shown once; `id()` to revoke it; at most 32 scopes of 1 to 64 bytes without spaces, stored and returned as given; also in a transaction |
+| `api_keys(account) -> Result<Vec<ApiKeyInfo>>` (0.9) | P1 | oldest first, revoked and expired keys included; `ApiKeyInfo`: `id()`, `created_at()`, `expires_at()`, `revoked_at()`, `scopes()`; never the text, which is not stored (only a keyed BLAKE3 digest of it is); reads every key record of the realm (an estimated 1 to 2 us each) |
 | `validate_api_key(text) -> Result<ApiKeyCheck>`, `revoke_api_key(id) -> Result<bool>` | P1 | `ApiKeyCheck` (non-exhaustive): `Valid { account, id, scopes }`, `Expired`, `Revoked`, `Unknown`, `Malformed`; one read of the account store; a session token is never a key, nor a key a session |
 | `define_role(Role) -> Result<RoleId>`, `assign_roles(account, &[RoleId])`, `roles(account)`, `role(id)`, `role_named(name)` | P1 | `Role::new(name).permission(p).inherits(id)`; a role inherits only roles already defined; roles are never removed; at most 256 per realm and 16 per account |
 | `allowed(account, permission) -> Result<bool>` | P1 | checks the account's roles against the current policy |

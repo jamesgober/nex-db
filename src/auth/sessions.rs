@@ -19,7 +19,7 @@ use std::{
     sync::{Mutex, MutexGuard, PoisonError, RwLock},
 };
 
-use super::types::{MAX_PAYLOAD, Payload, RevokeReason, Session};
+use super::types::{MAX_PAYLOAD, Payload, RevokeReason, Session, SessionId};
 use crate::{
     ids::AccountId,
     table::{At, Refused, Table},
@@ -27,10 +27,13 @@ use crate::{
 };
 
 /// Words per slot: account (2), created, expires, idle, recheck, a meta
-/// word (kind, reason, payload length, epoch), and the payload's start.
-const WORDS: usize = 14;
+/// word (kind, reason, payload length, epoch), the session id (2, kept so
+/// a validation need not derive it), and the payload's start.
+const WORDS: usize = 16;
+/// Words before the payload.
+const HEAD: usize = 9;
 /// Payload bytes kept in the slot itself.
-const INLINE: usize = (WORDS - 7) * 8;
+const INLINE: usize = (WORDS - HEAD) * 8;
 /// Words of an extension block: the rest of a full payload.
 const EXT: usize = (MAX_PAYLOAD - INLINE) / 8;
 const _: () = assert!(INLINE + EXT * 8 == MAX_PAYLOAD);
@@ -127,9 +130,14 @@ fn encode_live(session: &Session) -> (Words, Option<ExtWords>) {
     words[4] = session.idle_ms;
     words[5] = session.recheck_ms;
     words[6] = KIND_LIVE | ((payload.len() as u64) << 16) | (u64::from(session.epoch) << 32);
+    words[7] = word(&session.id.0[..8]);
+    words[8] = word(&session.id.0[8..]);
     let mut bytes = [0; MAX_PAYLOAD];
     bytes[..payload.len()].copy_from_slice(payload);
-    for (w, chunk) in words[7..].iter_mut().zip(bytes[..INLINE].chunks_exact(8)) {
+    for (w, chunk) in words[HEAD..]
+        .iter_mut()
+        .zip(bytes[..INLINE].chunks_exact(8))
+    {
         *w = word(chunk);
     }
     let ext = (payload.len() > INLINE).then(|| {
@@ -161,7 +169,7 @@ fn decode(words: &Words, ext: Option<&ExtWords>) -> Option<Slot> {
         KIND_LIVE => {
             let len = usize::from((words[6] >> 16) as u16);
             let mut bytes = [0; MAX_PAYLOAD];
-            for (chunk, w) in bytes[..INLINE].chunks_exact_mut(8).zip(&words[7..]) {
+            for (chunk, w) in bytes[..INLINE].chunks_exact_mut(8).zip(&words[HEAD..]) {
                 chunk.copy_from_slice(&w.to_le_bytes());
             }
             if let Some(ext) = ext {
@@ -170,6 +178,12 @@ fn decode(words: &Words, ext: Option<&ExtWords>) -> Option<Slot> {
                 }
             }
             Some(Slot::Live(Session {
+                id: {
+                    let mut id = [0; 16];
+                    id[..8].copy_from_slice(&words[7].to_le_bytes());
+                    id[8..].copy_from_slice(&words[8].to_le_bytes());
+                    SessionId(id)
+                },
                 account: account_of(words),
                 created_ms: words[2],
                 expires_ms: words[3],
@@ -582,6 +596,7 @@ mod tests {
 
     fn session() -> Session {
         Session {
+            id: SessionId([5; 16]),
             account: AccountId::from_bytes([7; 16]),
             created_ms: 1,
             expires_ms: 10_000,
@@ -612,6 +627,7 @@ mod tests {
         let table = table();
         table.insert(digest(1), session(), 0).unwrap(); // expires at 10 s
         let longer = Session {
+            id: SessionId::NONE,
             expires_ms: 100_000,
             ..session()
         };
@@ -636,6 +652,7 @@ mod tests {
     fn test_idle_session_is_reclaimed_only_after_its_idle_limit() {
         let table = table();
         let idle = Session {
+            id: SessionId::NONE,
             idle_ms: 3_000,
             ..session()
         };
@@ -654,6 +671,7 @@ mod tests {
             let table = table();
             let bytes: Vec<u8> = (0..len).map(|i| i as u8 ^ 0x5A).collect();
             let with = Session {
+                id: SessionId::NONE,
                 payload: Payload::new(&bytes).unwrap(),
                 ..session()
             };
@@ -679,6 +697,7 @@ mod tests {
         let table = table();
         table.insert(digest(1), session(), 0).unwrap();
         let later = Session {
+            id: SessionId::NONE,
             epoch: 1,
             ..session()
         };
@@ -686,6 +705,7 @@ mod tests {
         table.insert(digest(3), session(), 0).unwrap();
         table.revoke(digest(3), RevokeReason::Revoked, 0).unwrap();
         let other = Session {
+            id: SessionId::NONE,
             account: AccountId::from_bytes([8; 16]),
             ..session()
         };
@@ -710,6 +730,7 @@ mod tests {
         table.insert(digest(3), session(), 1).unwrap();
         assert_eq!(table.get(&digest(3)), out);
         let current = Session {
+            id: SessionId::NONE,
             epoch: 1,
             ..session()
         };

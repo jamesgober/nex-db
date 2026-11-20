@@ -58,10 +58,11 @@ pub(crate) mod op {
     pub(crate) const ACCOUNT_NAMED: u16 = 18;
     pub(crate) const SESSIONS: u16 = 19;
     pub(crate) const API_KEY_CHECK: u16 = 20;
-    #[cfg(feature = "mfa")]
+    #[cfg(feature = "passkey")]
     pub(crate) const PASSKEYS: u16 = 21;
     pub(crate) const POLICY: u16 = 22;
     pub(crate) const LOCKED_UNTIL: u16 = 23;
+    pub(crate) const API_KEYS: u16 = 24;
 
     pub(crate) const TX_VALIDATE_READS: u16 = 40;
     pub(crate) const TX_SEAL: u16 = 41;
@@ -93,25 +94,25 @@ pub(crate) mod op {
     pub(crate) const REVOKE: u16 = 72;
     pub(crate) const PLANT_DECOY: u16 = 73;
     pub(crate) const RETIRE_DECOY: u16 = 74;
-    #[cfg(feature = "mfa")]
+    #[cfg(feature = "totp")]
     pub(crate) const ADD_TOTP: u16 = 80;
-    #[cfg(feature = "mfa")]
+    #[cfg(feature = "totp")]
     pub(crate) const CONFIRM_TOTP: u16 = 81;
-    #[cfg(feature = "mfa")]
+    #[cfg(feature = "totp")]
     pub(crate) const CHECK_TOTP: u16 = 82;
-    #[cfg(feature = "mfa")]
+    #[cfg(feature = "totp")]
     pub(crate) const REMOVE_TOTP: u16 = 83;
-    #[cfg(feature = "mfa")]
+    #[cfg(feature = "passkey")]
     pub(crate) const PASSKEY_REGISTRATION: u16 = 84;
-    #[cfg(feature = "mfa")]
+    #[cfg(feature = "passkey")]
     pub(crate) const PASSKEY_SIGN_IN: u16 = 85;
-    #[cfg(feature = "mfa")]
+    #[cfg(feature = "passkey")]
     pub(crate) const ADD_PASSKEY: u16 = 86;
-    #[cfg(feature = "mfa")]
+    #[cfg(feature = "passkey")]
     pub(crate) const REMOVE_PASSKEY: u16 = 87;
-    #[cfg(feature = "mfa")]
+    #[cfg(feature = "passkey")]
     pub(crate) const COMPLETE_PASSKEY: u16 = 88;
-    #[cfg(feature = "mfa")]
+    #[cfg(feature = "totp")]
     pub(crate) const COMPLETE_SECOND_FACTOR: u16 = 89;
 
     /// True for a transaction operation.

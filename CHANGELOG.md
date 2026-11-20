@@ -6,6 +6,28 @@ All notable changes to `nex-db` are documented in this file. The format is based
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-20
+
+Two-step sign-in without a C compiler, and tighter account checks in the auth engine.
+
+### Added
+
+- Feature `totp`: TOTP second factors and nothing else, on crypt-io 1.7's pure-Rust `otp`. It needs no C compiler, so it builds for musl and other static targets. Feature `passkey`: passkeys, which still build crypt-io's C backend (AWS-LC). `mfa` is both, as before.
+- `Session::id()`: the id of a validated session, the same one `sessions(account)` lists for it. An application can mark "this device" in a session list, or sign out every other session. The id is kept in the session table, so `validate` stays as fast as before.
+- `db.auth().api_keys(account)`: an account's API keys, oldest first, revoked and expired ones included. `ApiKeyInfo` gives `id()`, `created_at()`, `expires_at()`, `revoked_at()` and `scopes()`; never the key's text.
+
+### Changed
+
+- `issue_session` checks the account's standing. A locked-out, suspended or banned account gets `Error::Invalid { field: "account", reason: "may not sign in" }` instead of a session, even when the application skips its own check, and a suspension staged earlier in the same transaction counts. An erased account still gets "no such account".
+- `add_totp` is refused while TOTP is on (`Error::Invalid { field: "totp", reason: "already on" }`). Moving to a new secret needs `remove_totp` first: the user turning it off, or an administrator's reset. In 0.8 a second `add_totp` left a new secret pending beside the confirmed one, and confirming it moved TOTP over. Now `confirm_totp` on an account with TOTP on returns `false`. A secret 0.8 left pending is never used, and it is dropped the next time a code is accepted.
+- crypt-io 1.7.
+- The split-auth wire: a validated session carries its id, and there is a request for the API key list. Both processes come from the same build, as before.
+
+### Unchanged
+
+- API keys were already stored as a keyed BLAKE3 digest of the key, never the key or a sealed copy of it, so a stolen database with its keys gives no key a program could use. A new test checks what a commit writes for a key. There is nothing to migrate.
+- On-disk formats: 0.8 databases open as they are.
+
 ## [0.8.1] - 2026-11-12
 
 lsm-db 1.4 for the account and content stores.
@@ -240,7 +262,8 @@ The walking skeleton.
 - Repository scaffold: `Cargo.toml` (edition 2024, MSRV 1.85), `src/lib.rs` with `VERSION`, CI on Linux, macOS, and Windows (stable and 1.85), `cargo deny` configuration.
 - `dev/PLAN.md`, `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/nex-db/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/jamesgober/nex-db/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/jamesgober/nex-db/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/jamesgober/nex-db/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/jamesgober/nex-db/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/nex-db/compare/v0.6.0...v0.7.0

@@ -89,6 +89,49 @@ impl fmt::Debug for ApiKey {
     }
 }
 
+/// An API key as [`api_keys`](crate::Auth::api_keys) lists it. Never its
+/// text: nex-db keeps only a keyed digest of that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiKeyInfo {
+    pub(crate) id: ApiKeyId,
+    pub(crate) created_ms: u64,
+    pub(crate) expires_ms: u64,
+    pub(crate) revoked_ms: u64,
+    pub(crate) scopes: Vec<String>,
+}
+
+impl ApiKeyInfo {
+    /// The key's id, to revoke it.
+    #[must_use]
+    pub const fn id(&self) -> ApiKeyId {
+        self.id
+    }
+
+    /// When the key was made.
+    #[must_use]
+    pub fn created_at(&self) -> SystemTime {
+        crate::core::time_of(self.created_ms)
+    }
+
+    /// When the key stops working, if it was given an expiry.
+    #[must_use]
+    pub fn expires_at(&self) -> Option<SystemTime> {
+        (self.expires_ms != 0).then(|| crate::core::time_of(self.expires_ms))
+    }
+
+    /// When the key was revoked, if it was.
+    #[must_use]
+    pub fn revoked_at(&self) -> Option<SystemTime> {
+        (self.revoked_ms != 0).then(|| crate::core::time_of(self.revoked_ms))
+    }
+
+    /// What the key may do, as given when it was made.
+    #[must_use]
+    pub fn scopes(&self) -> &[String] {
+        &self.scopes
+    }
+}
+
 /// What [`validate_api_key`](crate::Auth::validate_api_key) found.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +208,17 @@ impl KeyRecord {
             revoked_ms,
             scopes,
         })
+    }
+
+    /// The record as a listing shows it.
+    pub(crate) fn info(&self) -> ApiKeyInfo {
+        ApiKeyInfo {
+            id: self.id,
+            created_ms: self.created_ms,
+            expires_ms: self.expires_ms,
+            revoked_ms: self.revoked_ms,
+            scopes: self.scopes.clone(),
+        }
     }
 
     /// What a check of this record finds at `now`.

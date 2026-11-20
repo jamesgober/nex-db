@@ -160,7 +160,7 @@ impl RemoteAuth {
         )
     }
 
-    #[cfg(feature = "mfa")]
+    #[cfg(feature = "totp")]
     pub(crate) fn locked_until(&self, key: [u8; 16], now: u64) -> Result<Option<u64>> {
         self.call(
             op::LOCKED_UNTIL,
@@ -229,7 +229,21 @@ impl RemoteAuth {
         self.call(op::API_KEY_CHECK, |w| put_str(w, text), wire::get_key_check)
     }
 
-    #[cfg(feature = "mfa")]
+    pub(crate) fn api_keys(
+        &self,
+        account: AccountId,
+    ) -> Result<Vec<crate::auth::keys::ApiKeyInfo>> {
+        self.call(
+            op::API_KEYS,
+            |w| {
+                wire::put_account(w, account);
+                Ok(())
+            },
+            wire::get_key_infos,
+        )
+    }
+
+    #[cfg(feature = "passkey")]
     pub(crate) fn passkeys(
         &self,
         account: AccountId,
@@ -240,7 +254,7 @@ impl RemoteAuth {
                 wire::put_account(w, account);
                 Ok(())
             },
-            wire::mfa::get_passkey_infos,
+            wire::passkey::get_passkey_infos,
         )
     }
 
@@ -700,13 +714,13 @@ impl<'db> RemoteStaged<'db> {
     }
 }
 
-#[cfg(feature = "mfa")]
+#[cfg(feature = "totp")]
 impl RemoteStaged<'_> {
     pub(crate) fn add_totp(
         &mut self,
         account: AccountId,
     ) -> Result<crate::auth::totp::TotpEnrollment> {
-        self.account_op(op::ADD_TOTP, account, wire::mfa::get_enrollment)
+        self.account_op(op::ADD_TOTP, account, wire::totp::get_enrollment)
     }
 
     fn code_op(&mut self, op: u16, account: AccountId, code: &str) -> Result<bool> {
@@ -731,16 +745,27 @@ impl RemoteStaged<'_> {
     pub(crate) fn remove_totp(&mut self, account: AccountId) -> Result<bool> {
         self.account_op(op::REMOVE_TOTP, account, get_bool)
     }
+}
 
+#[cfg(feature = "passkey")]
+impl RemoteStaged<'_> {
     pub(crate) fn passkey_registration(
         &mut self,
         account: AccountId,
     ) -> Result<crate::auth::passkey::PasskeyChallenge> {
-        self.account_op(op::PASSKEY_REGISTRATION, account, wire::mfa::get_challenge)
+        self.account_op(
+            op::PASSKEY_REGISTRATION,
+            account,
+            wire::passkey::get_challenge,
+        )
     }
 
     pub(crate) fn passkey_sign_in(&mut self) -> Result<crate::auth::passkey::PasskeyChallenge> {
-        self.tx(op::PASSKEY_SIGN_IN, |_| Ok(()), wire::mfa::get_challenge)
+        self.tx(
+            op::PASSKEY_SIGN_IN,
+            |_| Ok(()),
+            wire::passkey::get_challenge,
+        )
     }
 
     pub(crate) fn add_passkey(
@@ -753,7 +778,7 @@ impl RemoteStaged<'_> {
             op::ADD_PASSKEY,
             |w| {
                 wire::put_account(w, account);
-                wire::mfa::put_rp(w, rp)?;
+                wire::passkey::put_rp(w, rp)?;
                 w.bytes32(registration.client_data_json)?;
                 w.bytes32(registration.authenticator_data)
             },
@@ -786,17 +811,20 @@ impl RemoteStaged<'_> {
         self.tx(
             op::COMPLETE_PASSKEY,
             |w| {
-                wire::mfa::put_rp(w, rp)?;
+                wire::passkey::put_rp(w, rp)?;
                 w.bytes32(assertion.credential_id)?;
                 w.bytes32(assertion.client_data_json)?;
                 w.bytes32(assertion.authenticator_data)?;
                 w.bytes32(assertion.signature)?;
                 wire::put_spec(w, &spec)
             },
-            wire::mfa::get_outcome,
+            wire::passkey::get_outcome,
         )
     }
+}
 
+#[cfg(feature = "totp")]
+impl RemoteStaged<'_> {
     pub(crate) fn complete_second_factor(
         &mut self,
         challenge: &str,
@@ -810,7 +838,7 @@ impl RemoteStaged<'_> {
                 put_str(w, code)?;
                 wire::put_spec(w, &spec)
             },
-            wire::mfa::get_second,
+            wire::totp::get_second,
         )
     }
 }

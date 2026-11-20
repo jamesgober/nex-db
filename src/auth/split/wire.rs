@@ -17,7 +17,7 @@ use crypt_io::Zeroizing;
 
 use super::super::{
     AccountView, Checked, Standing, decode_standing, encode_standing,
-    keys::{ApiKey, ApiKeyCheck, ApiKeyId},
+    keys::{ApiKey, ApiKeyCheck, ApiKeyId, ApiKeyInfo},
     recovery::RecoveryCodes,
     roles::{Role, RoleId},
     token::Token,
@@ -433,6 +433,7 @@ pub(crate) fn get_role(r: &mut Reader<'_>) -> Result<Role> {
 }
 
 pub(crate) fn put_session(w: &mut Writer<'_>, s: &Session) -> Result<()> {
+    w.bytes(&s.id.0);
     put_account(w, s.account);
     w.u64(s.created_ms);
     w.u64(s.expires_ms);
@@ -444,6 +445,7 @@ pub(crate) fn put_session(w: &mut Writer<'_>, s: &Session) -> Result<()> {
 
 pub(crate) fn get_session(r: &mut Reader<'_>) -> Result<Session> {
     Ok(Session {
+        id: super::super::types::SessionId(r.fixed()?),
         account: get_account(r)?,
         created_ms: r.u64()?,
         expires_ms: r.u64()?,
@@ -654,6 +656,45 @@ pub(crate) fn get_key_check(r: &mut Reader<'_>) -> Result<ApiKeyCheck> {
     })
 }
 
+pub(crate) fn put_key_infos(w: &mut Writer<'_>, infos: &[ApiKeyInfo]) -> Result<()> {
+    w.u32(u32::try_from(infos.len()).map_err(|_| Error::invalid("api keys", "too many"))?);
+    for info in infos {
+        w.bytes(&info.id.0);
+        w.u64(info.created_ms);
+        w.u64(info.expires_ms);
+        w.u64(info.revoked_ms);
+        w.u32(u32::try_from(info.scopes.len()).map_err(|_| Error::invalid("scopes", "too many"))?);
+        for scope in &info.scopes {
+            put_str(w, scope)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn get_key_infos(r: &mut Reader<'_>) -> Result<Vec<ApiKeyInfo>> {
+    let n = r.u32()? as usize;
+    let mut out = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        let id = ApiKeyId(r.fixed()?);
+        let created_ms = r.u64()?;
+        let expires_ms = r.u64()?;
+        let revoked_ms = r.u64()?;
+        let count = r.u32()? as usize;
+        let mut scopes = Vec::with_capacity(count.min(32));
+        for _ in 0..count {
+            scopes.push(get_str(r)?.to_owned());
+        }
+        out.push(ApiKeyInfo {
+            id,
+            created_ms,
+            expires_ms,
+            revoked_ms,
+            scopes,
+        });
+    }
+    Ok(out)
+}
+
 pub(crate) fn put_api_key(w: &mut Writer<'_>, key: &ApiKey) -> Result<()> {
     w.bytes(&key.id.0);
     put_token(w, &key.token)
@@ -731,20 +772,77 @@ pub(crate) fn get_change(r: &mut Reader<'_>) -> Result<Change> {
     })
 }
 
-#[cfg(feature = "mfa")]
-pub(crate) mod mfa {
-    //! The second-factor values.
+#[cfg(feature = "totp")]
+pub(crate) mod totp {
+    //! The TOTP values.
 
     use crypt_io::Zeroizing;
 
     use super::{
-        Error, Reader, Result, Token, Writer, get_account, get_bool, get_opt_time, get_str,
-        get_token, put_account, put_opt_time, put_str, put_token,
+        Reader, Result, Token, Writer, get_account, get_bool, get_token, put_account, put_token,
+    };
+    use crate::auth::totp::{SECRET_LEN, TotpEnrollment};
+
+    pub(crate) fn put_enrollment(w: &mut Writer<'_>, e: &TotpEnrollment) {
+        w.bytes(&e.secret[..]);
+    }
+
+    pub(crate) fn get_enrollment(r: &mut Reader<'_>) -> Result<TotpEnrollment> {
+        let mut secret = Zeroizing::new([0u8; SECRET_LEN]);
+        secret.copy_from_slice(r.take(SECRET_LEN)?);
+        Ok(TotpEnrollment { secret })
+    }
+
+    pub(crate) fn put_second(
+        w: &mut Writer<'_>,
+        outcome: &Option<(crate::ids::AccountId, Option<Token>)>,
+    ) -> Result<()> {
+        match outcome {
+            None => w.u8(0),
+            Some((account, token)) => {
+                w.u8(1);
+                put_account(w, *account);
+                match token {
+                    Some(token) => {
+                        w.u8(1);
+                        put_token(w, token)?;
+                    }
+                    None => w.u8(0),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn get_second(
+        r: &mut Reader<'_>,
+    ) -> Result<Option<(crate::ids::AccountId, Option<Token>)>> {
+        if !get_bool(r)? {
+            return Ok(None);
+        }
+        let account = get_account(r)?;
+        let token = if get_bool(r)? {
+            Some(get_token(r)?)
+        } else {
+            None
+        };
+        Ok(Some((account, token)))
+    }
+}
+
+#[cfg(feature = "passkey")]
+pub(crate) mod passkey {
+    //! The passkey values.
+
+    use crypt_io::Zeroizing;
+
+    use super::{
+        Error, Reader, Result, Writer, get_account, get_bool, get_opt_time, get_str, get_token,
+        put_account, put_opt_time, put_str, put_token,
     };
     use crate::auth::{
         PasskeyOutcome,
         passkey::{PasskeyChallenge, PasskeyId, PasskeyInfo, RelyingParty},
-        totp::{SECRET_LEN, TotpEnrollment},
     };
 
     pub(crate) fn put_rp(w: &mut Writer<'_>, rp: &RelyingParty) -> Result<()> {
@@ -769,16 +867,6 @@ pub(crate) mod mfa {
             origins,
             user_verification: get_bool(r)?,
         })
-    }
-
-    pub(crate) fn put_enrollment(w: &mut Writer<'_>, e: &TotpEnrollment) {
-        w.bytes(&e.secret[..]);
-    }
-
-    pub(crate) fn get_enrollment(r: &mut Reader<'_>) -> Result<TotpEnrollment> {
-        let mut secret = Zeroizing::new([0u8; SECRET_LEN]);
-        secret.copy_from_slice(r.take(SECRET_LEN)?);
-        Ok(TotpEnrollment { secret })
     }
 
     pub(crate) fn put_challenge(w: &mut Writer<'_>, c: &PasskeyChallenge) {
@@ -837,42 +925,6 @@ pub(crate) mod mfa {
             2 => Some(Err(get_opt_time(r)?)),
             _ => return Err(Error::corrupt(super::REPLY, 0)),
         })
-    }
-
-    pub(crate) fn put_second(
-        w: &mut Writer<'_>,
-        outcome: &Option<(crate::ids::AccountId, Option<Token>)>,
-    ) -> Result<()> {
-        match outcome {
-            None => w.u8(0),
-            Some((account, token)) => {
-                w.u8(1);
-                put_account(w, *account);
-                match token {
-                    Some(token) => {
-                        w.u8(1);
-                        put_token(w, token)?;
-                    }
-                    None => w.u8(0),
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn get_second(
-        r: &mut Reader<'_>,
-    ) -> Result<Option<(crate::ids::AccountId, Option<Token>)>> {
-        if !get_bool(r)? {
-            return Ok(None);
-        }
-        let account = get_account(r)?;
-        let token = if get_bool(r)? {
-            Some(get_token(r)?)
-        } else {
-            None
-        };
-        Ok(Some((account, token)))
     }
 }
 
@@ -1059,7 +1111,20 @@ pub(crate) fn fuzz(data: &[u8]) {
     let _ = get_view(&mut reader());
     let _ = get_session_infos(&mut reader());
     let _ = get_key_check(&mut reader());
+    let _ = get_key_infos(&mut reader());
     let _ = get_api_key(&mut reader());
+    #[cfg(feature = "totp")]
+    {
+        let _ = totp::get_enrollment(&mut reader());
+        let _ = totp::get_second(&mut reader());
+    }
+    #[cfg(feature = "passkey")]
+    {
+        let _ = passkey::get_rp(&mut reader());
+        let _ = passkey::get_challenge(&mut reader());
+        let _ = passkey::get_passkey_infos(&mut reader());
+        let _ = passkey::get_outcome(&mut reader());
+    }
     let _ = get_codes(&mut reader());
     let _ = get_change(&mut reader());
     let _ = get_error(&mut reader());

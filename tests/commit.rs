@@ -1191,7 +1191,7 @@ fn test_recovery_codes_work_once_and_replace_each_other() {
 }
 
 /// RFC 4648 base32 without padding, for the test to read the secret.
-#[cfg(feature = "mfa")]
+#[cfg(feature = "totp")]
 fn base32_decode(text: &str) -> Vec<u8> {
     let mut out = Vec::new();
     let (mut buffer, mut bits) = (0u32, 0);
@@ -1211,7 +1211,7 @@ fn base32_decode(text: &str) -> Vec<u8> {
     out
 }
 
-#[cfg(feature = "mfa")]
+#[cfg(feature = "totp")]
 #[test]
 fn test_totp_second_factor_signs_in_once_per_code() {
     let dir = TempDir::new("totp");
@@ -1314,7 +1314,7 @@ fn test_totp_second_factor_signs_in_once_per_code() {
 }
 
 /// A software authenticator holding one Ed25519 passkey.
-#[cfg(feature = "mfa")]
+#[cfg(feature = "passkey")]
 struct Authenticator {
     key: crypt_io::sign::Ed25519SigningKey,
     id: Vec<u8>,
@@ -1322,7 +1322,7 @@ struct Authenticator {
     count: u32,
 }
 
-#[cfg(feature = "mfa")]
+#[cfg(feature = "passkey")]
 impl Authenticator {
     fn new(rp_id: &str) -> Self {
         Authenticator {
@@ -1377,7 +1377,7 @@ impl Authenticator {
     }
 }
 
-#[cfg(feature = "mfa")]
+#[cfg(feature = "passkey")]
 #[test]
 fn test_passkeys_register_sign_in_and_refuse_replays() {
     use nex_db::{PasskeyAssertion, PasskeyRegistration, RelyingParty};
@@ -1503,4 +1503,122 @@ fn test_passkeys_register_sign_in_and_refuse_replays() {
         SignIn::Failed
     ));
     assert!(db.auth().passkeys(ann).unwrap().is_empty());
+}
+
+/// `Session::id` is the id `sessions` lists for that session, so an
+/// application can mark "this device" and sign out the others.
+#[test]
+fn test_a_validated_session_names_its_listed_id() {
+    let dir = TempDir::new("session-id");
+    let db = Database::open(&dir.0).unwrap();
+    let password = db.auth().hash_password("a long password").unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    let tokens: Vec<_> = (0..3)
+        .map(|_| db.auth().issue_session(ann, SessionSpec::web()).unwrap())
+        .collect();
+    let ids: Vec<_> = tokens
+        .iter()
+        .map(|t| {
+            db.auth()
+                .validate(t.as_str())
+                .unwrap()
+                .session()
+                .unwrap()
+                .id()
+        })
+        .collect();
+    let mut listed: Vec<_> = db
+        .auth()
+        .sessions(ann)
+        .unwrap()
+        .iter()
+        .map(|s| s.id())
+        .collect();
+    let mut sorted = ids.clone();
+    listed.sort();
+    sorted.sort();
+    assert_eq!(listed, sorted, "each validated id is a listed id");
+    // The same after a reopen (sessions come back from the checkpoint a
+    // close writes, and from the log).
+    drop(db);
+    let db = Database::open(&dir.0).unwrap();
+    for (t, id) in tokens.iter().zip(&ids) {
+        let v = db.auth().validate(t.as_str()).unwrap();
+        assert_eq!(v.session().unwrap().id(), *id);
+    }
+    // Sign out the others: keep the current one.
+    let current = ids[1];
+    for id in &listed {
+        if *id != current {
+            assert!(db.auth().revoke_session(ann, *id).unwrap());
+        }
+    }
+    assert!(
+        db.auth()
+            .validate(tokens[1].as_str())
+            .unwrap()
+            .session()
+            .is_some()
+    );
+    assert!(
+        db.auth()
+            .validate(tokens[0].as_str())
+            .unwrap()
+            .session()
+            .is_none()
+    );
+    assert!(
+        db.auth()
+            .validate(tokens[2].as_str())
+            .unwrap()
+            .session()
+            .is_none()
+    );
+}
+
+/// `api_keys` lists an account's keys, oldest first, revoked ones marked,
+/// and never another account's.
+#[test]
+fn test_api_keys_are_listed_per_account() {
+    let dir = TempDir::new("api-keys");
+    let db = Database::open(&dir.0).unwrap();
+    let password = db.auth().hash_password("a long password").unwrap();
+    let ann = db
+        .auth()
+        .create_account("ann@example.com", &password)
+        .unwrap();
+    let bob = db
+        .auth()
+        .create_account("bob@example.com", &password)
+        .unwrap();
+    assert!(db.auth().api_keys(ann).unwrap().is_empty());
+    let later = std::time::SystemTime::now() + Duration::from_secs(3600);
+    let one = db.auth().create_api_key(ann, &["a"], None).unwrap();
+    std::thread::sleep(Duration::from_millis(2));
+    let two = db
+        .auth()
+        .create_api_key(ann, &["b", "c"], Some(later))
+        .unwrap();
+    let theirs = db.auth().create_api_key(bob, &["a"], None).unwrap();
+    assert!(db.auth().revoke_api_key(one.id()).unwrap());
+    let listed = db.auth().api_keys(ann).unwrap();
+    let ids: Vec<_> = listed.iter().map(|k| k.id()).collect();
+    assert_eq!(ids, [one.id(), two.id()]);
+    assert!(listed[0].revoked_at().is_some() && listed[1].revoked_at().is_none());
+    assert!(listed[0].expires_at().is_none() && listed[1].expires_at().is_some());
+    assert_eq!(listed[1].scopes(), ["b", "c"]);
+    let bobs: Vec<_> = db
+        .auth()
+        .api_keys(bob)
+        .unwrap()
+        .iter()
+        .map(|k| k.id())
+        .collect();
+    assert_eq!(bobs, [theirs.id()]);
+    // Erased: none listed.
+    db.auth().erase_account(ann).unwrap();
+    assert!(db.auth().api_keys(ann).unwrap().is_empty());
 }

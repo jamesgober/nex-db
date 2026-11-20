@@ -240,6 +240,12 @@ impl Purpose {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionId(pub(crate) [u8; 16]);
 
+impl SessionId {
+    /// No session: the id a [`Session`] carries inside the engine, before a
+    /// validation sets it.
+    pub(crate) const NONE: SessionId = SessionId([0; 16]);
+}
+
 impl fmt::Debug for SessionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SessionId({self})")
@@ -319,6 +325,9 @@ impl SessionInfo {
 /// fixed size, the payload inline: validating allocates nothing.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Session {
+    /// The session's id; set when the session is returned by a validation,
+    /// unset ([`SessionId::NONE`]) inside the engine.
+    pub(crate) id: SessionId,
     pub(crate) account: AccountId,
     pub(crate) created_ms: u64,
     pub(crate) expires_ms: u64,
@@ -345,6 +354,31 @@ impl fmt::Debug for Session {
 }
 
 impl Session {
+    /// The session's id: the [`SessionInfo::id`] of this session in
+    /// [`Auth::sessions`](crate::Auth::sessions), and what
+    /// [`Auth::revoke_session`](crate::Auth::revoke_session) takes. Use it
+    /// to tell which listed session is the one making a request (to mark
+    /// it "this device", or to keep it when signing out the others).
+    ///
+    /// ```
+    /// # fn main() -> nex_db::Result<()> {
+    /// # let dir = std::env::temp_dir().join(format!("nex-db-doc-session-id-{}", std::process::id()));
+    /// let db = nex_db::open(&dir)?;
+    /// let ann = db.auth().sign_up("ann@example.com", "a long password")?;
+    /// let token = db.auth().issue_session(ann, nex_db::SessionSpec::web())?;
+    /// let session = db.auth().validate(token.as_str())?.session().unwrap();
+    /// let listed = db.auth().sessions(ann)?;
+    /// assert!(listed.iter().any(|info| info.id() == session.id()));
+    /// # drop(db);
+    /// # let _ = std::fs::remove_dir_all(&dir);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub const fn id(&self) -> SessionId {
+        self.id
+    }
+
     /// The account the session belongs to.
     #[must_use]
     pub const fn account(&self) -> AccountId {
@@ -675,6 +709,7 @@ mod tests {
     #[test]
     fn test_validation_session_only_when_valid() {
         let session = Session {
+            id: SessionId::NONE,
             account: AccountId::from_bytes([1; 16]),
             created_ms: 1,
             expires_ms: 2,

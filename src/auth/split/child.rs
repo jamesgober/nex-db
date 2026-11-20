@@ -315,9 +315,12 @@ impl<'h> State<'h> {
                 wire::put_session_infos(w, &engine.session_list(wire::get_account(r)?))?;
             }
             op::API_KEY_CHECK => wire::put_key_check(w, &engine.api_key_check(get_str(r)?)?)?,
-            #[cfg(feature = "mfa")]
+            op::API_KEYS => {
+                wire::put_key_infos(w, &engine.api_key_list(wire::get_account(r)?)?)?;
+            }
+            #[cfg(feature = "passkey")]
             op::PASSKEYS => {
-                wire::mfa::put_passkey_infos(w, &engine.passkey_list(wire::get_account(r)?)?)?;
+                wire::passkey::put_passkey_infos(w, &engine.passkey_list(wire::get_account(r)?)?)?;
             }
             op::POLICY => {
                 let policy: Arc<Policy> = engine.policy();
@@ -576,20 +579,23 @@ impl<'h> State<'h> {
             }
             op::REVOKE => wire::put_bool(w, tx.revoke(get_str(r)?)?),
             op::RETIRE_DECOY => wire::put_bool(w, tx.retire_decoy(get_str(r)?)?),
-            #[cfg(feature = "mfa")]
+            #[cfg(any(feature = "totp", feature = "passkey"))]
             _ => return mfa_op(op, r, tx, w),
-            #[cfg(not(feature = "mfa"))]
+            #[cfg(not(any(feature = "totp", feature = "passkey")))]
             _ => return Err(Error::invalid("request", "not one the auth process knows")),
         }
         Ok(())
     }
 }
 
-#[cfg(feature = "mfa")]
+#[cfg(any(feature = "totp", feature = "passkey"))]
 fn mfa_op(op: u16, r: &mut Reader<'_>, tx: &mut LocalTx<'_, '_>, w: &mut Writer<'_>) -> Result<()> {
+    #[cfg(feature = "passkey")]
     use crate::auth::passkey::{PasskeyAssertion, PasskeyId, PasskeyRegistration};
     match op {
-        op::ADD_TOTP => wire::mfa::put_enrollment(w, &tx.add_totp(wire::get_account(r)?)?),
+        #[cfg(feature = "totp")]
+        op::ADD_TOTP => wire::totp::put_enrollment(w, &tx.add_totp(wire::get_account(r)?)?),
+        #[cfg(feature = "totp")]
         op::CONFIRM_TOTP | op::CHECK_TOTP => {
             let account = wire::get_account(r)?;
             let code = get_str(r)?;
@@ -600,25 +606,31 @@ fn mfa_op(op: u16, r: &mut Reader<'_>, tx: &mut LocalTx<'_, '_>, w: &mut Writer<
             };
             wire::put_bool(w, ok);
         }
+        #[cfg(feature = "totp")]
         op::REMOVE_TOTP => wire::put_bool(w, tx.remove_totp(wire::get_account(r)?)?),
+        #[cfg(feature = "passkey")]
         op::PASSKEY_REGISTRATION => {
-            wire::mfa::put_challenge(w, &tx.passkey_registration(wire::get_account(r)?)?);
+            wire::passkey::put_challenge(w, &tx.passkey_registration(wire::get_account(r)?)?);
         }
-        op::PASSKEY_SIGN_IN => wire::mfa::put_challenge(w, &tx.passkey_sign_in()?),
+        #[cfg(feature = "passkey")]
+        op::PASSKEY_SIGN_IN => wire::passkey::put_challenge(w, &tx.passkey_sign_in()?),
+        #[cfg(feature = "passkey")]
         op::ADD_PASSKEY => {
             let account = wire::get_account(r)?;
-            let rp = wire::mfa::get_rp(r)?;
+            let rp = wire::passkey::get_rp(r)?;
             let client_data_json = r.bytes32()?;
             let authenticator_data = r.bytes32()?;
             let registration = PasskeyRegistration::new(client_data_json, authenticator_data);
             w.bytes(&tx.add_passkey(account, &rp, &registration)?.0);
         }
+        #[cfg(feature = "passkey")]
         op::REMOVE_PASSKEY => {
             let account = wire::get_account(r)?;
             wire::put_bool(w, tx.remove_passkey(account, PasskeyId(r.fixed()?))?);
         }
+        #[cfg(feature = "passkey")]
         op::COMPLETE_PASSKEY => {
-            let rp = wire::mfa::get_rp(r)?;
+            let rp = wire::passkey::get_rp(r)?;
             let credential_id = r.bytes32()?;
             let client_data_json = r.bytes32()?;
             let authenticator_data = r.bytes32()?;
@@ -630,13 +642,14 @@ fn mfa_op(op: u16, r: &mut Reader<'_>, tx: &mut LocalTx<'_, '_>, w: &mut Writer<
                 signature,
             );
             let spec = wire::get_spec(r)?;
-            wire::mfa::put_outcome(w, &tx.complete_passkey(&rp, &assertion, spec)?)?;
+            wire::passkey::put_outcome(w, &tx.complete_passkey(&rp, &assertion, spec)?)?;
         }
+        #[cfg(feature = "totp")]
         op::COMPLETE_SECOND_FACTOR => {
             let challenge = get_str(r)?;
             let code = get_str(r)?;
             let spec = wire::get_spec(r)?;
-            wire::mfa::put_second(w, &tx.complete_second_factor(challenge, code, spec)?)?;
+            wire::totp::put_second(w, &tx.complete_second_factor(challenge, code, spec)?)?;
         }
         _ => return Err(Error::invalid("request", "not one the auth process knows")),
     }
